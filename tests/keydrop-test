@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+"""keydrop-test — the secret goes in the keychain and nowhere else.
+
+What's asserted, in order of how much it matters:
+
+1. The value never reaches argv. Checked two ways. Deterministically: the
+   tool's own keychain_store() runs with subprocess.run wrapped, and every argv
+   it passes is searched for the value and its hex. Empirically: a thread
+   polls `ps -axwwE` (argv and environment of every process) while
+   submissions go through the server, and keeps submitting until it has
+   actually caught a `security` process in the act, so a pass means it looked
+   while the write was happening, not that it happened to miss it.
+2. The value and the token never reach the state dir or the log.
+3. The page escapes name and note, 404s everything but /<token>, and gives up
+   after MAX_BAD wrong guesses (browser favicon fetches don't count).
+4. "Stored" only when the keychain really holds the value: a `security` that
+   exits 0 without storing (its exit code is the OSStatus mod 256) is caught
+   by reading the item back.
+5. Teardown happens on submit, TTL, lockout, cancel, and SIGKILL (via reap).
+   A teardown that fails (tailscaled unreachable, or `off` lying about it,
+   both faked with a shim) keeps its record and the next reap removes the
+   route. An unowned keydrop-shaped route gets swept; the shape test that
+   keeps other people's routes safe is a unit test on synthetic serve configs.
+6. The login pin: a missing, wrong, doubled or underscore-spelled
+   Tailscale-User-Login gets a bare 404, counts toward lockout, and stores
+   nothing, on request pages and vault sessions alike.
+7. The vault session: every POST needs the form token (and a cross-site
+   Sec-Fetch-Site is refused even with it), a GET never changes anything,
+   add/replace/delete work and log name and outcome only, delete asks first,
+   and can't reach anything outside the service prefix: bad names are
+   refused, and a non-keydrop keychain item with a valid-looking name
+   survives. No value ever appears in a page, the log, the state dir or any
+   argv.
+8. There is no --local: `request --local` and `vault --local` are refused,
+   say why, and leave no record and no route.
+
+Nothing here touches a real keychain or a real tailnet. `security` is a fake
+(tests/fakes.py) that keeps items in a JSON file in the temp dir, and
+`tailscale` is a stub whose serve config is another JSON file there. Requests
+go straight to the page's 127.0.0.1 port carrying the Host and login header
+serve would set. Config comes from the environment only (KEYDROP_CONFIG
+points at a file that doesn't exist).
+
+    tests/keydrop-test
+"""
+import importlib.machinery, importlib.util, json, os, re, secrets, shlex, signal
+import subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from fakes import fake_security  # noqa: E402
+
+TOOL = os.path.join(os.path.dirname(HERE), "keydrop")
+BASE = tempfile.mkdtemp(prefix="keydrop-test-")
+STATE = os.path.join(BASE, "state")
+OWNER = "owner@example.com"
+FAKE_SECURITY = fake_security(BASE)
+os.environ.update(KEYDROP_CONFIG=os.path.join(BASE, "no-such-config.json"),
+                  KEYDROP_STATE_DIR=STATE, KEYDROP_OWNER_LOGIN=OWNER,
+                  KEYDROP_SECURITY=FAKE_SECURITY)
+for var in ("KEYDROP_ACCOUNT", "KEYDROP_SERVICE_PREFIX", "KEYDROP_LAUNCHD_LABEL", "KEYDROP_HOME_PORT",
+            "KEYDROP_TAILSCALE", "KEYDROP_TS_SOCKET"):
+    os.environ.pop(var, None)
+
+sys.dont_write_bytecode = True   # 3.14 would cache the extensionless tool in a __pycache__ beside it
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"   # and so would every keydrop this spawns
+loader = importlib.machinery.SourceFileLoader("keydrop", TOOL)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+KD = importlib.util.module_from_spec(spec)
+loader.exec_module(KD)
+# The one guard everything else rests on: never the real keychain.
+assert KD.SECURITY == FAKE_SECURITY and KD.OWNER_LOGIN == OWNER, "refusing to run against the real keychain"
+
+FAILS = []
+MADE = set()
+
+# The stub tailscale. Spawned keydrops get it through the environment, and
+# the loaded module is pointed at it in use_stub().
+STUB_DIR = os.path.dirname(STATE)
+STUB = os.path.join(STUB_DIR, "tailscale-stub")
+STUB_JSON = os.path.join(STUB_DIR, "stub-serve.json")
+STUB_HOST = "keydrop-test.example.ts.net"
+STUB_SRC = r'''#!/usr/bin/env python3
+import json, re, sys
+SERVE, HOST = %r, %r
+args = [a for a in sys.argv[1:] if not a.startswith("--socket=")]
+def load():
+    try:
+        return json.load(open(SERVE))
+    except (OSError, ValueError):
+        return {}
+if args[:2] == ["status", "--json"]:
+    print(json.dumps({"BackendState": "Running", "CertDomains": [HOST], "Self": {"DNSName": HOST + "."}}))
+elif args[:3] == ["serve", "status", "--json"]:
+    print(json.dumps(load()))
+elif args and args[0] == "serve" and args[-1] == "off":
+    port = re.fullmatch(r"--https?=(\d+)", args[1]).group(1)
+    st = load()
+    (st.get("TCP") or {}).pop(port, None)
+    (st.get("Web") or {}).pop(HOST + ":" + port, None)
+    json.dump(st, open(SERVE, "w"))
+elif args[:3] == ["serve", "--bg", "--yes"]:
+    kind, port = re.fullmatch(r"--(https?)=(\d+)", args[3]).groups()
+    st = load()
+    st.setdefault("TCP", {})[port] = {kind.upper(): True}
+    st.setdefault("Web", {})[HOST + ":" + port] = {"Handlers": {"/": {"Proxy": args[4]}}}
+    json.dump(st, open(SERVE, "w"))
+else:
+    sys.exit("stub: unexpected " + " ".join(args))
+'''
+
+
+def use_stub():
+    with open(STUB, "w") as f:
+        f.write(STUB_SRC % (STUB_JSON, STUB_HOST))
+    os.chmod(STUB, 0o700)
+    os.environ["KEYDROP_TAILSCALE"] = STUB
+    KD.TAILSCALE = STUB
+
+
+def stub_ports():
+    try:
+        with open(STUB_JSON) as f:
+            return set((json.load(f).get("TCP") or {}).keys())
+    except (OSError, ValueError):
+        return set()
+
+
+LAST_LINK = []
+
+
+def loopback(link):
+    """The page's tailnet link, as the 127.0.0.1 URL this suite sends to
+    (the tailnet port is the loopback port). Remembers the link itself."""
+    LAST_LINK[:] = [link]
+    m = re.fullmatch(rf"https://{re.escape(STUB_HOST)}:(\d+)/([A-Za-z0-9_-]+)", link)
+    if not m:
+        raise AssertionError(f"not a stubbed tailnet link: {link[:60]!r}")
+    return f"http://127.0.0.1:{m.group(1)}/{m.group(2)}"
+
+
+def link_shape_ok():
+    return bool(re.fullmatch(rf"https://{re.escape(STUB_HOST)}:\d+/[A-Za-z0-9_-]{{43}}", LAST_LINK[0]))
+
+
+def check(cond, label):
+    print(("ok   " if cond else "FAIL ") + label)
+    if not cond:
+        FAILS.append(label)
+
+
+OUTSIDE = []
+
+
+def test_name(tag):
+    n = f"test-{tag}-{secrets.token_hex(3)}"
+    MADE.add(n)
+    return n
+
+
+def secret_value():
+    # Spaces, quotes, &, unicode: everything a naive quoting scheme would trip on.
+    return f'kd "sekrit" & {secrets.token_hex(12)} ünï'
+
+
+def run(*args, **kw):
+    return subprocess.run([TOOL, *args], capture_output=True, text=True, **kw)
+
+
+def request(*args):
+    r = run("request", *args)
+    if r.returncode != 0:
+        raise AssertionError(f"request failed: {r.stderr}")
+    return r.stdout.strip()
+
+
+def page(*args):
+    """A request page through the stub, as its loopback URL."""
+    return loopback(request(*args))
+
+
+def vault_page(*args):
+    r = run("vault", *args)
+    if r.returncode != 0:
+        raise AssertionError(f"vault failed: {r.stderr}")
+    return loopback(r.stdout.strip())
+
+
+def http(method, url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def form(value):
+    return urllib.parse.urlencode({"value": value}).encode()
+
+
+def pending_names():
+    return [r["name"] for r in KD.read_pending()]
+
+
+def wait_gone(name, secs=10):
+    end = time.time() + secs
+    while time.time() < end:
+        if name not in pending_names():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def log_outcomes(name):
+    try:
+        with open(KD.LOG_FILE) as f:
+            return [l.rstrip("\n").split("\t")[2] for l in f if l.split("\t")[1] == name]
+    except FileNotFoundError:
+        return []
+
+
+def state_contains(needle):
+    for root, _, files in os.walk(STATE):
+        for fn in files:
+            with open(os.path.join(root, fn), "rb") as f:
+                if needle.encode() in f.read():
+                    return True
+    return False
+
+
+class PsWatch(threading.Thread):
+    """Poll every process's argv+env for any of the needles."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.needles, self.hits, self.saw_security, self.samples = [], [], 0, 0
+        self.stop = False
+
+    def run(self):
+        while not self.stop:
+            out = subprocess.run(["ps", "-axwwE", "-o", "command="],
+                                 capture_output=True, text=True, errors="replace").stdout
+            self.samples += 1
+            for line in out.splitlines():
+                if re.search(r"(security|keydrop-security-shim) -i\b", line):
+                    self.saw_security += 1
+                for n in list(self.needles):
+                    if n in line:
+                        self.hits.append((n, line[:160]))
+
+
+# ---------- units ----------
+
+def test_units():
+    for good in ("example-api-key", "a", "x" * 64, "a.b_c-9"):
+        check(KD.valid_name(good), f"valid name {good[:20]!r}")
+    for bad in ("", "x" * 65, "Upper", "a b", "a/b", "a;b", "é", "$(id)", "x\n", "x\n-l y"):
+        check(not KD.valid_name(bad), f"invalid name {bad[:20]!r}")
+    check(KD.parse_ttl("15m") == 900 and KD.parse_ttl("90s") == 90 and KD.parse_ttl("1h") == 3600,
+          "ttl parses s/m/h")
+    for bad in ("0", "2h", "abc", "15 m", "-5m"):
+        try:
+            KD.parse_ttl(bad)
+            check(False, f"ttl {bad!r} rejected")
+        except KD.KeydropError:
+            check(True, f"ttl {bad!r} rejected")
+    page = KD.render_form('<img src=x onerror=alert(1)>', '"><script>x</script>', "/tok")
+    check("<script>" not in page and "<img" not in page and "&lt;script&gt;" in page,
+          "name and note are HTML-escaped")
+    check('type="password"' in page, "field is a password field")
+    tok = "abc123"
+    check(KD.token_matches("/abc123", tok), "right token matches")
+    check(not KD.token_matches("/abc124", tok) and not KD.token_matches("/", tok)
+          and not KD.token_matches("/abc123/x", tok), "wrong tokens don't")
+    test_login_units()
+    test_vault_render_units()
+    cmd = KD.store_command("test-x", 'a "b" c')
+    check('a "b" c' not in cmd and 'a "b" c'.encode().hex() in cmd, "store command carries hex only")
+    test_orphan_shape()
+
+
+def headers(*pairs):
+    import email.message
+    m = email.message.Message()
+    for k, v in pairs:
+        m[k] = v
+    return m
+
+
+def test_login_units():
+    good = ("Tailscale-User-Login", KD.OWNER_LOGIN)
+    check(KD.login_ok(headers(good)), "login pin: the owner's login passes")
+    check(KD.login_ok(headers(("tailscale-user-login", KD.OWNER_LOGIN.upper()))),
+          "login pin: header name and value compare case-insensitively")
+    for label, hs in (("missing", ()),
+                      ("wrong login", (("Tailscale-User-Login", "someone@example.com"),)),
+                      ("empty", (("Tailscale-User-Login", ""),)),
+                      ("suffix", (("Tailscale-User-Login", KD.OWNER_LOGIN + ".evil"),)),
+                      ("doubled", (good, ("Tailscale-User-Login", "someone@example.com"))),
+                      ("doubled, same value", (good, good)),
+                      ("underscore lookalike beside it", (good, ("Tailscale_User_Login", "x@y"))),
+                      ("underscore only", (("Tailscale_User_Login", KD.OWNER_LOGIN),))):
+        check(not KD.login_ok(headers(*hs)), f"login pin refuses: {label}")
+
+
+def test_vault_render_units():
+    entries = {"a.b": {"created": 1, "updated": 2}, "<x>": {"created": None, "updated": None}}
+    page = KD.render_vault("/tok", "csrf-tok", entries, {"a.b": '"><script>n</script>'}, time.time())
+    check("<script>" not in page and "&lt;script&gt;" in page and "&lt;x&gt;" in page,
+          "vault page escapes names and notes")
+    check(page.count('name="csrf" value="csrf-tok"') == page.count("<form"),
+          "every vault form carries the form token")
+    check('method="post"' in page and 'method="get"' not in page.lower(), "vault forms are POST only")
+    check("keychain_get" not in open(TOOL).read().split("# ---------- pages ----------")[1]
+          .split("def run_until_done")[0], "no page or handler code calls keychain_get directly")
+    for bad in ("", "../x", "x/../../y", "Example", "a b", "x" * 65, "keydrop.x\n"):
+        try:
+            KD.keychain_delete(bad)
+            check(False, f"keychain_delete refuses {bad[:20]!r}")
+        except KD.KeydropError:
+            check(True, f"keychain_delete refuses {bad[:20]!r}")
+
+
+def test_orphan_shape():
+    host = "keydrop-test.example.ts.net"
+
+    def route(port, proxy, kind="HTTP", handlers=None):
+        return {"TCP": {port: {kind: True}},
+                "Web": {f"{host}:{port}": {"Handlers": handlers or {"/": {"Proxy": proxy}}}}}
+
+    def merged(*routes):
+        out = {"TCP": {}, "Web": {}}
+        for r in routes:
+            out["TCP"].update(r["TCP"])
+            out["Web"].update(r["Web"])
+        return out
+
+    ours = [route("60183", "http://127.0.0.1:60183"),
+            route("60190", "http://127.0.0.1:60188", "HTTPS")]
+    decoys = [
+        route("7317", "http://127.0.0.1:7317"),               # a local service on a chosen port
+        route("443", "http://127.0.0.1:3000", "HTTPS"),        # the usual `serve 3000`
+        route("61000", "http://localhost:61000"),              # not the literal keydrop target
+        route("61001", "http://127.0.0.1:61001/app"),          # a path on the target
+        route("61002", "https+insecure://127.0.0.1:61002"),
+        route("61003", "http://10.0.0.5:61003"),               # somewhere else entirely
+        route("61004", "http://127.0.0.1:61100"),              # tailnet port below local
+        route("62000", "http://127.0.0.1:61000"),              # too far above local
+        route("61005", "http://127.0.0.1:61005",
+              handlers={"/": {"Proxy": "http://127.0.0.1:61005"}, "/x": {"Path": "/tmp"}}),
+        route("61006", "", handlers={"/": {"Path": "/srv/files"}}),
+        {"TCP": {"61007": {"TCPForward": "127.0.0.1:61007"}}, "Web": {}},
+        {"TCP": {"61008": {"HTTP": True, "TCPForward": "127.0.0.1:61008"}},
+         "Web": {f"{host}:61008": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:61008"}}}}},
+    ]
+    st = merged(*ours, *decoys)
+    check(KD.orphan_routes(st, set()) == [("60183", True, 60183), ("60190", False, 60188)],
+          "orphan sweep picks exactly the keydrop-shaped routes (HTTP and HTTPS)")
+    check(KD.orphan_routes(st, {"60183", "60190"}) == [], "orphan sweep skips routes a record owns")
+    check(KD.orphan_routes(merged(*decoys), set()) == [],
+          f"orphan sweep leaves all {len(decoys)} non-keydrop routes alone")
+    check(KD.orphan_routes({}, set()) == [] and KD.orphan_routes({"TCP": None}, set()) == [],
+          "orphan sweep copes with an empty config")
+
+
+# ---------- argv, deterministic ----------
+
+def test_store_argv_intercepted():
+    name, value = test_name("argv"), secret_value()
+    seen = []
+    real_run = KD.subprocess.run
+
+    def spy(args, *a, **kw):
+        seen.append((list(args), kw.get("input")))
+        return real_run(args, *a, **kw)
+
+    KD.subprocess.run = spy
+    try:
+        KD.keychain_store(name, value)
+    finally:
+        KD.subprocess.run = real_run
+    hexed = value.encode().hex()
+    argv_blob = " ".join(" ".join(a) for a, _ in seen)
+    check(seen and seen[0][0] == [KD.SECURITY, "-i"], "store runs `security -i`")
+    check(value not in argv_blob and hexed not in argv_blob, "store: value absent from every argv")
+    check(any(i and hexed in i for _, i in seen), "store: value travels on stdin (as hex)")
+    check(KD.keychain_get(name) == value, "keychain round-trips the value exactly")
+    KD.keychain_store(name, value + "2")
+    check(KD.keychain_get(name) == value + "2", "second store updates in place (-U)")
+
+
+# ---------- a store that lies ----------
+
+def lying_security(exit_code=0):
+    """Swallows `security -i` and exits with exit_code without storing.
+    Everything else (the read-back) goes to the fake keychain."""
+    path = os.path.join(os.path.dirname(STATE), f"lying-security-{exit_code}")
+    with open(path, "w") as f:
+        f.write('#!/bin/sh\nif [ "$1" = "-i" ]; then cat >/dev/null; exit %d; fi\n'
+                'exec %s "$@"\n' % (exit_code, shlex.quote(FAKE_SECURITY)))
+    os.chmod(path, 0o700)
+    return path
+
+
+def test_store_verified():
+    real = KD.SECURITY
+    try:
+        for code, label in ((0, "exit 0, nothing stored"), (45, "exit 45")):
+            KD.SECURITY = lying_security(code)
+            name = test_name("lie")
+            try:
+                KD.keychain_store(name, secret_value())
+                check(False, f"store refuses to report success: {label}")
+            except KD.KeydropError:
+                check(True, f"store refuses to report success: {label}")
+        # An existing item plus a silent no-op update: exit 0, item present,
+        # old value. Only the digest comparison catches this one.
+        name = test_name("stale")
+        KD.SECURITY = real
+        KD.keychain_store(name, "old value")
+        KD.SECURITY = lying_security(0)
+        try:
+            KD.keychain_store(name, "new value")
+            check(False, "store catches a no-op update over an old value")
+        except KD.KeydropError as e:
+            check("new value" not in str(e) and "old value" not in str(e),
+                  "store catches a no-op update over an old value (and the error names neither)")
+        KD.SECURITY = real
+        for odd in ("back\\slash", "tab\there", 'q"uote', "tail space ", "0xdeadbeef"):
+            n = test_name("odd")
+            KD.keychain_store(n, odd)   # raises if the read-back disagrees
+            check(KD.keychain_get(n) == odd, f"read-back agrees for {odd!r}")
+    finally:
+        KD.SECURITY = real
+
+    # End to end: the page must not say Stored.
+    os.environ["KEYDROP_SECURITY"] = lying_security(0)
+    try:
+        name, value = test_name("e2elie"), secret_value()
+        url = page(name, "--ttl", "1m")
+        code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+        check(code == 500 and "Stored" not in body and value not in body,
+              "page says it couldn't store, not Stored, when security lies")
+        check(wait_gone(name) and log_outcomes(name)[-1] == "store-failed", "log: store-failed")
+        check(KD.keychain_get(name) is None, "nothing in the keychain after the lying store")
+    finally:
+        os.environ["KEYDROP_SECURITY"] = FAKE_SECURITY
+
+
+# ---------- end to end, localhost ----------
+
+SHIM_NAME = "keydrop-security-shim"
+
+
+def make_shim():
+    """Delays, then execs security with the argv it was given. The
+    process that holds the secret on stdin then sits in the process table for
+    half a second, so the ps watcher sees it for certain rather than by luck;
+    exec means what it sees is exactly the argv security runs with."""
+    path = os.path.join(os.path.dirname(STATE), SHIM_NAME)
+    with open(path, "w") as f:
+        f.write('#!/bin/sh\nsleep 0.5\nexec %s "$@"\n' % shlex.quote(FAKE_SECURITY))
+    os.chmod(path, 0o700)
+    return path
+
+
+def test_watch_can_see(watch):
+    """Positive control: a needle that IS on argv must be caught, or the
+    'never saw the value' checks below prove nothing."""
+    canary = "canary-" + secrets.token_hex(8)
+    watch.needles.append(canary)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)", canary])
+    end = time.time() + 5
+    while time.time() < end and not any(n == canary for n, _ in watch.hits):
+        time.sleep(0.1)
+    proc.kill()
+    proc.wait()
+    check(any(n == canary for n, _ in watch.hits), "ps watcher catches a value that is on argv (control)")
+    watch.needles.remove(canary)
+    time.sleep(1)   # let an in-flight sample finish before clearing the control's hits
+    watch.hits = [h for h in watch.hits if h[0] != canary]
+
+
+def test_local_flow(watch):
+    caught_before = watch.saw_security
+    os.environ["KEYDROP_SECURITY"] = make_shim()
+    for attempt in range(8):
+        name, value = test_name("e2e"), secret_value()
+        watch.needles += [value, value.encode().hex(), value.split(" ")[3]]
+        url = page(name, "--note", '<b>"for tests"</b>', "--ttl", "1m")
+        token = url.rsplit("/", 1)[1]
+        base = url.rsplit("/", 1)[0]
+        if attempt == 0:
+            check(link_shape_ok(), "tailnet link shape, 256-bit token")
+            check(name in pending_names(), "pending while waiting")
+            check(run("request", name).returncode != 0, "second request for a pending name refused")
+            st = run("status").stdout
+            check(name in st and token not in st, "status lists it, without the token")
+            code, body = http("GET", url, headers=LOGIN)
+            check(code == 200 and "&lt;b&gt;&quot;for tests&quot;&lt;/b&gt;" in body and "<b>" not in body,
+                  "GET /<token> serves the escaped form")
+            wrong = token[:-1] + ("B" if token[-1] == "A" else "A")   # always differs
+            code, body = http("GET", base + "/" + wrong, headers=LOGIN)
+            check(code == 404 and body == "", "wrong token: bare 404")
+            code, body = http("GET", base + "/", headers=LOGIN)
+            check(code == 404 and body == "", "/: bare 404")
+            code, _ = http("POST", url, data=form(""), headers=dict(LOGIN, **FORM))
+            check(code == 400 and name in pending_names(), "empty submit is refused and doesn't consume the link")
+        code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+        if attempt == 0:
+            check(code == 200 and "Stored" in body and value not in body, "POST stores and says so (via delayed security shim)")
+            check(wait_gone(name), "server gone after submit")
+            try:
+                http("GET", url, headers=LOGIN)
+                check(False, "link dead after submit")
+            except (urllib.error.URLError, ConnectionError):
+                check(True, "link dead after submit")
+            check(KD.keychain_get(name) == value, "keydrop.<name> holds the submitted value")
+            check(run("get", name).stdout == value, "`keydrop get` prints it")
+            check(name in run("list").stdout.split(), "`keydrop list` shows the name")
+            check(log_outcomes(name) == ["requested", "stored"], "log: requested, stored")
+        wait_gone(name)
+        for needle in (value, value.encode().hex(), token):
+            check(not state_contains(needle), f"state dir free of {'token' if needle == token else 'value'} (#{attempt})")
+        if watch.saw_security > caught_before:
+            break
+    os.environ["KEYDROP_SECURITY"] = FAKE_SECURITY
+    time.sleep(0.3)
+    check(watch.saw_security > caught_before,
+          f"ps watcher caught `security -i` mid-write ({watch.saw_security} sightings, {watch.samples} samples)")
+    check(not watch.hits, "ps watcher never saw the value in any argv/env" + (f": {watch.hits[:2]}" if watch.hits else ""))
+
+
+def test_lockout():
+    name = test_name("lock")
+    url = page(name, "--ttl", "1m")
+    base = url.rsplit("/", 1)[0]
+    for _ in range(3):
+        http("GET", base + "/favicon.ico", headers=LOGIN)
+        http("GET", base + "/apple-touch-icon.png", headers=LOGIN)
+    check(name in pending_names(), "browser auto-fetches don't count as guesses")
+    for i in range(KD.MAX_BAD):
+        try:
+            http("GET", base + "/" + secrets.token_urlsafe(32), headers=LOGIN)
+        except (urllib.error.URLError, ConnectionError):
+            pass
+    check(wait_gone(name), f"shuts down after {KD.MAX_BAD} wrong tokens")
+    check(log_outcomes(name)[-1] == "locked-out", "log: locked-out")
+    check(KD.keychain_get(name) is None, "nothing stored on lockout")
+
+
+def test_expiry():
+    name = test_name("ttl")
+    page(name, "--ttl", "2s")
+    check(wait_gone(name, 8), "expires on TTL")
+    check(log_outcomes(name)[-1] == "expired", "log: expired")
+
+
+def test_cancel():
+    name = test_name("cancel")
+    page(name)
+    check(run("cancel", name).returncode == 0 and wait_gone(name), "cancel stops it (SIGTERM path)")
+    check(log_outcomes(name)[-1].startswith("cancelled"), "log: cancelled")
+
+
+def test_sigkill_reaped_local():
+    name = test_name("kill")
+    page(name)
+    pid = next(r["pid"] for r in KD.read_pending() if r["name"] == name)
+    os.kill(pid, signal.SIGKILL)
+    time.sleep(0.3)
+    run("status")
+    check(name not in pending_names() and log_outcomes(name)[-1] == "reaped",
+          "SIGKILL leaves a record that status reaps")
+    check(stub_ports() == set(), "and the reap takes its route down")
+
+
+def test_no_local():
+    """No page has --local any more: each refuses, says why, and leaves
+    nothing behind."""
+    before = (stub_ports(), len(KD.read_pending()))
+    for label, args in (("request", ("request", test_name("nolocal"), "--local")),
+                        ("request, flag first", ("request", "--local", test_name("nolocal"))),
+                        ("vault", ("vault", "--local")), ("vault with a ttl", ("vault", "--ttl", "1m", "--local"))):
+        r = run(*args)
+        check(r.returncode != 0 and "no --local" in r.stderr and "tailnet peer" in r.stderr and not r.stdout,
+              f"{label} --local: refused, says why, prints no link")
+    check((stub_ports(), len(KD.read_pending())) == before, "--local refusals leave no route and no record")
+
+
+# ---------- login pin and vault, localhost ----------
+
+LOGIN = {"Tailscale-User-Login": OWNER}
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+assert LOGIN["Tailscale-User-Login"] == KD.OWNER_LOGIN
+
+
+def csrf_of(page):
+    m = re.search(r'name="csrf" value="([^"]+)"', page)
+    return m.group(1) if m else ""
+
+
+def vpost(url, fields, extra=None):
+    return http("POST", url, data=urllib.parse.urlencode(fields).encode(),
+                headers=dict(LOGIN, **FORM, **(extra or {})))
+
+
+def test_pin_on_request():
+    name, value = test_name("pin"), secret_value()
+    url = page(name, "--ttl", "1m")
+    for label, h in (("missing", {}), ("wrong", {"Tailscale-User-Login": "x@example.com"}),
+                     ("underscore", {"Tailscale_User_Login": OWNER})):
+        code, body = http("GET", url, headers=h)
+        check(code == 404 and body == "", f"request page, login {label}: bare 404")
+    code, _ = http("POST", url, data=form(value), headers=dict(FORM, **{"Tailscale-User-Login": "x@example.com"}))
+    check(code == 404 and KD.keychain_get(name) is None, "request page, wrong login: POST stores nothing")
+    code, _ = http("POST", url, data=form(value), headers=FORM)
+    check(code == 404 and KD.keychain_get(name) is None, "request page, no login: POST stores nothing")
+    check(wait_gone(name), f"request page locks out after {KD.MAX_BAD} refused logins")
+    outs = log_outcomes(name)
+    check(outs.count("refused: login") == KD.MAX_BAD and outs[-1] == "locked-out",
+          "log: refused: login x5, locked-out")
+
+    name, value = test_name("pinok"), secret_value()
+    url = page(name, "--ttl", "1m")
+    code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+    check(code == 200 and "Stored" in body and KD.keychain_get(name) == value,
+          "request page, the owner's login: stores")
+
+
+def make_outside_item():
+    """A keychain item that isn't keydrop's, under a name that passes NAME_RE."""
+    name = f"kdtest-outside-{secrets.token_hex(3)}"
+    subprocess.run([FAKE_SECURITY, "add-generic-password", "-a", KD.ACCOUNT, "-s", name,
+                    "-w", "not-a-secret"], check=True, capture_output=True)
+    OUTSIDE.append(name)
+    return name
+
+
+def outside_exists(name):
+    return subprocess.run([FAKE_SECURITY, "find-generic-password", "-a", KD.ACCOUNT, "-s", name],
+                          capture_output=True).returncode == 0
+
+
+def test_vault_local(watch):
+    os.environ["KEYDROP_SECURITY"] = make_shim()
+    try:
+        _vault_local(watch)
+    finally:
+        os.environ["KEYDROP_SECURITY"] = FAKE_SECURITY
+
+
+def _vault_local(watch):
+    url = vault_page("--ttl", "5m")
+    check(link_shape_ok(), "vault: tailnet session link")
+    token = url.rsplit("/", 1)[1]
+    check(run("vault").returncode != 0, "vault: a second session is refused")
+    check(KD.VAULT in run("status").stdout, "vault: status lists the session")
+
+    code, body = http("GET", url)
+    check(code == 404 and body == "", "vault: no login header, bare 404")
+    code, page = http("GET", url, headers=LOGIN)
+    check(code == 200 and "keydrop vault" in page, "vault: the owner's login gets the list")
+    csrf = csrf_of(page)
+    check(len(csrf) == 43 and csrf != token, "vault: page carries a separate form token")
+
+    name, value, note = test_name("vault-add"), secret_value(), "for <the> tests"
+    watch.needles += [value, value.encode().hex()]
+    add = {"action": "add", "name": name, "note": note, "value": value}
+
+    code, _ = vpost(url, add)
+    check(code == 403 and KD.keychain_get(name) is None, "vault: add without form token refused")
+    code, _ = vpost(url, dict(add, csrf=csrf[:-1] + ("A" if csrf[-1] != "A" else "B")))
+    check(code == 403 and KD.keychain_get(name) is None, "vault: add with wrong form token refused")
+    code, _ = vpost(url, dict(add, csrf=csrf), {"Sec-Fetch-Site": "cross-site"})
+    check(code == 403 and KD.keychain_get(name) is None, "vault: cross-site POST refused even with the token")
+    # Four strikes so far. Close this session properly and go on in a fresh one,
+    # so the lockout (tested on its own below) doesn't end the run early.
+    code, _ = vpost(url, {"csrf": csrf, "action": "done"})
+    check(code == 200 and wait_gone(KD.VAULT), "vault: Done works after refused attempts")
+    url = vault_page("--ttl", "5m")
+    token = url.rsplit("/", 1)[1]
+    code, page = http("GET", url, headers=LOGIN)
+    check(csrf_of(page) not in ("", csrf), "vault: each session gets its own form token")
+    code, _ = vpost(url, dict(add, csrf=csrf))
+    check(code == 403 and KD.keychain_get(name) is None, "vault: the last session's form token is refused")
+    csrf = csrf_of(page)
+    code, _ = http("POST", url, data=urllib.parse.urlencode(dict(add, csrf=csrf)).encode(),
+                   headers=dict(FORM, **{"Tailscale-User-Login": "x@example.com"}))
+    check(code == 404 and KD.keychain_get(name) is None, "vault: POST with the wrong login stores nothing")
+    q = urllib.parse.urlencode(dict(add, csrf=csrf))
+    code, _ = http("GET", f"{url}?{q}", headers=LOGIN)
+    check(code == 200 and KD.keychain_get(name) is None, "vault: a GET carrying the add fields changes nothing")
+
+    code, page = vpost(url, dict(add, csrf=csrf))
+    check(code == 200 and f"Stored {name}." in page, "vault: add stores (303 back to the list)")
+    check(KD.keychain_get(name) == value, "vault: keychain holds the added value")
+    check(name in page and "for &lt;the&gt; tests" in page, "vault: list shows the name and escaped note")
+    check(value not in page and value.encode().hex() not in page, "vault: the page never shows the value")
+    check(KD.read_notes().get(name) == note, "vault: note saved in meta.json")
+
+    code, page = vpost(url, dict(add, csrf=csrf, value="other"))
+    check(code == 409 and KD.keychain_get(name) == value, "vault: add over an existing name refused")
+
+    time.sleep(1.1)   # mdat has one-second resolution
+    before = KD.keychain_entries()[name]
+    value2 = secret_value()
+    watch.needles += [value2, value2.encode().hex()]
+    code, page = vpost(url, {"csrf": csrf, "action": "replace", "name": name, "value": value2, "note": ""})
+    check(code == 200 and KD.keychain_get(name) == value2, "vault: replace stores the new value")
+    after = KD.keychain_entries()[name]
+    check(after["created"] == before["created"] and after["updated"] > before["updated"],
+          "vault: replace keeps created, moves updated")
+    check(KD.read_notes().get(name) == note, "vault: blank note on replace keeps the old one")
+    check(value2 not in page and value not in page, "vault: replace page shows no value")
+    code, _ = vpost(url, {"csrf": csrf, "action": "replace", "name": test_name("vault-none"), "value": "x"})
+    check(code == 404, "vault: replace of a name that doesn't exist refused")
+
+    # delete: can't reach outside keydrop.*
+    outside = make_outside_item()
+    for bad in ("../" + outside, "../../" + name, name.upper(), "", "a/b", "x;y", "*"):
+        for act in ("delete", "delete-confirm"):
+            code, _ = vpost(url, {"csrf": csrf, "action": act, "name": bad})
+            check(code == 400, f"vault: {act} refuses name {bad[:30]!r}")
+    for other in (outside, "keydrop." + name):
+        code, _ = vpost(url, {"csrf": csrf, "action": "delete-confirm", "name": other})
+        check(code == 404, f"vault: delete-confirm {other[:30]!r} only looks under keydrop.*, finds nothing")
+    check(outside_exists(outside) and KD.keychain_get(name) == value2,
+          "vault: the non-keydrop item and the real entry both survive")
+
+    code, page = vpost(url, {"csrf": csrf, "action": "delete", "name": name})
+    check(code == 200 and f"Delete {name}?" in page and KD.keychain_get(name) == value2,
+          "vault: delete asks to confirm and deletes nothing yet")
+    code, _ = vpost(url, {"action": "delete-confirm", "name": name})
+    check(code == 403 and KD.keychain_get(name) == value2, "vault: confirm without form token refused")
+    code, page = vpost(url, {"csrf": csrf, "action": "delete-confirm", "name": name})
+    check(code == 200 and f"Deleted {name}." in page and not KD.keychain_exists(name),
+          "vault: confirmed delete removes the item")
+    check(name not in KD.read_notes(), "vault: delete drops the note")
+    check(name in pending_names() or KD.VAULT in pending_names(), "vault: session still open after changes")
+
+    code, page = vpost(url, {"csrf": csrf, "action": "done"})
+    check(code == 200 and "Closed" in page, "vault: Done closes it")
+    check(wait_gone(KD.VAULT), "vault: server gone after Done")
+    outs = log_outcomes(name)
+    check(outs == ["vault add stored", "vault replace stored", "vault deleted"],
+          f"vault log: add, replace, delete ({outs})")
+    check(log_outcomes(KD.VAULT)[-1] == "done", "vault log: session done")
+    with open(KD.LOG_FILE) as f:
+        logtext = f.read()
+    for label, needle in (("value", value), ("value 2", value2), ("token", token), ("form token", csrf),
+                          ("hex value", value.encode().hex())):
+        check(needle not in logtext, f"vault: log free of {label}")
+        check(not state_contains(needle), f"vault: state dir free of {label}")
+
+
+def test_vault_lockout_and_cancel():
+    url = vault_page("--ttl", "1m")
+    code, page = http("GET", url, headers=LOGIN)
+    csrf = csrf_of(page)
+    for _ in range(KD.MAX_BAD):
+        try:
+            vpost(url, {"csrf": "nope", "action": "done"})
+        except (urllib.error.URLError, ConnectionError):
+            pass
+    check(wait_gone(KD.VAULT), f"vault: locks out after {KD.MAX_BAD} bad form tokens")
+    check(log_outcomes(KD.VAULT)[-1] == "locked-out", "vault log: locked-out")
+    vault_page("--ttl", "1m")
+    check(run("cancel", "vault").returncode == 0 and wait_gone(KD.VAULT), "`keydrop cancel vault` ends a session")
+    check(log_outcomes(KD.VAULT)[-1].startswith("cancelled"), "vault log: cancelled")
+    del csrf, code
+
+
+def test_vault_expiry():
+    vault_page("--ttl", "2s")
+    check(wait_gone(KD.VAULT, 8) and log_outcomes(KD.VAULT)[-1] == "expired", "vault: expires on TTL")
+
+
+# ---------- tailnet ----------
+
+def serve_ports():
+    return stub_ports()
+
+
+def ts_shim():
+    """A tailscale that passes through to the stub unless the fault file says otherwise:
+    `down` fails `serve ... off` and `serve status` (tailscaled unreachable),
+    `noop-off` makes `off` exit 0 without doing anything."""
+    base = os.path.dirname(STATE)
+    fault = os.path.join(base, "ts-fault")
+    open(fault, "w").close()
+    path = os.path.join(base, "tailscale-shim")
+    with open(path, "w") as f:
+        f.write(f"""#!/bin/sh
+mode=$(cat '{fault}' 2>/dev/null)
+case "$mode:$*" in
+  down:*"serve "*" off"|down:*"serve status"*) echo "failed to connect to local tailscaled" >&2; exit 1 ;;
+  noop-off:*"serve "*" off") exit 0 ;;
+esac
+exec '{STUB}' "$@"
+""")
+    os.chmod(path, 0o700)
+    return path, fault
+
+
+def set_fault(fault, mode):
+    with open(fault, "w") as f:
+        f.write(mode)
+
+
+def wait_record(name, pred, secs=10):
+    end = time.time() + secs
+    while time.time() < end:
+        rec = next((r for r in KD.read_pending() if r["name"] == name), None)
+        if pred(rec):
+            return rec
+        time.sleep(0.1)
+    return None
+
+
+def test_teardown_failure(before):
+    shim, fault = ts_shim()
+    os.environ["KEYDROP_TAILSCALE"] = shim
+    try:
+        for mode, why in (("down", "tailscaled unreachable"), ("noop-off", "`off` exits 0 but does nothing")):
+            name = test_name("tdown")
+            url = request(name, "--http", "--ttl", "2m")
+            port = url.split(":")[2].split("/")[0]
+            pid = next(r["pid"] for r in KD.read_pending() if r["name"] == name)
+            set_fault(fault, mode)
+            run("cancel", name)
+            rec = wait_record(name, lambda r: r and r.get("teardown_failed"))
+            check(rec is not None, f"{why}: record kept, marked teardown-failed")
+            end = time.time() + 5
+            while time.time() < end and KD.alive(pid):
+                time.sleep(0.1)
+            check(not KD.alive(pid), f"{why}: the server process itself still exits")
+            check(port in serve_ports(), f"{why}: route really is still there (so keeping the record matters)")
+            check("teardown-failed" in log_outcomes(name), f"{why}: log: teardown-failed")
+            st = run("status").stdout
+            check(name in pending_names() and "teardown failed" in st,
+                  f"{why}: reap while still failing keeps the record, status says so")
+            r2 = run("request", name, "--http", "--ttl", "5s")
+            check(r2.returncode == 0,
+                  f"{why}: a teardown-failed record doesn't block a new request for the name")
+            port2 = r2.stdout.strip().split(":")[2].split("/")[0] if r2.returncode == 0 else port
+            end = time.time() + 15
+            while time.time() < end and any(KD.alive(x["pid"]) for x in KD.read_pending()
+                                            if x["name"] == name and not x.get("teardown_failed")):
+                time.sleep(0.1)
+            check("expired" in log_outcomes(name), f"{why}: the new request finished on its own")
+            set_fault(fault, "")
+            run("status")
+            check(name not in pending_names() and port not in serve_ports() and port2 not in serve_ports()
+                  and log_outcomes(name)[-1] == "reaped",
+                  f"{why}: once tailscale answers, the next reap removes routes and records")
+    finally:
+        os.environ["KEYDROP_TAILSCALE"] = STUB
+        set_fault(fault, "")
+    check(serve_ports() == before, "serve config back to exactly what it was after teardown-failure tests")
+
+
+def test_sweep_spares_other_state_dirs(before):
+    """The regression that mattered: a keydrop running with a different state
+    dir (a real install, while this test uses a temp dir) has no record here,
+    and its route must survive our reap."""
+    other = os.path.join(tempfile.mkdtemp(prefix="keydrop-test-other-"), "state")
+    name = test_name("other")
+    r = run("request", name, "--http", "--ttl", "1m", env=dict(os.environ, KEYDROP_STATE_DIR=other))
+    check(r.returncode == 0, "request in a second state dir")
+    port = r.stdout.strip().split(":")[2].split("/")[0]
+    run("status")
+    check(port in serve_ports(), "our reap leaves a live keydrop's route alone when its record is elsewhere")
+    run("cancel", name, env=dict(os.environ, KEYDROP_STATE_DIR=other))
+    end = time.time() + 10
+    while time.time() < end and port in serve_ports():
+        time.sleep(0.2)
+    check(serve_ports() == before, "the other request cleans up after itself")
+
+
+def test_orphan_sweep(before):
+    name = test_name("orphan")
+    url = request(name, "--http")
+    port = url.split(":")[2].split("/")[0]
+    rec = next(r for r in KD.read_pending() if r["name"] == name)
+    os.kill(rec["pid"], signal.SIGKILL)
+    os.unlink(os.path.join(KD.PENDING_DIR, rec["id"] + ".json"))   # record lost too
+    time.sleep(0.3)
+    check(port in serve_ports() and name not in pending_names(), "route left with no record")
+    run("status")
+    check(port not in serve_ports(), "reap sweeps an unowned keydrop-shaped route")
+    check(any(o == f"swept orphan :{port} ok" for o in log_outcomes("-")), "log: swept orphan")
+    check(serve_ports() == before, "sweep touched nothing else")
+
+
+def test_serve_routes():
+    """Route lifecycle against the stub: SIGKILL reap, teardown failure,
+    other state dirs, orphan sweep. The serve config must come back to
+    exactly what it was."""
+    before = serve_ports()
+    name = test_name("tkill")
+    url = request(name, "--http")
+    port = url.split(":")[2].split("/")[0]
+    check(port in serve_ports(), "serve config has the port while pending")
+    pid = next(r["pid"] for r in KD.read_pending() if r["name"] == name)
+    os.kill(pid, signal.SIGKILL)
+    time.sleep(0.3)
+    check(port in serve_ports(), "SIGKILL leaves the serve route behind (expected)")
+    run("status")
+    check(port not in serve_ports() and log_outcomes(name)[-1] == "reaped", "status reaps the orphaned serve route")
+
+    test_teardown_failure(before)
+    test_sweep_spares_other_state_dirs(before)
+    test_orphan_sweep(before)
+
+
+def cleanup():
+    for name in MADE:
+        subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT,
+                        "-s", KD.service(name)], capture_output=True)
+    left = [n for n in KD.keychain_list() if n.startswith("test-") and n in MADE]
+    check(not left, "all test-* entries deleted")
+    for name in OUTSIDE:
+        subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT, "-s", name],
+                       capture_output=True)
+    check(not any(outside_exists(n) for n in OUTSIDE), "kdtest-outside-* item deleted")
+
+
+def main():
+    watch = PsWatch()
+    watch.start()
+    try:
+        use_stub()
+        test_units()
+        test_watch_can_see(watch)
+        test_store_argv_intercepted()
+        test_store_verified()
+        test_local_flow(watch)
+        test_lockout()
+        test_expiry()
+        test_cancel()
+        test_sigkill_reaped_local()
+        test_no_local()
+        test_pin_on_request()
+        test_vault_local(watch)
+        test_vault_lockout_and_cancel()
+        test_vault_expiry()
+        test_serve_routes()
+        mode = oct(os.stat(STATE).st_mode & 0o777)
+        check(mode == "0o700", f"state dir is 0700 ({mode})")
+        check(not watch.hits, "ps watcher: value never on any argv/env, whole run")
+    finally:
+        watch.stop = True
+        for rec in KD.read_pending():
+            if not KD.alive(rec["pid"]):
+                continue   # a teardown-failed record's pid may be reused by now
+            try:
+                os.kill(rec["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.5)
+        cleanup()
+    print(f"\n{'FAILED ' + str(len(FAILS)) if FAILS else 'all passed'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

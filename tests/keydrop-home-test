@@ -1,0 +1,1401 @@
+#!/usr/bin/env python3
+"""keydrop-home-test — the always-on page holds the vault's line without a TTL.
+
+Never touches a real tailnet or a real keychain: `tailscale` is a stub that
+keeps its serve config in a JSON file and logs every argv it's given, and
+`security` is the fake in tests/fakes.py, backed by another JSON file.
+Requests go straight to the page's 127.0.0.1 port carrying the headers serve
+would set, which is also how a spoof would arrive. Config comes from the
+environment only (KEYDROP_CONFIG points at a file that doesn't exist).
+
+What's asserted:
+
+1. No stored value ever appears in a response body, keydrop.log,
+   home-audit.log, or anywhere in the state dir; the path token never lands in
+   the state dir, a log, or the stub's argv log.
+2. The login pin: missing, wrong, doubled, underscore-beside and
+   underscore-only Tailscale-User-Login all get a bare 404 and store nothing.
+3. CSRF: missing, forged, other-site Origin and duplicated Origin are refused
+   and count; a real-but-aged form token asks for a reload and doesn't count;
+   a cross-site Sec-Fetch-Site never reaches the handler and doesn't count; a
+   GET carrying the add fields changes nothing.
+4. Lockout: MAX_BAD strikes end the process, take the route down, and the
+   lock survives a restart (the respawned page refuses to serve) until
+   --unlock.
+5. The write rate limit holds, and holds across a restart.
+6. --stop tears the route down (with the process alive, and after a SIGKILL
+   left the route behind), and the page stays down until --unlock; the page's
+   own Stop button does the same.
+7. Delete is scoped to <service prefix><NAME_RE> under the configured account.
+8. --new-link replaces the old link without a restart.
+9. Review fixes. A request without the owner's login (wrong, missing,
+   underscore, doubled; any path, any method, GET or POST) is a bare 404 and
+   never a strike, while the owner's login with a wrong path token or method
+   still counts.
+   A form left open across a restart is stale, not a strike; forged and
+   garbled tokens still count. A stop flag ends a running page by itself,
+   and a --stop landing mid start-up (the stub stalls `status --json` to hold
+   that window open) leaves no page and no route. The rendered plist
+   template lints and runs the installed copy with `home`.
+10. Round two. A strike needs the owner's login and Sec-Fetch-Site same-origin or
+   none; without Fetch Metadata a failure is a bare 404. `home --http` is
+   refused and the no-certs error doesn't offer it. A peer without the
+   owner's login doesn't spend the owner's per-minute budget, and its refusals are logged
+   at most REQUESTS_PER_MINUTE a minute. The documented install line, run
+   in a throwaway HOME, installs origin/main and not the working tree.
+11. Round three. Every page answers only an exact Host allowlist: a
+   rebinding Host is a bare 404, uncharged and unstruck, on home and on a
+   one-shot request.
+12. Same-port binding. tailscaled's netstack forwards tailnet TCP to
+   127.0.0.1:<port> for any port serve isn't claiming, so the loopback port
+   always equals the tailnet port and nothing listens before the route
+   exists: the stub probes the backend when `serve` adds a route and records
+   whether it was already listening (it must not be). claim_port refuses a
+   port serve already uses rather than drift. home listens on
+   127.0.0.1:HOME_PORT and nothing else, refuses --local, and its watchdog
+   closes the listener and exits 1 when the route disappears or is
+   repointed, without firing while the route is intact. HOME_PORT is a free
+   port the suite picks, never the default 9443.
+13. Round five. Every request, on home, request and vault pages alike,
+   checks the route before the Host allowlist and the login pin. With the
+   route dropped (or repointed, or `serve status` garbled) the page stays up
+   past the drop, so the idle watchdog isn't what ends it, and then a request
+   carrying a valid Host, the owner's login and the right token gets a bare 404, no
+   strike, and the page exits (home with 1). Unreadable or garbled status
+   counts as gone. A repointed route is left in place by teardown.
+
+    tests/keydrop-home-test
+"""
+import html, importlib.machinery, importlib.util, json, os, re, secrets, signal, subprocess, sys
+import tempfile, time, urllib.error, urllib.parse, urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from fakes import fake_security  # noqa: E402
+
+TOOL = os.path.join(ROOT, "keydrop")
+BASE = tempfile.mkdtemp(prefix="keydrop-home-test-")
+OWNER = "owner@example.com"
+FAKE_SECURITY = fake_security(BASE)
+STATE = os.path.join(BASE, "state")
+SERVE_JSON = os.path.join(BASE, "serve.json")
+ARGV_LOG = os.path.join(BASE, "tailscale-argv.log")
+STUB = os.path.join(BASE, "tailscale")
+NOCERTS = os.path.join(BASE, "no-certs")         # present: the tailnet has no HTTPS certs
+SLOW = os.path.join(BASE, "slow-status")        # present: the next `status --json` stalls
+STALLING = os.path.join(BASE, "status-stalling")  # the stub writes this while it stalls
+PLIST_TEMPLATE = os.path.join(ROOT, "launchd", "keydrop-home.plist.template")
+README = os.path.join(ROOT, "README.md")
+HOST = "keydrop-test.example.ts.net"
+for var in ("KEYDROP_ACCOUNT", "KEYDROP_SERVICE_PREFIX", "KEYDROP_LAUNCHD_LABEL", "KEYDROP_TS_SOCKET"):
+    os.environ.pop(var, None)
+os.environ.update(KEYDROP_CONFIG=os.path.join(BASE, "no-such-config.json"), KEYDROP_STATE_DIR=STATE,
+                  KEYDROP_TAILSCALE=STUB, KEYDROP_OWNER_LOGIN=OWNER, KEYDROP_SECURITY=FAKE_SECURITY)
+ORDER_LOG = os.path.join(BASE, "serve-order.log")   # the stub: was the backend listening at `serve`?
+GARBLE = os.path.join(BASE, "garble-status")   # present: `serve status` prints its contents ("fail": exits 1)
+
+
+def free_port():
+    """A loopback port outside the ephemeral range (as 9443 is), free now."""
+    import socket
+    for p in range(40000 + secrets.randbelow(8000), 49000):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", p))
+            return p
+        except OSError:
+            continue
+        finally:
+            s.close()
+    raise SystemExit("no free port for the test home page")
+
+
+os.environ["KEYDROP_HOME_PORT"] = str(free_port())
+
+sys.dont_write_bytecode = True   # 3.14 would cache the extensionless tool in a __pycache__ beside it
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+loader = importlib.machinery.SourceFileLoader("keydrop", TOOL)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+KD = importlib.util.module_from_spec(spec)
+loader.exec_module(KD)
+# The one guard everything else rests on: never the real keychain or tailscale.
+assert KD.SECURITY == FAKE_SECURITY and KD.TAILSCALE == STUB and KD.OWNER_LOGIN == OWNER, \
+    "refusing to run against the real keychain or tailnet"
+
+FAILS, MADE, OUTSIDE, VALUES, TOKENS, BODIES = [], set(), [], [], [], []
+# The owner's browser: their login (serve sets it) and the Fetch Metadata an HTTPS
+# page gets from any current browser. Strikes need both.
+LOGIN = {"Tailscale-User-Login": KD.OWNER_LOGIN, "Sec-Fetch-Site": "same-origin"}
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+def check(cond, label):
+    print(("ok   " if cond else "FAIL ") + label)
+    if not cond:
+        FAILS.append(label)
+
+
+# ---------- the stub ----------
+
+STUB_SRC = r'''#!/usr/bin/env python3
+import json, os, re, sys, time
+SERVE, LOG, HOST, SLOW, STALLING, NOCERTS, ORDER, GARBLE = %r, %r, %r, %r, %r, %r, %r, %r
+import socket
+args = [a for a in sys.argv[1:] if not a.startswith("--socket=")]
+with open(LOG, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+def load():
+    try:
+        return json.load(open(SERVE))
+    except (OSError, ValueError):
+        return {}
+def save(st):
+    json.dump(st, open(SERVE, "w"))
+if args[:2] == ["status", "--json"]:
+    if os.path.exists(SLOW):
+        os.unlink(SLOW)
+        open(STALLING, "w").close()
+        time.sleep(3)
+    print(json.dumps({"BackendState": "Running",
+                      "CertDomains": [] if os.path.exists(NOCERTS) else [HOST],
+                      "Self": {"DNSName": HOST + "."}}))
+elif args[:3] == ["serve", "status", "--json"]:
+    g = open(GARBLE).read() if os.path.exists(GARBLE) else ""
+    if g == "fail":
+        sys.exit("failed to connect to local tailscaled")
+    print(g if g else json.dumps(load()))
+elif args and args[0] == "serve" and args[-1] == "off":
+    m = re.fullmatch(r"--https?=(\d+)", args[1])
+    st = load()
+    (st.get("TCP") or {}).pop(m.group(1), None)
+    (st.get("Web") or {}).pop(HOST + ":" + m.group(1), None)
+    save(st)
+elif args[:3] == ["serve", "--bg", "--yes"]:
+    m = re.fullmatch(r"--(https?)=(\d+)", args[3])
+    st = load()
+    st.setdefault("TCP", {})[m.group(2)] = {m.group(1).upper(): True}
+    st.setdefault("Web", {})[HOST + ":" + m.group(2)] = {"Handlers": {"/": {"Proxy": args[4]}}}
+    save(st)
+    b = re.fullmatch(r"http://127\.0\.0\.1:(\d+)", args[4])
+    listening = None
+    if b:
+        try:
+            socket.create_connection(("127.0.0.1", int(b.group(1))), 0.3).close()
+            listening = True
+        except OSError:
+            listening = False
+    with open(ORDER, "a") as f:
+        f.write(json.dumps({"port": int(m.group(2)), "backend": args[4], "listening": listening}) + "\n")
+else:
+    sys.exit("stub: unexpected " + " ".join(args))
+'''
+
+
+def make_stub():
+    with open(STUB, "w") as f:
+        f.write(STUB_SRC % (SERVE_JSON, ARGV_LOG, HOST, SLOW, STALLING, NOCERTS, ORDER_LOG, GARBLE))
+    os.chmod(STUB, 0o700)
+
+
+def serve_cfg():
+    try:
+        with open(SERVE_JSON) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def route_up():
+    return str(KD.HOME_PORT) in (serve_cfg().get("TCP") or {})
+
+
+# ---------- helpers ----------
+
+def run(*args, timeout=60, **kw):
+    return subprocess.run([TOOL, *args], capture_output=True, text=True, timeout=timeout, **kw)
+
+
+def new_link():
+    r = run("home", "--new-link")
+    url = r.stdout.strip()
+    m = re.fullmatch(rf"https://{re.escape(HOST)}:{KD.HOME_PORT}/([A-Za-z0-9_-]{{43}})", url)
+    if m:
+        TOKENS.append(m.group(1))
+    return r, (m.group(1) if m else None)
+
+
+class Page:
+    """A running `keydrop home`, started the way launchd would start it."""
+
+    def __init__(self, env=None):
+        self.proc = subprocess.Popen([TOOL, "home"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, env=dict(os.environ, **(env or {})))
+        self.port = None
+        end = time.time() + 10
+        while time.time() < end and self.proc.poll() is None:
+            rec = next((r for r in KD.read_pending() if r.get("kind") == "home"
+                        and r.get("pid") == self.proc.pid), None)
+            if rec and route_up() and accepts(rec["local_port"]):
+                self.port = rec["local_port"]
+                return
+            time.sleep(0.05)
+
+    def url(self, token):
+        return f"http://127.0.0.1:{self.port}/{token}"
+
+    def wait(self, secs=10):
+        try:
+            return self.proc.wait(secs)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def kill(self):
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGTERM)
+            self.wait()
+
+
+def accepts(port, timeout=0.2):
+    import socket
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def order_log():
+    return [json.loads(line) for line in log_lines(ORDER_LOG)]
+
+
+def listening_tcp(pid):
+    """Every TCP address the process listens on, from lsof."""
+    r = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"],
+                       capture_output=True, text=True, timeout=10)
+    return sorted(line[1:] for line in r.stdout.splitlines() if line.startswith("n"))
+
+
+def http(method, url, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            code, body = resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        code, body = e.code, e.read().decode()
+    except urllib.error.URLError:
+        code, body = 0, ""          # page gone (locked out): a check fails, not the run
+    BODIES.append(body)
+    return code, body
+
+
+def get(url, extra=None):
+    return http("GET", url, headers=dict(LOGIN, **(extra or {})))
+
+
+def post(url, fields, extra=None, login=True):
+    return http("POST", url, data=urllib.parse.urlencode(fields).encode(),
+                headers=dict(LOGIN if login else {}, **FORM, **(extra or {})))
+
+
+def csrf_of(page):
+    m = re.search(r'name="csrf" value="([^"]+)"', page)
+    return m.group(1) if m else ""
+
+
+def strikes():
+    return len(KD.recent(KD.read_home().get("bad"), KD.HOME_BAD_WINDOW))
+
+
+def name(tag):
+    n = f"test-home-{tag}-{secrets.token_hex(3)}"
+    MADE.add(n)
+    return n
+
+
+def value():
+    v = f'kd "home" & {secrets.token_hex(12)} ünï'
+    VALUES.append(v)
+    return v
+
+
+def log_lines(path):
+    try:
+        with open(path) as f:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def state_contains(needle):
+    for root, _, files in os.walk(STATE):
+        for fn in files:
+            with open(os.path.join(root, fn), "rb") as f:
+                if needle.encode() in f.read():
+                    return True
+    return False
+
+
+def restart(page):
+    page.kill()
+    unlock()
+    return Page()
+
+
+def unlock():
+    run("home", "--unlock")
+
+
+def unlock_in_process():
+    KD.update_home(lambda st: dict(st, bad=[], locked=None, stopped=None))
+
+
+# ---------- units ----------
+
+def test_units():
+    KD.ensure_state()
+    srv = KD.Home(pin=True, port=0)
+    try:
+        tok = srv.issue_csrf()
+        check(srv.check_csrf(tok) == "ok", "unit: a fresh form token is ok")
+        check(srv.check_csrf(srv.issue_csrf()) == "ok" and srv.issue_csrf().split(".")[0].isdigit(),
+              "unit: every page gets its own stamped form token")
+        old = str(int(time.time()) - KD.CSRF_MAX_AGE - 10)
+        import hashlib, hmac
+        aged = old + "." + hmac.new(srv._csrf_key, old.encode(), hashlib.sha256).hexdigest()
+        check(srv.check_csrf(aged) == "stale", "unit: a real but aged form token is stale, not bad")
+        later = str(int(srv.started) + 5)
+        same = str(int(srv.started))
+        for bad in ("", "x", tok[:-1] + ("0" if tok[-1] != "0" else "1"), later + "." + "0" * 64,
+                    same + "." + "0" * 64, old + ".", "-1.abc", tok + "x", "\u00b2." + "0" * 64):
+            check(srv.check_csrf(bad) == "bad", f"unit: forged form token {bad[:16]!r} is bad")
+        # Finding 3: a well-formed token stamped before this process started
+        # can't be verified (its key died with the old process) and is
+        # treated as stale, not as a strike. Garbled ones stay bad.
+        before = str(int(srv.started) - 3600)
+        check(srv.check_csrf(before + "." + secrets.token_hex(32)) == "stale",
+              "unit: a well-formed token stamped before this process started is stale")
+        for garbled in (before + "." + "0" * 63, before + "." + "Z" * 64,
+                        before + "." + secrets.token_hex(32).upper(), before + "." + "0" * 65,
+                        before + "x." + "0" * 64):
+            check(srv.check_csrf(garbled) == "bad", f"unit: garbled pre-start token {garbled[-8:]!r} is bad")
+        time.sleep(1.1)
+        other = KD.Home(pin=True, port=0)
+        check(other.check_csrf(tok) == "stale",
+              "unit: a form token from an earlier process is stale, not bad")
+        other.server_close()
+        srv._minute = []
+        ok = [srv.under_rate() for _ in range(KD.REQUESTS_PER_MINUTE)]
+        check(all(ok) and not srv.under_rate(), f"unit: request rate caps at {KD.REQUESTS_PER_MINUTE}/min")
+        # Finding 2: a stop or a lock reads as a full strike count, so the
+        # serve loop ends, and refusal() names it, so serve_child won't route.
+        check(srv.bad == 0 and srv.refusal() is None, "unit: no flags, no strikes, no refusal")
+        KD.update_home(lambda st: dict(st, stopped={"at": time.time(), "why": "test"}))
+        check(srv.bad >= KD.MAX_BAD, "unit: a stopped page reads as MAX_BAD (the serve loop exits)")
+        check(srv.refusal() == "stopped", "unit: refusal() says stopped")
+        srv.bad += 1
+        check(strikes() <= 1, "unit: a strike while stopped adds one strike, not a pile")
+        KD.update_home(lambda st: dict(st, stopped=None, bad=[], locked={"at": time.time(), "why": "t"}))
+        check(srv.bad >= KD.MAX_BAD and srv.refusal() == "locked", "unit: refusal() says locked")
+        unlock_in_process()
+    finally:
+        srv.server_close()
+    page = KD.render_vault("/t", "c", {}, {}, None, title="keydrop", done_label="Stop this page")
+    check("stays up" in page and "Stop this page" in page and "Link ends" not in page,
+          "unit: home page renders without an expiry")
+    st = {"TCP": {"9443": {"HTTPS": True}},
+          "Web": {f"{HOST}:9443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:50000"}}}}}
+    check(KD.home_route(st, 9443) == 50000, "unit: home_route recognises its own route")
+    st2 = {"TCP": {"9443": {"HTTPS": True}},
+           "Web": {f"{HOST}:9443": {"Handlers": {"/": {"Proxy": "http://10.0.0.1:80"}}}}}
+    check(KD.home_route(st2, 9443) is None, "unit: home_route won't claim someone else's route on 9443")
+    check(KD.orphan_routes(st, set()) == [], "unit: reap's orphan sweep never matches the home route")
+
+
+# ---------- start-up ----------
+
+def test_no_link_yet():
+    r = run("home")
+    check(r.returncode == 0 and "--new-link" in r.stderr and not route_up(),
+          "no link yet: exits 0 (launchd leaves it down), serves nothing")
+
+
+def test_new_link():
+    r, token = new_link()
+    check(r.returncode == 0 and token is not None, f"--new-link prints https://{HOST}:{KD.HOME_PORT}/<43 chars>")
+    check(not route_up(), "--new-link alone doesn't open anything")
+    check(KD.read_home().get("token_sha256") and not state_contains(token),
+          "state keeps the link's SHA-256, never the token")
+    return token
+
+
+# ---------- the main flow ----------
+
+def test_header_spoofs(page, token):
+    url = page.url(token)
+    code, body = http("GET", url)
+    check(code == 404 and body == "", "no login header: bare 404")
+    for label, hs in (("wrong login", [("Tailscale-User-Login", "x@example.com")]),
+                      ("underscore only", [("Tailscale_User_Login", KD.OWNER_LOGIN)]),
+                      ("doubled", [("Tailscale-User-Login", KD.OWNER_LOGIN),
+                                   ("Tailscale-User-Login", "x@example.com")])):
+        raw = "".join(f"{k}: {v}\r\n" for k, v in hs)
+        head = raw_get(page.port, token, raw)
+        check(" 404 " in head, f"login {label}: 404")
+        unlock()
+    head = raw_get(page.port, token, f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\n"
+                                     f"Tailscale_User_Login: {KD.OWNER_LOGIN}\r\n")
+    check(" 404 " in head, "login with an underscore lookalike beside it: 404")
+    n, v = name("spoof"), value()
+    code, _ = post(url, {"action": "add", "name": n, "value": v},
+                   {"Tailscale-User-Login": "x@example.com"}, login=False)
+    check(code == 404 and KD.keychain_get(n) is None, "POST with the wrong login stores nothing")
+    unlock()
+    check(page.proc.poll() is None, "page still up after the spoof checks (with unlocks between)")
+
+
+def raw_get(port, token, header_lines, method="GET", host=None):
+    """Hand-built request, so duplicate headers go out exactly as written.
+    host: the Host header (default 127.0.0.1:<port>; "" sends none)."""
+    import socket
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    except ConnectionError:
+        return "connection refused"
+    host = f"127.0.0.1:{port}" if host is None else host
+    hline = f"Host: {host}\r\n" if host else ""
+    s.sendall(f"{method} /{token} HTTP/1.0\r\n{hline}{header_lines}\r\n".encode())
+    out = b""
+    while True:
+        c = s.recv(65536)
+        if not c:
+            break
+        out += c
+    s.close()
+    BODIES.append(out.decode(errors="replace"))
+    return out.split(b"\r\n", 1)[0].decode()
+
+
+def test_csrf(page, token):
+    url = page.url(token)
+    code, html = get(url)
+    check(code == 200 and "keydrop" in html and "stays up" in html, "the owner's login gets the list")
+    csrf = csrf_of(html)
+    n, v = name("csrf"), value()
+    add = {"action": "add", "name": n, "value": v}
+    before = strikes()
+    code, _ = post(url, add)
+    check(code == 403 and KD.keychain_get(n) is None and strikes() == before + 1,
+          "add without a form token: 403, counts")
+    code, _ = post(url, dict(add, csrf="1." + "0" * 64))
+    check(code == 403 and KD.keychain_get(n) is None, "add with a forged form token: 403")
+    code, _ = post(url, dict(add, csrf=csrf), {"Origin": "https://evil.example"})
+    check(code == 403 and KD.keychain_get(n) is None, "add from another site's Origin: 403")
+    unlock()
+    raw = urllib.parse.urlencode(dict(add, csrf=csrf)).encode()
+    import socket
+    s = socket.create_connection(("127.0.0.1", page.port), timeout=5)
+    s.sendall((f"POST /{token} HTTP/1.0\r\nHost: 127.0.0.1:{page.port}\r\n"
+               f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\nSec-Fetch-Site: same-origin\r\nOrigin: null\r\n"
+               f"Origin: https://evil.example\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+               f"Content-Length: {len(raw)}\r\n\r\n").encode() + raw)
+    head = s.recv(4096).split(b"\r\n", 1)[0].decode()
+    s.close()
+    check(" 403 " in head and KD.keychain_get(n) is None, "two Origin headers: 403")
+    unlock()
+    before = strikes()
+    for _ in range(KD.MAX_BAD + 2):
+        code, _ = post(url, dict(add, csrf=csrf), {"Sec-Fetch-Site": "cross-site"})
+    check(code == 404 and strikes() == before and page.proc.poll() is None
+          and KD.keychain_get(n) is None,
+          f"{KD.MAX_BAD + 2} cross-site POSTs: 404, no strikes, page stays up")
+    for _ in range(KD.MAX_BAD + 2):
+        http("OPTIONS", url, headers={"Sec-Fetch-Site": "cross-site"})
+        http("GET", page.url("nope"), headers={"Sec-Fetch-Site": "same-site"})
+    check(strikes() == before and page.proc.poll() is None,
+          "cross-site preflights and same-site probes don't count either")
+    q = urllib.parse.urlencode(dict(add, csrf=csrf))
+    code, _ = get(f"{url}?{q}")
+    check(code == 200 and KD.keychain_get(n) is None, "a GET carrying the add fields changes nothing")
+    for origin in (None, "null", f"http://127.0.0.1:{page.port}"):
+        extra = {"Origin": origin} if origin else {}
+        n2 = name("origin")
+        code, _ = post(url, {"action": "add", "name": n2, "value": value(), "csrf": csrf_of(get(url)[1])},
+                       dict(extra, **{"Sec-Fetch-Site": "same-origin"}))
+        check(code == 200 and KD.keychain_exists(n2), f"add with Origin {origin!r}: stored")
+
+
+def test_writes(page, token):
+    url = page.url(token)
+    csrf = csrf_of(get(url)[1])
+    n, v, note = name("add"), value(), "for <the> tests"
+    code, html = post(url, {"csrf": csrf, "action": "add", "name": n, "note": note, "value": v})
+    check(code == 200 and f"Stored {n}." in html and KD.keychain_get(n) == v, "add stores (303 back to the list)")
+    check(n in html and "for &lt;the&gt; tests" in html and v not in html, "list shows name and note, not the value")
+    code, _ = post(url, {"csrf": csrf, "action": "add", "name": n, "value": "other"})
+    check(code == 409 and KD.keychain_get(n) == v, "add over an existing name refused")
+    v2 = value()
+    code, html = post(url, {"csrf": csrf_of(get(url)[1]), "action": "replace", "name": n, "value": v2, "note": ""})
+    check(code == 200 and KD.keychain_get(n) == v2 and KD.read_notes().get(n) == note,
+          "replace stores, blank note keeps the old one")
+
+    outside = make_outside_item()
+    for bad in ("../" + outside, "../../" + n, n.upper(), "", "a/b", "x;y", "*"):
+        code, _ = post(url, {"csrf": csrf, "action": "delete-confirm", "name": bad})
+        check(code == 400, f"delete refuses name {bad[:30]!r}")
+    for other in (outside, "keydrop." + n):
+        code, _ = post(url, {"csrf": csrf, "action": "delete-confirm", "name": other})
+        check(code == 404, f"delete-confirm {other[:30]!r} only looks under keydrop.*")
+    check(outside_exists(outside) and KD.keychain_get(n) == v2, "the non-keydrop item and the real entry survive")
+    code, html = post(url, {"csrf": csrf, "action": "delete", "name": n})
+    check(code == 200 and f"Delete {n}?" in html and KD.keychain_exists(n), "delete asks first")
+    code, html = post(url, {"csrf": csrf_of(html), "action": "delete-confirm", "name": n})
+    check(code == 200 and f"Deleted {n}." in html and not KD.keychain_exists(n), "confirmed delete removes it")
+
+    audit = log_lines(KD.AUDIT_FILE)
+    mine = [l.split("\t")[2] for l in audit if l.split("\t")[1] == n]
+    check(mine == ["add stored", "replace stored", "deleted"], f"audit log: add, replace, delete ({mine})")
+    check(all(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}\t[a-z0-9._-]+\t[a-z -]+", l) for l in audit),
+          "audit lines are time, name, event and nothing else")
+    check(oct(os.stat(KD.AUDIT_FILE).st_mode & 0o777) == "0o600", "audit log is 0600")
+
+
+def test_flood(page, token):
+    url = page.url(token)
+    codes = [get(url)[0] for _ in range(KD.REQUESTS_PER_MINUTE + 5)]
+    check(codes.count(200) == KD.REQUESTS_PER_MINUTE and set(codes[KD.REQUESTS_PER_MINUTE:]) == {429},
+          f"past {KD.REQUESTS_PER_MINUTE} requests a minute: bare 429")
+    for _ in range(KD.MAX_BAD + 1):
+        http("GET", page.url(secrets.token_urlsafe(32)), headers=LOGIN)
+    check(strikes() == 0 and page.proc.poll() is None, "flooded wrong-token requests aren't counted")
+
+
+def test_rate_limit(page, token):
+    url = page.url(token)
+    n = name("rate")
+    now = time.time()
+    KD.update_home(lambda st: dict(st, writes=[now - 10] * (KD.WRITE_LIMIT - 1)))
+    code, _ = post(url, {"csrf": csrf_of(get(url)[1]), "action": "add", "name": n, "value": value()})
+    check(code == 200 and KD.keychain_exists(n), f"write {KD.WRITE_LIMIT} of {KD.WRITE_LIMIT} in the hour goes through")
+    n2 = name("rate")
+    code, html = post(url, {"csrf": csrf_of(get(url)[1]), "action": "add", "name": n2, "value": value()})
+    check(code == 429 and not KD.keychain_exists(n2), "the next write: 429, nothing stored")
+    code, _ = post(url, {"csrf": csrf_of(get(url)[1]), "action": "delete-confirm", "name": n})
+    check(code == 429 and KD.keychain_exists(n), "deletes are rate limited too")
+    code, _ = post(url, {"csrf": csrf_of(get(url)[1]), "action": "add", "name": name("rate"), "value": ""})
+    check(code == 400 and len(KD.read_home().get("writes")) == KD.WRITE_LIMIT,
+          "an empty submit is refused before it can book a write")
+    check(f"{n2}\tadd rate-limited" in "\n".join(log_lines(KD.AUDIT_FILE)), "audit log records the refusal")
+    page.kill()
+    page2 = Page()
+    check(page2.port is not None, "restarted")
+    code, _ = post(page2.url(token), {"csrf": csrf_of(get(page2.url(token))[1]), "action": "add",
+                                      "name": n2, "value": value()})
+    check(code == 429 and not KD.keychain_exists(n2), "the rate limit survives a restart")
+    KD.update_home(lambda st: dict(st, writes=[now - KD.WRITE_WINDOW - 1] * KD.WRITE_LIMIT))
+    code, _ = post(page2.url(token), {"csrf": csrf_of(get(page2.url(token))[1]), "action": "add",
+                                      "name": n2, "value": value()})
+    check(code == 200 and KD.keychain_exists(n2), "writes older than the window don't count")
+    return page2
+
+
+def test_lockout(page, token):
+    url = page.url(token)
+    unlock()
+    for i in range(KD.MAX_BAD):
+        try:
+            http("GET", page.url(secrets.token_urlsafe(32)), headers=LOGIN)
+        except (urllib.error.URLError, ConnectionError):
+            pass
+    rc = page.wait()
+    check(rc == 0, f"{KD.MAX_BAD} wrong tokens: process exits 0 (so launchd's KeepAlive leaves it down)")
+    check(not route_up(), "lockout tears the route down")
+    check(KD.read_home().get("locked"), "the lock is written to home.json")
+    r = run("home")
+    check(r.returncode == 0 and "locked" in r.stderr and not route_up(),
+          "a restart refuses to serve while locked")
+    st = run("status").stdout
+    check("locked" in st and "--unlock" in st, "status says it's locked")
+    check(http("GET", url, headers=LOGIN)[0] == 0, "the old port is dead")
+    unlock()
+    check(not KD.read_home().get("locked") and strikes() == 0, "--unlock clears the lock and the strikes")
+    page2 = Page()
+    check(page2.port is not None and route_up(), "starts again after --unlock")
+    return page2
+
+
+def test_new_link_replaces(page, old):
+    r, token = new_link()
+    code, _ = get(page.url(old))
+    check(code == 404, "after --new-link the old bookmark 404s, without a restart")
+    code, _ = get(page.url(token))
+    check(code == 200, "and the new one works")
+    unlock()
+    return token
+
+
+def test_stop(page, token):
+    check(route_up(), "route up before --stop")
+    r = run("home", "--stop")
+    check(r.returncode == 0, "--stop succeeds")
+    check(page.wait() == 0, "--stop ends the process, exit 0")
+    check(not route_up(), "--stop: route gone from serve config")
+    check(not [x for x in KD.read_pending() if x.get("kind") == "home"], "--stop: no record left")
+    r = run("home")
+    check(r.returncode == 0 and "stopped" in r.stderr and not route_up(), "stays down while stopped")
+
+    unlock()
+    page = Page()
+    check(page.port is not None, "--unlock lets it start again")
+    os.kill(page.proc.pid, signal.SIGKILL)
+    page.wait()
+    check(route_up(), "SIGKILL leaves the route behind (expected)")
+    r = run("home", "--stop")
+    check(r.returncode == 0 and not route_up(), "--stop removes a dead page's route")
+
+    unlock()
+    page = Page()
+    url = page.url(token)
+    code, html = post(url, {"csrf": csrf_of(get(url)[1]), "action": "done"})
+    check(code == 200 and "Stopped" in html, "the page's Stop button")
+    check(page.wait() == 0 and not route_up(), "Stop button: process exits 0, route gone")
+    check(KD.read_home().get("stopped"), "Stop button leaves the stopped flag")
+    other = {"TCP": {str(KD.HOME_PORT): {"HTTPS": True}},
+             "Web": {f"{HOST}:{KD.HOME_PORT}": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}}}
+    with open(SERVE_JSON, "w") as f:
+        json.dump(other, f)
+    r = run("home", "--stop")
+    check(r.returncode != 0 and "leaving it" in r.stderr, "--stop refuses a route that isn't home's")
+    check(serve_cfg() == other, "--stop leaves someone else's route on the port alone")
+    with open(SERVE_JSON, "w") as f:
+        json.dump({}, f)
+    unlock()
+
+
+def test_strangers_cant_lock(page, token):
+    """Finding 1. serve overwrites Tailscale-User-Login from WhoIs, so a
+    request that doesn't carry the owner's login can never get in; counting it only
+    hands every other tailnet node a way to lock the page.
+    Every stranger request here also claims Sec-Fetch-Site: same-origin:
+    a peer with curl can send any Fetch Metadata it likes, so the login
+    check has to hold on its own, not behind the Fetch Metadata gate."""
+    before = strikes()
+    fm = "Sec-Fetch-Site: same-origin\r\n"
+    variants = (("wrong login", fm + "Tailscale-User-Login: x@example.com\r\n"),
+                ("no login", fm),
+                ("underscore only", fm + f"Tailscale_User_Login: {KD.OWNER_LOGIN}\r\n"),
+                ("doubled", fm + f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\nTailscale-User-Login: x@example.com\r\n"))
+    for label, hs in variants:
+        heads = [raw_get(page.port, t, hs) for t in (token, "nope", secrets.token_urlsafe(32))
+                 for _ in range(2)]
+        check(all(" 404 " in h for h in heads), f"stranger ({label}), any path: 404")
+    for method in ("HEAD", "PUT", "DELETE", "OPTIONS"):
+        heads = [raw_get(page.port, "nope", fm + "Tailscale-User-Login: x@example.com\r\n", method)
+                 for _ in range(2)]
+        check(all(" 404 " in h for h in heads), f"stranger {method}: 404")
+    n = name("stranger")
+    code = None
+    for _ in range(KD.MAX_BAD + 1):
+        try:
+            code, _ = post(page.url(token), {"action": "add", "name": n, "value": value()},
+                           {"Tailscale-User-Login": "x@example.com", "Sec-Fetch-Site": "same-origin"},
+                           login=False)
+        except (urllib.error.URLError, ConnectionError):
+            code = "refused"
+    check(code == 404 and KD.keychain_get(n) is None, "stranger POSTs: 404, nothing stored")
+    check(strikes() == before and not KD.read_home().get("locked") and page.proc.poll() is None,
+          f"{len(variants) * 6 + 8 + KD.MAX_BAD + 1} stranger requests: no strikes, no lock, page up")
+    if page.proc.poll() is not None or KD.read_home().get("locked"):
+        check(False, "page locked during the stranger flood; skipping the rest")
+        unlock()
+        return
+    code, _ = get(page.url(token))
+    check(code == 200, "the owner still gets in after the stranger flood")
+    code, _ = get(page.url("nope"))
+    check(code == 404 and strikes() == before + 1, "the owner's login with a wrong path token still counts")
+    raw_get(page.port, "nope", f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\nSec-Fetch-Site: same-origin\r\n", "PUT")
+    check(strikes() == before + 2, "the owner's login with an unsupported method still counts")
+    unlock()
+
+
+def test_stale_after_restart(page, token):
+    """Finding 3. A form left open across a restart carries a token MACed
+    under the dead process's key: stale (reload), not a strike."""
+    url = page.url(token)
+    old_csrf = csrf_of(get(url)[1])
+    time.sleep(1.1)   # the restart has to land in a later second than the stamp
+    page = restart(page)
+    url = page.url(token)
+    n = name("restart")
+    before = strikes()
+    code, body = post(url, {"csrf": old_csrf, "action": "add", "name": n, "value": value()})
+    check(code == 403 and "stale" in body and KD.keychain_get(n) is None,
+          "a form from before the restart: 403, asks for a reload, stores nothing")
+    check(strikes() == before, "and isn't counted as a strike")
+    stamp = str(int(time.time()) + 2)
+    before = strikes()
+    code, _ = post(url, {"csrf": stamp + "." + "0" * 64, "action": "add", "name": n, "value": value()})
+    check(code == 403 and strikes() == before + 1, "a forged token stamped after the restart still counts")
+    before = strikes()
+    code, _ = post(url, {"csrf": "1." + "0" * 63, "action": "add", "name": n, "value": value()})
+    check(code == 403 and strikes() == before + 1, "a garbled old-looking token still counts")
+    unlock()
+    return page
+
+
+def test_stop_flag_ends_loop(token):
+    """Finding 2, the loop half. A stop flag set while the page runs ends the
+    serve loop on its own, even if the SIGTERM never reaches it."""
+    unlock()
+    page = Page()
+    check(page.port is not None, "page up before the flag is set")
+    KD.update_home(lambda st: dict(st, stopped={"at": time.time(), "why": "test"}))
+    rc = page.wait(5)
+    check(rc == 0 and not route_up(), "a stop flag set mid-run ends the page (exit 0) and takes the route down")
+    page.kill()
+    unlock()
+
+
+def test_stop_race(token):
+    """Finding 2, the start-up half. --stop lands while `keydrop home` is past
+    its start-up flag check but hasn't routed yet. --stop must not be a lie:
+    the page must not come up afterwards."""
+    unlock()
+    for f in (SLOW, STALLING):
+        if os.path.exists(f):
+            os.unlink(f)
+    open(SLOW, "w").close()
+    proc = subprocess.Popen([TOOL, "home"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    end = time.time() + 10
+    while time.time() < end and not os.path.exists(STALLING):
+        time.sleep(0.02)
+    check(os.path.exists(STALLING) and proc.poll() is None, "race: home is stalled inside start-up")
+    r = run("home", "--stop")
+    check(r.returncode == 0, "race: --stop reports the page stopped")
+    seen = len(log_lines(ARGV_LOG))
+    try:
+        rc = proc.wait(15)
+    except subprocess.TimeoutExpired:
+        rc = None
+    up = route_up()
+    if rc is None:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(15)
+    check(rc == 0, f"race: the page exits 0 instead of serving after --stop (rc={rc})")
+    check(not up, "race: no route after --stop")
+    later = [json.loads(l) for l in log_lines(ARGV_LOG)[seen:]]
+    check(not [a for a in later if a[:2] == ["serve", "--bg"]],
+          "race: the page never puts a route up after --stop (not even briefly)")
+    check(log_lines(KD.LOG_FILE)[-1:] and log_lines(KD.LOG_FILE)[-1].endswith("refused (stopped)"),
+          "race: the page logs that it refused to start")
+    check(not [x for x in KD.read_pending() if x.get("kind") == "home"], "race: no record left")
+    check(KD.read_home().get("stopped"), "race: still flagged stopped")
+    unlock()
+
+
+def render_plist(label, python, keydrop, log):
+    with open(PLIST_TEMPLATE) as f:
+        text = f.read()
+    for k, v in (("__LABEL__", label), ("__PYTHON__", python), ("__KEYDROP__", keydrop), ("__LOG__", log)):
+        text = text.replace(k, v)
+    return text
+
+
+def test_plist():
+    """The launchd template renders to a valid plist that runs an installed
+    copy with `home`, restarts only on failure, and leaves no placeholder."""
+    import plistlib
+    with open(PLIST_TEMPLATE) as f:
+        found = set(re.findall(r"__[A-Z]+__", f.read()))
+    check(found == {"__LABEL__", "__PYTHON__", "__KEYDROP__", "__LOG__"}, f"template placeholders ({sorted(found)})")
+    installed = os.path.join(BASE, "bin", "keydrop")
+    log = os.path.join(BASE, "home.launchd.log")
+    out = os.path.join(BASE, "rendered.plist")
+    text = render_plist(KD.LAUNCHD_LABEL, sys.executable, installed, log)
+    with open(out, "w") as f:
+        f.write(text)
+    check(not re.search(r"__[A-Z]+__", text), "rendered plist has no placeholder left")
+    lint = subprocess.run(["/usr/bin/plutil", "-lint", out], capture_output=True, text=True)
+    check(lint.returncode == 0, "rendered plist passes plutil -lint")
+    with open(out, "rb") as f:
+        pl = plistlib.load(f)    # strict XML: the template's comment must not hold a double hyphen
+    check(pl["Label"] == KD.LAUNCHD_LABEL, "plist label is the configured launchd label")
+    check(pl["ProgramArguments"] == [sys.executable, installed, "home"], "plist runs <python> <installed copy> home")
+    check(pl["KeepAlive"] == {"SuccessfulExit": False} and pl["RunAtLoad"] is True,
+          "plist restarts only on failure, starts at load")
+    check(pl["StandardOutPath"] == log == pl["StandardErrorPath"], "plist logs to the given path")
+
+
+def test_fetch_metadata(page, token):
+    """Round 2, finding 1. A strike needs the owner's login AND Sec-Fetch-Site of
+    same-origin or none. Without Fetch Metadata (plain HTTP, a non-browser,
+    an <img> on a page that got none) a failure is a bare 404 and no strike."""
+    url = page.url(token)
+    mo_bare = {"Tailscale-User-Login": KD.OWNER_LOGIN}
+    before = strikes()
+    for _ in range(KD.MAX_BAD + 1):
+        code, body = http("GET", page.url(secrets.token_urlsafe(32)), headers=mo_bare)
+    check(code == 404 and body == "" and strikes() == before and page.proc.poll() is None,
+          f"{KD.MAX_BAD + 1} wrong tokens without Sec-Fetch-Site: bare 404, no strikes, page up")
+    n = name("nofetch")
+    forged = f"{int(time.time()) + 5}.{'0' * 64}"   # stamped after start: "bad", not "stale"
+    code, body = http("POST", url, data=urllib.parse.urlencode(
+        {"csrf": forged, "action": "add", "name": n, "value": value()}).encode(),
+        headers=dict(mo_bare, **FORM))
+    check(code == 404 and body == "" and strikes() == before and KD.keychain_get(n) is None,
+          "a forged form token without Sec-Fetch-Site: bare 404, no strike, nothing stored")
+    head = raw_get(page.port, "nope", f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\n"
+                   "Sec-Fetch-Site: same-origin\r\nSec-Fetch-Site: same-origin\r\n")
+    check(" 404 " in head and strikes() == before, "a doubled Sec-Fetch-Site doesn't count")
+    code, _ = get(page.url("nope"), {"Sec-Fetch-Site": ""})
+    check(code == 404 and strikes() == before, "an empty Sec-Fetch-Site doesn't count")
+    code, _ = http("GET", url, headers=mo_bare)
+    check(code == 200, "the right token without Sec-Fetch-Site still gets the page")
+    code, _ = get(page.url("nope"), {"Sec-Fetch-Site": "none"})
+    check(code == 404 and strikes() == before + 1, "a mistyped bookmark (Sec-Fetch-Site: none) counts")
+    code, _ = post(url, {"csrf": forged, "action": "add", "name": n, "value": value()})
+    check(code == 403 and strikes() == before + 2, "a forged form token from the owner's browser counts")
+    unlock()
+
+
+def test_no_http():
+    """Round 2, finding 1. Browsers send no Fetch Metadata over plain HTTP,
+    so home won't run there at all."""
+    r = run("home", "--local", timeout=10)
+    check(r.returncode != 0 and "no --local" in r.stderr and not route_up(),
+          "home --local: refused, says why, serves nothing")
+    for args in (("home", "--http"), ("home", "--new-link", "--http")):
+        try:
+            r = run(*args, timeout=10)
+            ok = r.returncode != 0 and "HTTPS" in r.stderr and not route_up()
+        except subprocess.TimeoutExpired:
+            ok = False
+            run("home", "--stop")
+            unlock()
+        check(ok, f"keydrop {' '.join(args)}: refused, says why, serves nothing")
+    open(NOCERTS, "w").close()
+    try:
+        r = run("home", "--new-link")
+        check(r.returncode != 0 and "HTTPS" in r.stderr and "--http" not in r.stderr,
+              "home on a tailnet without certs: fails without suggesting --http")
+        r = run("request", "test-home-hint")
+        check(r.returncode != 0 and "--http" in r.stderr, "request still offers --http there")
+    finally:
+        os.unlink(NOCERTS)
+
+
+def test_peer_flood(page, token):
+    """Round 2, finding 2. A peer without the owner's login doesn't spend
+    the owner's per-minute budget, and its refusals don't grow keydrop.log without bound."""
+    logged = sum(1 for l in log_lines(KD.LOG_FILE) if l.endswith("refused: login"))
+    for _ in range(KD.REQUESTS_PER_MINUTE + 15):
+        http("GET", page.url(token), headers={"Tailscale-User-Login": "x@example.com"})
+    code, _ = get(page.url(token))
+    check(code == 200, f"after {KD.REQUESTS_PER_MINUTE + 15} peer requests the owner still gets 200, not 429")
+    more = sum(1 for l in log_lines(KD.LOG_FILE) if l.endswith("refused: login")) - logged
+    check(0 < more <= KD.REQUESTS_PER_MINUTE,
+          f"refused logins are logged at most {KD.REQUESTS_PER_MINUTE} a minute ({more})")
+
+
+def test_install_line():
+    """The documented install line takes keydrop from origin/main, not from
+    the working tree or an unpushed commit. Run for real against a throwaway
+    HOME with its own clone and bare origin."""
+    with open(README) as f:
+        lines = [l.strip() for l in f.read().splitlines() if "install -m 0755" in l]
+    check(len(lines) == 1, "README documents one install line")
+    if len(lines) != 1:
+        return
+    line = lines[0]
+    home = os.path.join(BASE, "install-home")
+    origin, clone = os.path.join(BASE, "origin.git"), os.path.join(home, "src", "keydrop")
+    git = ["/usr/bin/git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    env = {"HOME": home, "PATH": "/usr/bin:/bin", "TMPDIR": os.path.join(BASE, "install-tmp")}
+    os.makedirs(env["TMPDIR"])
+    os.makedirs(os.path.join(home, ".local", "bin"))
+    q = dict(capture_output=True, env=env, check=True)
+    subprocess.run(git + ["init", "-q", "--bare", "-b", "main", origin], **q)
+    subprocess.run(git + ["clone", "-q", origin, clone], **q)
+    target = os.path.join(clone, "keydrop")
+
+    def commit(text, push):
+        with open(target, "w") as f:
+            f.write(text)
+        subprocess.run(git + ["-C", clone, "add", "-A"], **q)
+        subprocess.run(git + ["-C", clone, "commit", "-qm", text], **q)
+        if push:
+            subprocess.run(git + ["-C", clone, "push", "-q", "origin", "HEAD:main"], **q)
+    commit("old\n", True)
+    other = os.path.join(BASE, "other-clone")    # the merge lands on origin from elsewhere
+    subprocess.run(git + ["clone", "-q", origin, other], **q)
+    with open(os.path.join(other, "keydrop"), "w") as f:
+        f.write("reviewed\n")
+    subprocess.run(git + ["-C", other, "commit", "-qam", "reviewed"], **q)
+    subprocess.run(git + ["-C", other, "push", "-q", "origin", "HEAD:main"], **q)
+    commit("unpushed\n", False)
+    with open(target, "w") as f:
+        f.write("uncommitted\n")
+    r = subprocess.run(["/bin/bash", "-c", line], capture_output=True, text=True, env=env)
+    installed = os.path.join(home, ".local", "bin", "keydrop")
+    got = open(installed).read() if os.path.exists(installed) else None
+    check(r.returncode == 0 and got == "reviewed\n",
+          "install line fetches and installs origin/main, not a stale origin/main, "
+          f"an unpushed commit or the working tree ({got!r})")
+    check(got is not None and oct(os.stat(installed).st_mode & 0o777) == "0o755", "installed 0755")
+
+
+OWNER_RAW = f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\nSec-Fetch-Site: same-origin\r\n"
+
+
+def test_host_units():
+    """Round 3. The Host allowlist, called directly on a server object."""
+    srv = KD.OneShot("t" * 43, "x", "", pin=True)
+    try:
+        port = srv.server_address[1]
+        srv.allow_hosts(HOST, 9443)
+        for good in (HOST, f"{HOST}:9443", f"127.0.0.1:{port}", f"localhost:{port}",
+                     f"LOCALHOST:{port}"):
+            check(srv.host_allowed([good]), f"unit: Host {good!r} allowed")
+        for bad in ([], [""], ["evil.example"], [f"evil.example:{port}"], ["127.0.0.1"],
+                    [f"127.0.0.1:{port + 1}"], [f"{HOST}:9444"], [f"{HOST}.evil.example"],
+                    [f"{HOST}:9443", f"{HOST}:9443"], [f"{HOST}:9443", "evil.example"],
+                    [f"x{HOST}"], [f"127.0.0.1:{port} "]):
+            check(not srv.host_allowed(bad), f"unit: Host {bad!r} refused")
+        loc = KD.OneShot("t" * 43, "x", "", pin=False)
+        try:
+            lp = loc.server_address[1]
+            check(loc.host_allowed([f"127.0.0.1:{lp}"]) and not loc.host_allowed([HOST]),
+                  "unit: a --local page allows only its own loopback names")
+        finally:
+            loc.server_close()
+    finally:
+        srv.server_close()
+
+
+def test_rebinding(page, token):
+    """Round 3. A page in a browser on the Mac rebinds its own hostname to
+    127.0.0.1 and sends the owner's login as a custom header. Its Host is its own
+    name, so it gets a bare 404, uncharged, unstruck."""
+    before = strikes()
+    evil = f"rebind.evil.example:{page.port}"
+    heads = [raw_get(page.port, token, OWNER_RAW, host=evil) for _ in range(KD.REQUESTS_PER_MINUTE + 15)]
+    check(all(" 404 " in h for h in heads),
+          f"{KD.REQUESTS_PER_MINUTE + 15} rebinding requests with the owner's login and the right token: 404")
+    code, _ = get(page.url(token))
+    check(code == 200 and strikes() == before, "after them the owner still gets 200, and no strikes")
+    for label, h, extra in (("missing", "", ""), ("other port", f"127.0.0.1:{page.port + 1}", ""),
+                            ("duplicate", f"127.0.0.1:{page.port}", f"Host: 127.0.0.1:{page.port}\r\n"),
+                            ("tailnet name, wrong port", f"{HOST}:9444", "")):
+        head = raw_get(page.port, token, OWNER_RAW + extra, host=h)
+        check(" 404 " in head, f"Host {label}: 404")
+    for h in (HOST, f"{HOST}:{KD.HOME_PORT}", f"127.0.0.1:{page.port}", f"localhost:{page.port}"):
+        head = raw_get(page.port, token, OWNER_RAW, host=h)
+        check(" 200 " in head, f"Host {h}: 200")
+    head = raw_get(page.port, "nope", OWNER_RAW, "PUT", host=evil)
+    check(" 404 " in head and strikes() == before, "a rebinding PUT: 404, no strike")
+    check(strikes() == before, "no strikes from any of it")
+
+
+def test_request_host():
+    """Round 3. The one-shot request page (tailnet mode, stubbed serve) has
+    the same Host allowlist: its tailnet name and port work, and rebinding
+    GETs and PUTs neither use up MAX_REQUESTS nor count as bad."""
+    n = name("rebind")
+    r = run("request", n)
+    m = re.fullmatch(rf"https://{re.escape(HOST)}:(\d+)/([A-Za-z0-9_-]{{43}})", r.stdout.strip())
+    rec = next((x for x in KD.read_pending() if x.get("name") == n), None)
+    check(r.returncode == 0 and m and rec, "request prints a tailnet link and records its port")
+    if not (m and rec):
+        run("cancel", n)
+        return
+    tport, tok, port = int(m.group(1)), m.group(2), rec["local_port"]
+    check(tport == port == rec["tailnet_port"], "a request's tailnet port is its loopback port")
+    seen = [e for e in order_log() if e["port"] == tport]
+    check(len(seen) == 1 and seen[0]["listening"] is False,
+          f"the request wasn't listening yet when serve claimed :<port> ({seen})")
+    owner = f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\n"
+    evil = f"rebind.evil.example:{port}"
+    try:
+        heads = [raw_get(port, tok, owner, host=evil) for _ in range(KD.MAX_REQUESTS + 5)]
+        heads += [raw_get(port, "nope", owner, "PUT", host=evil) for _ in range(KD.MAX_BAD + 1)]
+        check(all(" 404 " in h for h in heads),
+              f"{KD.MAX_REQUESTS + KD.MAX_BAD + 6} rebinding GETs and PUTs: 404")
+        for h in (f"{HOST}:{tport}", HOST, f"localhost:{port}"):
+            check(" 200 " in raw_get(port, tok, owner, host=h),
+                  f"the request page still answers Host {h.replace(str(port), '<port>')}")
+    finally:
+        run("cancel", n)
+
+
+def test_same_port(page):
+    """The home page binds 127.0.0.1:HOME_PORT, the port its route claims,
+    listens there and nowhere else, and wasn't listening when serve added
+    the route."""
+    rec = next((r for r in KD.read_pending() if r.get("kind") == "home"), {})
+    check(rec.get("local_port") == rec.get("tailnet_port") == KD.HOME_PORT,
+          "home's record: loopback port == tailnet port == HOME_PORT")
+    seen = [e for e in order_log() if e["port"] == KD.HOME_PORT]
+    check(bool(seen) and seen[-1]["listening"] is False,
+          f"home wasn't listening yet when serve claimed its port ({seen[-1:]})")
+    check(listening_tcp(page.proc.pid) == [f"127.0.0.1:{KD.HOME_PORT}"],
+          f"home listens on 127.0.0.1:HOME_PORT only ({listening_tcp(page.proc.pid)})")
+    try:
+        KD.Home(pin=True).server_close()
+        taken = False
+    except Exception as e:   # a raw OSError here means the refusal went missing
+        taken = isinstance(e, KD.KeydropError) and "already taken" in str(e)
+    check(taken, "a second bind on HOME_PORT while home runs is refused, as a KeydropError")
+
+
+class _Every:
+    def __contains__(self, _):
+        return True
+
+
+class _FirstOnly:
+    def __init__(self):
+        self.seen = False
+
+    def __contains__(self, _):
+        hit, self.seen = not self.seen, True
+        return hit
+
+
+def test_same_port_units():
+    """claim_port, route_ours, the watchdog's gating, and a bound page that
+    isn't listening yet, called directly."""
+    made = []
+
+    def make():
+        made.append(KD.OneShot("t" * 43, "x", ""))
+        return made[-1]
+    try:
+        KD.claim_port(make, _Every(), tries=3)
+        refused = False
+    except KD.KeydropError:
+        refused = True
+    check(refused and len(made) == 3 and all(s.fileno() == -1 for s in made),
+          "unit: claim_port refuses when every port it binds is served, and closes them all")
+    made.clear()
+    got = KD.claim_port(make, _FirstOnly(), tries=3)
+    check(got is made[1] and made[0].fileno() == -1 and got.fileno() != -1
+          and got.server_address[1] != made[0].server_address[1],
+          "unit: claim_port skips a port serve already uses, keeps the next")
+    got.server_close()
+    made.clear()
+    got = KD.claim_port(make, set(), tries=3)
+    check(got is made[0] and len(made) == 1, "unit: claim_port keeps the first free port")
+    check(not got.listening and not accepts(got.server_address[1], 0.5),
+          "unit: a new page is bound but not listening (a connect gets nowhere)")
+    got.listen()
+    check(got.listening and accepts(got.server_address[1]), "unit: listen() opens it")
+    got.server_close()
+
+    p = KD.HOME_PORT
+
+    def route(proxy, port=p):
+        return {"TCP": {str(port): {"HTTPS": True}},
+                "Web": {f"{HOST}:{port}": {"Handlers": {"/": {"Proxy": proxy}}}}}
+    check(KD.route_ours(route(f"http://127.0.0.1:{p}"), p), "unit: route_ours: same-port route is ours")
+    check(not KD.route_ours(None, p), "unit: route_ours: unreadable status counts as gone (fail closed)")
+    for label, st in (("a list", []), ("Web as a list", {"TCP": {str(p): {"HTTPS": True}}, "Web": [f"{HOST}:{p}"]}),
+                      ("Handlers as a string", {"TCP": {str(p): {"HTTPS": True}},
+                                                "Web": {f"{HOST}:{p}": {"Handlers": "x"}}}),
+                      ("TCP as a list", dict(route(f"http://127.0.0.1:{p}"), TCP=[str(p)])),
+                      ("Proxy a number", route(p))):
+        try:
+            ours = KD.route_ours(st, p)
+        except Exception as e:   # a crash in the per-request check is a 500, not a refusal
+            ours = f"raised {type(e).__name__}"
+        check(ours is False, f"unit: route_ours: garbled status ({label}) counts as gone ({ours})")
+    srv = KD.OneShot("t" * 43, "x", "")
+    try:
+        q = srv.server_address[1]
+        check(not srv.route_intact(route(f"http://127.0.0.1:{q}", q)),
+              "unit: route_intact: a page with no tailnet port is never intact")
+        srv.allow_hosts(HOST, q + 1)
+        check(not srv.route_intact(route(f"http://127.0.0.1:{q + 1}", q + 1)),
+              "unit: route_intact: a tailnet port that isn't the loopback port is never intact")
+        srv.allow_hosts(HOST, q)
+        check(srv.route_intact(route(f"http://127.0.0.1:{q}", q)), "unit: route_intact: own route is intact")
+        check(not srv.route_intact({}), "unit: route_intact: no route, not intact")
+    finally:
+        srv.server_close()
+    for label, st in (("no route", {}), ("other port's route", route(f"http://127.0.0.1:{p + 1}", p + 1)),
+                      ("repointed", route(f"http://127.0.0.1:{p + 1}")),
+                      ("repointed off-box", route(f"http://10.0.0.1:{p}"))):
+        check(not KD.route_ours(st, p), f"unit: route_ours: {label} is not ours")
+
+    h = KD.Home(pin=True, port=0)
+    try:
+        now = 1000.0
+        check(h.watch(now, status={}) is None, "unit: the watchdog does nothing before listening")
+        h.listen()
+        check(h.watch(now, status=route(f"http://127.0.0.1:{p}")) is None,
+              "unit: watchdog quiet while the route is there")
+        check(h.watch(now + 1, status={}) is None, "unit: watchdog waits out its interval")
+        check(h.watch(now + KD.WATCH_INTERVAL, status={}) == "route-gone",
+              "unit: watchdog ends the loop once the route is gone")
+    finally:
+        h.server_close()
+    for val, want in (("999", KD.WATCH_INTERVAL), ("0.3", 0.3), ("x", KD.WATCH_INTERVAL), ("", KD.WATCH_INTERVAL)):
+        os.environ["KEYDROP_WATCH_INTERVAL"] = val
+        check(KD.watch_interval() == want, f"unit: watch interval {val!r} -> {want}")
+    os.environ.pop("KEYDROP_WATCH_INTERVAL", None)
+
+
+def test_watchdog(token):
+    """A route removed (or repointed) behind home's back: home closes its
+    listener and exits 1 within a couple of watch intervals. An intact route
+    doesn't trip it."""
+    unlock()
+    fast = {"KEYDROP_WATCH_INTERVAL": "0.3"}
+    page = Page(fast)
+    check(page.port is not None, "watchdog: page up")
+    reads = sum(1 for line in log_lines(ARGV_LOG) if '"serve", "status"' in line)
+    time.sleep(1.5)
+    check(page.proc.poll() is None and get(page.url(token))[0] == 200,
+          "watchdog: an intact route doesn't trip it")
+    check(sum(1 for line in log_lines(ARGV_LOG) if '"serve", "status"' in line) > reads,
+          "watchdog: it does read serve status while up")
+    for label, change in (("removed", lambda st: {}),
+                          ("repointed", lambda st: dict(st, Web={f"{HOST}:{KD.HOME_PORT}": {"Handlers": {"/": {
+                              "Proxy": f"http://127.0.0.1:{KD.HOME_PORT + 1}"}}}}))):
+        if page.port is None:
+            page = Page(fast)
+        with open(SERVE_JSON, "w") as f:
+            json.dump(change(serve_cfg()), f)
+        rc = page.wait(5)
+        err = page.proc.stderr.read() if rc is not None else ""
+        check(rc == 1 and "went away" in err, f"watchdog: route {label}: exits 1 and says why ({rc})")
+        check(not accepts(KD.HOME_PORT), f"watchdog: route {label}: nothing listens on HOME_PORT after")
+        check(not any(r.get("kind") == "home" for r in KD.read_pending()),
+              f"watchdog: route {label}: no home record left")
+        page.kill()
+        page = Page(fast) if label == "removed" else None
+    check(not route_up() or run("home", "--stop").returncode == 0, "watchdog: tidy")
+    unlock()
+
+
+def set_garble(text):
+    if text is None:
+        if os.path.exists(GARBLE):
+            os.unlink(GARBLE)
+        return
+    with open(GARBLE, "w") as f:
+        f.write(text)
+
+
+def outcomes(n):
+    return [line.split("\t")[2] for line in log_lines(KD.LOG_FILE) if line.split("\t")[1:2] == [n]]
+
+
+def test_route_check_home(token):
+    """The page reads serve status on every request, before the gate. The
+    idle watchdog runs at its full 10s here, and the route is dropped right
+    after a tick, so the page is demonstrably still up when the request
+    lands: only the per-request check can be what refuses it."""
+    unlock()
+    cases = (("removed", lambda st: {}, None),
+             ("repointed", lambda st: dict(st, Web={f"{HOST}:{KD.HOME_PORT}": {"Handlers": {"/": {
+                 "Proxy": f"http://127.0.0.1:{KD.HOME_PORT + 1}"}}}}), None),
+             ("status garbled", lambda st: st, "{not json"),
+             ("status unreadable", lambda st: st, "fail"))
+    for label, change, garble in cases:
+        page = Page()
+        check(page.port is not None and get(page.url(token))[0] == 200, f"route check, {label}: page up, the owner gets in")
+        before = strikes()
+        with open(SERVE_JSON, "w") as f:
+            json.dump(change(serve_cfg()), f)
+        set_garble(garble)
+        time.sleep(1.5)
+        check(page.proc.poll() is None and accepts(KD.HOME_PORT),
+              f"route check, {label}: still listening 1.5s on (the watchdog hasn't caught it)")
+        code, body = get(page.url(token), {"Host": f"{HOST}:{KD.HOME_PORT}"})
+        rc = page.wait(3)
+        err = page.proc.stderr.read() if rc is not None else ""
+        check(code == 404 and body == "", f"route check, {label}: the owner's login, right Host and token: bare 404 ({code})")
+        check(rc == 1 and "went away" in err, f"route check, {label}: the page exits 1 right after ({rc})")
+        check(not accepts(KD.HOME_PORT), f"route check, {label}: nothing listens after")
+        check(strikes() == before, f"route check, {label}: no strike")
+        check("route-gone" in outcomes(KD.HOME)[-2:], f"route check, {label}: log: route-gone ({outcomes(KD.HOME)[-2:]})")
+        if label == "repointed":
+            check(home_proxy() == f"http://127.0.0.1:{KD.HOME_PORT + 1}",
+                  "route check, repointed: teardown leaves someone else's route alone")
+        if garble:   # it couldn't see the route, so it tried to remove it and kept the record
+            check(outcomes(KD.HOME)[-1:] == ["teardown-failed"] and route_up() is False
+                  and any(r.get("kind") == "home" and r.get("teardown_failed") for r in KD.read_pending()),
+                  f"route check, {label}: teardown still ran and kept its record for the reap")
+        page.kill()
+        set_garble(None)
+        run("status")   # reap: retries a teardown the garbled status made fail
+        if route_up():
+            run("home", "--stop")
+            unlock()
+        check(not route_up() and not any(r.get("kind") == "home" for r in KD.read_pending()),
+              f"route check, {label}: no route and no record left")
+    unlock()
+
+
+def home_proxy():
+    return (((serve_cfg().get("Web") or {}).get(f"{HOST}:{KD.HOME_PORT}") or {})
+            .get("Handlers", {}).get("/", {}).get("Proxy"))
+
+
+def drop_route(port):
+    st = serve_cfg()
+    (st.get("TCP") or {}).pop(str(port), None)
+    (st.get("Web") or {}).pop(f"{HOST}:{port}", None)
+    with open(SERVE_JSON, "w") as f:
+        json.dump(st, f)
+
+
+def test_route_check_pages():
+    """request and vault pages: the same per-request check, on a PUT (the
+    reject path), a GET and a POST."""
+    n = name("route")
+    r = run("request", n)
+    rec = next((x for x in KD.read_pending() if x.get("name") == n), None)
+    check(r.returncode == 0 and rec, "route check, request: page up")
+    if rec:
+        port, tok = rec["local_port"], r.stdout.strip().rsplit("/", 1)[1]
+        owner = f"Tailscale-User-Login: {KD.OWNER_LOGIN}\r\n"
+        check(" 200 " in raw_get(port, tok, owner, host=f"{HOST}:{port}"), "route check, request: the owner gets the form")
+        drop_route(port)
+        time.sleep(0.5)
+        check(KD.alive(rec["pid"]) and accepts(port), "route check, request: still up after the drop")
+        check(" 404 " in raw_get(port, tok, owner, "PUT", host=f"{HOST}:{port}"),
+              "route check, request: a PUT after the drop gets a bare 404")
+        end = time.time() + 3
+        while time.time() < end and KD.alive(rec["pid"]):
+            time.sleep(0.05)
+        check(not KD.alive(rec["pid"]) and not accepts(port), "route check, request: the page is gone")
+        check(outcomes(n)[-1:] == ["route-gone"] and n not in [x["name"] for x in KD.read_pending()],
+              f"route check, request: log route-gone, record dropped ({outcomes(n)[-2:]})")
+
+    r = run("vault")
+    rec = next((x for x in KD.read_pending() if x.get("kind") == "vault"), None)
+    check(r.returncode == 0 and rec, "route check, vault: session up")
+    if rec:
+        url = f"http://127.0.0.1:{rec['local_port']}/" + r.stdout.strip().rsplit("/", 1)[1]
+        code, page = get(url)
+        check(code == 200, "route check, vault: the owner gets the list")
+        n = name("vroute")
+        drop_route(rec["local_port"])
+        code, _ = post(url, {"csrf": csrf_of(page), "action": "add", "name": n, "value": value()})
+        check(code == 404 and KD.keychain_get(n) is None,
+              "route check, vault: an add after the drop is a bare 404 and stores nothing")
+        end = time.time() + 3
+        while time.time() < end and KD.alive(rec["pid"]):
+            time.sleep(0.05)
+        check(not KD.alive(rec["pid"]) and outcomes(KD.VAULT)[-1:] == ["route-gone"],
+              "route check, vault: the session ends, log route-gone")
+        check(not any(x.get("kind") == "vault" for x in KD.read_pending()), "route check, vault: record dropped")
+
+
+def make_outside_item():
+    n = f"kdtest-outside-{secrets.token_hex(3)}"
+    subprocess.run([FAKE_SECURITY, "add-generic-password", "-a", KD.ACCOUNT, "-s", n,
+                    "-w", "not-a-secret"], check=True, capture_output=True)
+    OUTSIDE.append(n)
+    return n
+
+
+def outside_exists(n):
+    return subprocess.run([FAKE_SECURITY, "find-generic-password", "-a", KD.ACCOUNT, "-s", n],
+                          capture_output=True).returncode == 0
+
+
+def test_nothing_leaked():
+    blobs = {"keydrop.log": "\n".join(log_lines(KD.LOG_FILE)),
+             "home-audit.log": "\n".join(log_lines(KD.AUDIT_FILE)),
+             "tailscale argv": "\n".join(log_lines(ARGV_LOG))}
+    for v in VALUES:
+        # The random core alone, plus the whole value raw, HTML-escaped and
+        # hex: an escaped or partial leak still trips one of them.
+        forms = (v, html.escape(v), v.encode().hex(), v.split(" & ")[1].split(" ")[0])
+        check(not any(f in b for f in forms for b in BODIES), f"no response body holds value {forms[3][:6]}")
+        for label, blob in blobs.items():
+            check(not any(f in blob for f in forms), f"{label} free of value {forms[3][:6]}")
+        check(not any(state_contains(f) for f in forms), f"state dir free of value {forms[3][:6]}")
+    for t in TOKENS:
+        for label, blob in blobs.items():
+            check(t not in blob, f"{label} free of the link token")
+        check(not state_contains(t), "state dir free of the link token")
+    check("funnel" not in blobs["tailscale argv"], "never funnel")
+    check(oct(os.stat(KD.HOME_FILE).st_mode & 0o777) == "0o600", "home.json is 0600")
+
+
+def cleanup():
+    for n in MADE:
+        subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT,
+                        "-s", KD.service(n)], capture_output=True)
+    check(not [n for n in KD.keychain_list() if n in MADE], "all test-home-* entries deleted")
+    for n in OUTSIDE:
+        subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT, "-s", n],
+                       capture_output=True)
+    check(not any(outside_exists(n) for n in OUTSIDE), "kdtest-outside-* item deleted")
+
+
+def main():
+    make_stub()
+    page = None
+    try:
+        test_units()
+        test_no_link_yet()
+        token = test_new_link()
+        page = Page()
+        check(page.port is not None and route_up(), "home starts and serve has :%d" % KD.HOME_PORT)
+        proxy = serve_cfg()["Web"][f"{HOST}:{KD.HOME_PORT}"]["Handlers"]["/"]["Proxy"]
+        check(page.port == KD.HOME_PORT and proxy == f"http://127.0.0.1:{KD.HOME_PORT}",
+              "the route proxies to 127.0.0.1 on the same port it claims")
+        test_same_port(page)
+        check(run("home").returncode != 0, "a second `keydrop home` is refused")
+        check("[home]\talways on" in run("status").stdout, "status lists the home page")
+        test_header_spoofs(page, token)
+        page = restart(page)
+        test_strangers_cant_lock(page, token)
+        page = restart(page)
+        test_csrf(page, token)
+        page = test_stale_after_restart(page, token)
+        page = restart(page)
+        test_fetch_metadata(page, token)
+        page = restart(page)
+        test_peer_flood(page, token)
+        page = restart(page)
+        test_rebinding(page, token)
+        page = restart(page)    # the per-minute request cap is per process
+        test_writes(page, token)
+        page = restart(page)
+        test_flood(page, token)
+        page = restart(page)
+        page = test_rate_limit(page, token)
+        page = test_lockout(page, token)
+        token = test_new_link_replaces(page, token)
+        test_stop(page, token)
+        page = None
+        test_stop_flag_ends_loop(token)
+        test_stop_race(token)
+        test_plist()
+        test_host_units()
+        test_same_port_units()
+        test_watchdog(token)
+        test_route_check_home(token)
+        test_route_check_pages()
+        test_request_host()
+        test_no_http()
+        test_install_line()
+        test_nothing_leaked()
+    finally:
+        if page:
+            page.kill()
+        for rec in KD.read_pending():
+            if KD.alive(rec["pid"]):
+                os.kill(rec["pid"], signal.SIGTERM)
+        cleanup()
+    print(f"\n{'FAILED ' + str(len(FAILS)) if FAILS else 'all passed'} ({len(FAILS)} failed)")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
