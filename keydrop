@@ -1,0 +1,1936 @@
+#!/usr/bin/env python3
+"""keydrop — hand a secret to a local tool or agent through a one-shot link
+instead of pasting it into a chat.
+
+    keydrop request <name> [--note "what it's for"] [--ttl 15m] [--http]
+    keydrop vault [--ttl 15m] [--http]
+                              a session link for listing, adding, replacing
+                              and deleting entries under the service prefix
+    keydrop get <name>        print the stored value (for local tools)
+    keydrop list              names only
+    keydrop status            pending requests and vault sessions
+    keydrop cancel <name>     stop a pending request (`cancel vault` ends a session)
+    keydrop home              the vault page held up for good, for launchd
+                              (HTTPS only: no --http)
+    keydrop home --new-link
+                              mint the home page's link (prints it once)
+    keydrop home --stop       kill switch: take the home page down and keep it down
+    keydrop home --unlock     clear a lockout or a stop
+    keydrop config            print the settings in effect (never a value)
+
+`request` binds a one-shot HTTP server to 127.0.0.1, exposes it on the tailnet
+with `tailscale serve` on the same port number, prints the URL and detaches. The
+page is a single password field. One good submit, or the TTL, or a handful of
+bad guesses, and it tears its serve config down and exits.
+
+The vault is the login keychain: service `<prefix><name>` (prefix `keydrop.`
+by default), account from the config (`keydrop` by default).
+Created/updated times are the keychain item's own cdat/mdat. Notes live in
+meta.json in the state dir, because a note isn't a secret and `security -i`
+has no quoting that's safe for free text; values never go there.
+
+`vault` is `request` held open as a session: same token-in-path link on its own
+tailnet port, same TTL cap, lockout and teardown, but it stays up until the
+TTL or the Done button. The page is write-only. It lists names, notes and
+times and takes new values; it never renders a stored value, so nothing that
+reads the page (a screenshot, the browser's cache, someone over a shoulder)
+can see one. Every POST needs the session's form token as well as the path
+token. Delete asks to confirm first, and can only ever reach a
+`<prefix><NAME_RE>` item with the configured account.
+
+On the tailnet, requests must carry `Tailscale-User-Login: <owner login>`, the
+owner's tailnet login from the config. There is no default: without one, no
+page starts.
+`tailscale serve` deletes any incoming Tailscale-User-* header and sets its own
+from WhoIs on the connection (ipn/ipnlocal/serve.go, addTailscaleIdentityHeaders),
+so a tailnet client can't forge it. It is not a defence against a process on
+this Mac: if the Mac is logged in to the tailnet as the owner, its own traffic
+through serve carries the owner's login, and anything that connects to
+127.0.0.1 directly can send
+any header it likes. Those still need the token. An underscore spelling
+(Tailscale_User_Login) survives serve untouched, so any header that
+normalises to the login header's name, other than exactly one real one, is
+refused.
+
+Where the secret goes, and where it must never go:
+
+- The write is `security -i` with the command on stdin and the value as hex
+  (`-X`). `security add-generic-password -w <value>` would put it on argv, which
+  any process can read with `ps`. Using `security` rather than calling the
+  Security framework from Python also matters for `get`: an item's ACL trusts
+  the binary that created it, so a Python-created item would pop a keychain
+  dialog every time `security find-generic-password` read it.
+- Nothing is logged but name, time and outcome. The http.server request log is
+  switched off, because its default line is the request path, and the path is
+  the token.
+- The token is never written to the state dir either. It's a capability, not
+  the secret, but whoever holds it decides what ends up under that name.
+
+Serve uses a dedicated tailnet port per request rather than a path on :443, so
+the token never lands in tailscaled's serve config (which it persists to disk)
+and teardown can't touch anyone else's routes. Never `funnel`: the page must
+not be reachable from the internet.
+
+The tailnet port is always the loopback port, and the order is bind, add the
+serve route, then listen. This was worked out against tailscaled running
+with userspace networking (netstack); a kernel-TUN tailscaled was not
+analysed. Under netstack, tailscaled forwards inbound tailnet TCP for the node's own IP to
+127.0.0.1:<same port> unless a serve handler claims that port
+(wgengine/netstack/netstack.go, Impl.acceptTCP: lb.TCPHandlerForDst first,
+the 127.0.0.1 rewrite and forwardTCP only after; ipn/ipnlocal/netstack.go,
+LocalBackend.TCPHandlerForDst, reaches tcpHandlerForServe in
+ipn/ipnlocal/serve.go, which answers for any port in the serve config). So a
+loopback listener on a port serve isn't claiming is open to every tailnet
+peer, with any headers it likes. Sharing the number means the port is claimed
+for as long as the route is up; not listening until the route exists means
+there is no window where it isn't (a bound socket that isn't listening drops
+the SYN). claim_port picks a loopback port serve isn't using, or refuses.
+There is no --local on any page, for the same reason: a loopback listener with
+no route in front is open to every tailnet peer.
+
+The route can still go away while a page is up (someone runs `serve reset`,
+or repoints the port). From then on netstack forwards peers straight to the
+listener with whatever Tailscale-User-Login they like, so every request, on
+every page, first reads `serve status` and checks the route is still a
+single `/` proxy to 127.0.0.1:<this port> (route_ours). If it isn't, or the
+status can't be read or parsed, the request gets a bare 404 and the page ends
+with outcome route-gone: the serve loop stops as soon as that response is
+written, the listener closes, and the process exits (home exits 1). Failing
+closed matters: "can't read the config" is not evidence the route is there.
+Teardown then leaves the port alone if serve shows it gone or pointing
+somewhere else; it only removes a route that is still ours.
+
+Teardown runs on every exit path the process can see: submit, TTL, lockout,
+SIGTERM/SIGINT/SIGHUP, and exceptions. SIGKILL can't be caught, so `request`
+and `status` also reap pending records whose process is gone. A teardown only
+counts once `serve status` shows the port gone; until then the record stays,
+marked teardown-failed, and every reap retries it. Otherwise a teardown that
+ran while tailscaled was down would leave the route in tailscaled's persisted
+config with nothing left to remove it. Reap also sweeps keydrop-shaped routes
+that no record owns (see orphan_routes).
+
+`home` is the vault page with no TTL, meant to run under launchd on its own
+tailnet port (HOME_PORT). It reuses the vault handler and adds what the TTL
+used to provide: bad requests (5 in 24h) lock it out, and the lockout is
+written to the state dir, so a restart doesn't clear it; adds, replaces and
+deletes are rate limited (also persisted); every write attempt goes to
+home-audit.log (time, name, action, outcome; never a value); and `home
+--stop`, or the page's own Stop button, tears the serve route down and leaves
+a flag that keeps it down until `home --unlock`. The path token stays, minted
+by `home --new-link`, which prints it once; only its SHA-256 is kept. A bad
+request counts toward the lockout only if it carries the owner's login and
+the browser's own Sec-Fetch-Site says same-origin or none; anything else (a
+cross-site request, an <img> on some page, a request with no Fetch Metadata)
+gets a bare 404 and no strike, so a web page the owner happens to visit can't
+lock them out of their own page. Browsers send no Fetch Metadata over plain HTTP, so
+home is HTTPS only and refuses --http. It binds 127.0.0.1:HOME_PORT, the
+port its route claims. Besides the per-request route check, it reads `serve
+status` every WATCH_INTERVAL seconds while idle, so a page nobody is using
+doesn't sit on a port netstack would now forward to; the request check is the
+guarantee, the watchdog only shortens how long an idle page lingers. The per-minute request limit is charged
+only after the login check, so another tailnet node can't spend it. Every
+page (request, vault and home) answers only an exact Host allowlist (its
+tailnet name, with and without the tailnet port, and 127.0.0.1/localhost on
+its own loopback port), so a DNS-rebinding page in a browser on the Mac gets
+a bare 404 before the login pin is even looked at.
+
+Configuration comes from a JSON file, ~/.config/keydrop/config.json (or the
+path in KEYDROP_CONFIG), and environment variables, which win over the file:
+
+    owner_login      KEYDROP_OWNER_LOGIN     required for request, vault, home
+    account          KEYDROP_ACCOUNT         keychain account (default keydrop)
+    service_prefix   KEYDROP_SERVICE_PREFIX  keychain service prefix (default keydrop.)
+    state_dir        KEYDROP_STATE_DIR       default ~/.local/state/keydrop
+    launchd_label    KEYDROP_LAUNCHD_LABEL   default local.keydrop.home
+    home_port        KEYDROP_HOME_PORT       default 9443
+    tailscale        KEYDROP_TAILSCALE       default: tailscale on PATH
+    tailscale_socket KEYDROP_TS_SOCKET       passed as --socket only when set
+
+Test-only overrides: KEYDROP_SECURITY (the `security` binary) and
+KEYDROP_WATCH_INTERVAL (seconds, capped at WATCH_INTERVAL).
+"""
+import calendar, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
+import signal, subprocess, sys, time, urllib.parse
+
+CONFIG_PATH = os.environ.get("KEYDROP_CONFIG") or os.path.expanduser("~/.config/keydrop/config.json")
+CONFIG_KEYS = {   # file key: (env var, default)
+    "owner_login": ("KEYDROP_OWNER_LOGIN", ""),
+    "account": ("KEYDROP_ACCOUNT", "keydrop"),
+    "service_prefix": ("KEYDROP_SERVICE_PREFIX", "keydrop."),
+    "state_dir": ("KEYDROP_STATE_DIR", "~/.local/state/keydrop"),
+    "launchd_label": ("KEYDROP_LAUNCHD_LABEL", "local.keydrop.home"),
+    "home_port": ("KEYDROP_HOME_PORT", "9443"),
+    "tailscale": ("KEYDROP_TAILSCALE", ""),
+    "tailscale_socket": ("KEYDROP_TS_SOCKET", ""),
+}
+# These end up inside the `security -i` command line, which splits on
+# whitespace and honours quotes, so they are held to a plain charset.
+ACCOUNT_RE = re.compile(r"[A-Za-z0-9._@+-]{1,64}")
+PREFIX_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+LABEL_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+# A Tailscale login as serve sends it: user@domain, or user@github and the like.
+LOGIN_RE = re.compile(r"[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+")
+
+
+def load_config():
+    """(settings, problems). Env vars win over the file; a missing file is
+    fine, an unreadable or malformed one is a problem, never a silent default."""
+    problems, data = [], {}
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            problems.append(f"{CONFIG_PATH}: not a JSON object")
+            data = {}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        problems.append(f"{CONFIG_PATH}: {e}")
+    unknown = sorted(set(data) - set(CONFIG_KEYS))
+    if unknown:
+        problems.append(f"{CONFIG_PATH}: unknown keys {', '.join(unknown)}")
+    out = {}
+    for key, (env, default) in CONFIG_KEYS.items():
+        val = os.environ.get(env)
+        if val is None:
+            val = data.get(key, default)
+        out[key] = str(val).strip() if val is not None else ""
+    out["owner_login"] = out["owner_login"].lower()
+    if out["owner_login"] and not LOGIN_RE.fullmatch(out["owner_login"]):
+        problems.append(f"owner_login {out['owner_login']!r} doesn't look like a tailnet login (user@domain)")
+    if not ACCOUNT_RE.fullmatch(out["account"]):
+        problems.append("account must be 1-64 of A-Z a-z 0-9 . _ @ + -")
+    if not PREFIX_RE.fullmatch(out["service_prefix"]):
+        problems.append("service_prefix must be 1-64 of A-Z a-z 0-9 . _ -")
+    if not LABEL_RE.fullmatch(out["launchd_label"]):
+        problems.append("launchd_label must be 1-128 of A-Z a-z 0-9 . _ -")
+    try:
+        port = int(out["home_port"])
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except ValueError:
+        problems.append(f"home_port {out['home_port']!r} is not a port number")
+        port = 9443
+    out["home_port"] = port
+    if not out["state_dir"]:
+        problems.append("state_dir is empty")
+        out["state_dir"] = CONFIG_KEYS["state_dir"][1]
+    out["state_dir"] = os.path.abspath(os.path.expanduser(out["state_dir"]))
+    return out, problems
+
+
+CONFIG, CONFIG_PROBLEMS = load_config()
+STATE_DIR = CONFIG["state_dir"]
+PENDING_DIR = os.path.join(STATE_DIR, "pending")
+LOG_FILE = os.path.join(STATE_DIR, "keydrop.log")
+META_FILE = os.path.join(STATE_DIR, "meta.json")
+TS_SOCKET = os.path.expanduser(CONFIG["tailscale_socket"]) if CONFIG["tailscale_socket"] else ""
+TAILSCALE = CONFIG["tailscale"] or shutil.which("tailscale") or "/opt/homebrew/bin/tailscale"
+SECURITY = os.environ.get("KEYDROP_SECURITY", "/usr/bin/security")
+
+SERVICE_PREFIX = CONFIG["service_prefix"]
+ACCOUNT = CONFIG["account"]
+NAME_RE = re.compile(r"^[a-z0-9._-]{1,64}$")
+NOTE_MAX = 200
+DEFAULT_TTL = 15 * 60
+MAX_TTL = 60 * 60
+MAX_BAD = 5            # wrong-token requests before the server gives up
+MAX_REQUESTS = 50      # any requests at all, so a scanner can't keep it busy
+MAX_SESSION_REQUESTS = 400   # the same cap for a vault session, which is used for longer
+OWNER_LOGIN = CONFIG["owner_login"]   # "" until configured: then no page starts
+LAUNCHD_LABEL = CONFIG["launchd_label"]
+LOGIN_HEADER = "Tailscale-User-Login"
+VAULT = "[vault]"      # a vault session's record/log name; never a valid key name
+HOME = "[home]"        # the home page's record/log name
+HOME_PORT = CONFIG["home_port"]   # tailnet and loopback both
+WATCH_INTERVAL = 10    # seconds between home's checks that its serve route is still there
+HOME_FILE = os.path.join(STATE_DIR, "home.json")
+AUDIT_FILE = os.path.join(STATE_DIR, "home-audit.log")
+HOME_BAD_WINDOW = 24 * 3600   # MAX_BAD bad requests inside this, and home locks until --unlock
+WRITE_LIMIT = 10              # adds/replaces/deletes per WRITE_WINDOW on the home page
+WRITE_WINDOW = 3600
+REQUESTS_PER_MINUTE = 60      # any requests at all; past this, a bare 429
+CSRF_MAX_AGE = 12 * 3600      # a home form older than this asks for a reload
+MAX_BODY = 16 * 1024
+REQUEST_TIMEOUT = 10   # per-connection socket timeout; one slow client can't hold the link
+SERVE_TIMEOUT = 20     # `tailscale serve` blocks forever if serve isn't enabled
+# macOS ephemeral range (net.inet.ip.portrange.first/last). Keydrop's local
+# port always comes from here, and its tailnet port is the same number.
+EPHEMERAL_PORTS = range(49152, 65536)
+PORT_PROBE_MAX = 64    # how far an older version's tailnet port drifted above its local one
+PORT_PICK_TRIES = 32   # loopback ports tried before claim_port gives up
+# Paths browsers fetch on their own. 404'd, but not counted as guesses.
+AUTO_FETCH = ("/favicon", "/apple-touch-icon", "/robots.txt")
+
+
+class KeydropError(Exception):
+    pass
+
+
+def require_config():
+    if CONFIG_PROBLEMS:
+        raise KeydropError("config: " + "; ".join(CONFIG_PROBLEMS))
+
+
+def require_owner():
+    """Every page pins the owner's login. With none configured there is
+    nothing to pin to, so nothing serves: never fall back to open."""
+    require_config()
+    if not OWNER_LOGIN:
+        raise KeydropError(f"no owner login configured. Set owner_login in {CONFIG_PATH} "
+                           "(or KEYDROP_OWNER_LOGIN) to your tailnet login, e.g. you@example.com; "
+                           "`tailscale status --json` shows it under User")
+
+
+# ---------- validation ----------
+
+def valid_name(name):
+    # fullmatch, not match: `$` also matches before a trailing newline, and a
+    # newline in a name would end the `security -i` command line early.
+    return bool(NAME_RE.fullmatch(name or ""))
+
+
+def parse_ttl(text):
+    m = re.fullmatch(r"(\d+)([smh]?)", (text or "").strip())
+    if not m:
+        raise KeydropError(f"bad --ttl {text!r} (use e.g. 90s, 15m, 1h)")
+    secs = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+    if not 1 <= secs <= MAX_TTL:
+        raise KeydropError(f"--ttl must be between 1s and {MAX_TTL // 60}m")
+    return secs
+
+
+def clean_note(note):
+    note = re.sub(r"[\x00-\x1f\x7f]", " ", note or "").strip()
+    if len(note) > NOTE_MAX:
+        raise KeydropError(f"--note is limited to {NOTE_MAX} characters")
+    return note
+
+
+# ---------- keychain ----------
+
+def service(name):
+    return SERVICE_PREFIX + name
+
+
+def store_command(name, value):
+    """The `security -i` line. Goes to stdin, never argv. Hex means no quoting
+    rules to get wrong, whatever the value contains."""
+    if not (valid_name(name) and ACCOUNT_RE.fullmatch(ACCOUNT) and PREFIX_RE.fullmatch(SERVICE_PREFIX)):
+        raise KeydropError("bad name or config")
+    return (f"add-generic-password -U -a {ACCOUNT} -s {service(name)} "
+            f"-l {service(name)} -X {value.encode('utf-8').hex()}\n")
+
+
+def keychain_store(name, value):
+    """`security -i` does exit with the inner command's status, but only its
+    low 8 bits (errSecDuplicateItem, -25299, exits 45), so an OSStatus that is
+    a multiple of 256 would exit 0. The exit code alone can't be trusted to
+    mean stored: read the item back and compare digests."""
+    if not valid_name(name):
+        raise KeydropError("bad name")
+    r = subprocess.run([SECURITY, "-i"], input=store_command(name, value),
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        # security echoes the failing command name and a code, never the input line.
+        raise KeydropError(f"security exited {r.returncode}")
+    back = keychain_get(name)
+    if back is None or not hmac.compare_digest(
+            hashlib.sha256(back.encode("utf-8")).digest(),
+            hashlib.sha256(value.encode("utf-8")).digest()):
+        raise KeydropError("security exited 0 but the item doesn't read back as stored")
+
+
+def keychain_get(name):
+    """`-w` prints non-ASCII values as bare hex, indistinguishable from a value
+    that happens to be hex. `-g` marks the two forms apart on stderr:
+    `password: "text"` or `password: 0xHEX  "escaped"`."""
+    r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT,
+                        "-s", service(name), "-g"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    line = next((l for l in r.stderr.splitlines() if l.startswith("password: ")), None)
+    if line is None:
+        return None
+    rest = line[len("password: "):]
+    m = re.match(r"0x([0-9A-Fa-f]*)(\s|$)", rest)
+    if m:
+        return bytes.fromhex(m.group(1)).decode("utf-8", "replace")
+    return rest[1:-1] if rest.startswith('"') and rest.endswith('"') else rest
+
+
+def keychain_entries():
+    """{name: {"created": epoch, "updated": epoch}} for every <prefix>* item,
+    from dump-keychain's attribute listing. Without -d it prints no secret
+    data. cdat survives an -U update and mdat moves with it."""
+    r = subprocess.run([SECURITY, "dump-keychain"], capture_output=True, text=True, timeout=30)
+    out, cur = {}, {}
+
+    def flush(item):
+        svce = item.get("svce") or ""
+        name = svce[len(SERVICE_PREFIX):]
+        if item.get("acct") == ACCOUNT and svce.startswith(SERVICE_PREFIX) and valid_name(name):
+            out[name] = {"created": item.get("cdat"), "updated": item.get("mdat")}
+
+    for line in r.stdout.splitlines():
+        if line.startswith("keychain:"):
+            flush(cur)
+            cur = {}
+            continue
+        m = re.match(r'\s+"(svce|acct)"<blob>="(.*)"$', line)
+        if m:
+            cur = dict(cur, **{m.group(1): m.group(2)})
+            continue
+        m = re.match(r'\s+"(cdat|mdat)"<timedate>=\S+\s+"(\d{14})Z', line)
+        if m:
+            cur = dict(cur, **{m.group(1): calendar.timegm(time.strptime(m.group(2), "%Y%m%d%H%M%S"))})
+    flush(cur)
+    return out
+
+
+def keychain_list():
+    return sorted(keychain_entries())
+
+
+def keychain_exists(name):
+    """Attributes only: without -g or -w, find-generic-password never reads
+    the secret, so this can't prompt or put a value in memory."""
+    if not valid_name(name):
+        raise KeydropError("bad name")
+    r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", service(name)],
+                       capture_output=True, text=True, timeout=30)
+    return r.returncode == 0
+
+
+def keychain_delete(name):
+    """Only ever <prefix><NAME_RE> with the configured account: the name is validated
+    here, not just by callers, and the service is built from the prefix."""
+    if not valid_name(name):
+        raise KeydropError("bad name")
+    subprocess.run([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", service(name)],
+                   capture_output=True, text=True, timeout=30)
+    if keychain_exists(name):
+        raise KeydropError("security didn't delete it")
+
+
+# ---------- notes ----------
+
+def read_notes():
+    try:
+        with open(META_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if valid_name(k) and isinstance(v, str)}
+
+
+def write_note(name, note):
+    """note=None drops it. Replaces the file whole, 0600, so a crash leaves
+    the old one rather than half a new one."""
+    with meta_lock():
+        notes = {k: v for k, v in read_notes().items() if k != name}
+        if note:
+            notes = dict(notes, **{name: note})
+        tmp = META_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(notes, f, sort_keys=True)
+        os.replace(tmp, META_FILE)
+
+
+# ---------- tailscale ----------
+
+def ts(*args, timeout=15):
+    sock = [f"--socket={TS_SOCKET}"] if TS_SOCKET else []
+    return subprocess.run([TAILSCALE, *sock, *args],
+                          stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def tailnet_host(plain_http=False, http_hint=True):
+    try:
+        r = ts("status", "--json")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise KeydropError(f"tailscale not reachable: {e}")
+    if r.returncode != 0:
+        raise KeydropError("tailscale not reachable: " + (r.stderr.strip() or r.stdout.strip())[:200])
+    st = json.loads(r.stdout)
+    if st.get("BackendState") != "Running":
+        raise KeydropError(f"tailscale is {st.get('BackendState')}, not Running (is this Mac logged in?)")
+    if not plain_http and not st.get("CertDomains"):
+        # `serve --https` would block on an "enable Serve" prompt instead of failing.
+        raise KeydropError("HTTPS isn't enabled for this tailnet yet (admin console, "
+                           "DNS > HTTPS Certificates), so serve can't issue a cert"
+                           + (". --http serves plain HTTP inside the tailnet instead"
+                              if http_hint else ""))
+    return st["Self"]["DNSName"].rstrip(".")
+
+
+def serve_status():
+    """tailscaled's serve config, or None if it can't be read."""
+    try:
+        r = ts("serve", "status", "--json")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        st = json.loads(r.stdout or "{}")
+    except ValueError:
+        return None
+    return st if isinstance(st, dict) else None
+
+
+def serve_ports_in_use():
+    return set(((serve_status() or {}).get("TCP") or {}).keys())
+
+
+def orphan_routes(status, owned):
+    """Serve entries that look like keydrop made them and that no record owns.
+    Returns [(port, plain_http, local_port)].
+
+    Keydrop-shaped means all of: a TCP entry for port N that is HTTP or HTTPS
+    and nothing else, one web host for N, one handler at "/", proxying to
+    exactly http://127.0.0.1:L, with L in the ephemeral range and
+    L <= N <= L + PORT_PROBE_MAX. Anything else, including a route to a local
+    service on a port someone picked (a dashboard, a dev server), is left alone."""
+    out = []
+    web = status.get("Web") or {}
+    for port, entry in (status.get("TCP") or {}).items():
+        if port in owned or not port.isdigit() or not isinstance(entry, dict):
+            continue
+        kind = set(k for k, v in entry.items() if v)
+        if kind not in ({"HTTP"}, {"HTTPS"}):
+            continue
+        hosts = [h for h in web if h.rsplit(":", 1)[-1] == port]
+        if len(hosts) != 1:
+            continue
+        handlers = (web[hosts[0]] or {}).get("Handlers") or {}
+        if set(handlers) != {"/"} or set(handlers["/"] or {}) != {"Proxy"}:
+            continue
+        m = re.fullmatch(r"http://127\.0\.0\.1:(\d+)", handlers["/"]["Proxy"] or "")
+        if not m:
+            continue
+        local, n = int(m.group(1)), int(port)
+        if local in EPHEMERAL_PORTS and local <= n <= local + PORT_PROBE_MAX:
+            out.append((port, kind == {"HTTP"}, local))
+    return sorted(out)
+
+
+def serve_on(port, local_port, plain_http):
+    flag = f"--http={port}" if plain_http else f"--https={port}"
+    try:
+        r = ts("serve", "--bg", "--yes", flag, f"http://127.0.0.1:{local_port}",
+               timeout=SERVE_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        link = re.search(r"https://login\.tailscale\.com/\S+", out)
+        raise KeydropError("tailscale serve hung (HTTPS/Serve not enabled on the tailnet?)"
+                           + (f" enable at {link.group(0)}" if link else ""))
+    if r.returncode != 0:
+        raise KeydropError("tailscale serve failed: " + (r.stderr.strip() or r.stdout.strip())[:300])
+
+
+def route_ours(status, port):
+    """True only if serve status was read and still has :port as a single `/`
+    proxy to 127.0.0.1:<the same port>. Unreadable (None), garbled, gone or
+    repointed are all False: fail closed, because a page that can't prove
+    serve is claiming its port has to assume netstack is forwarding to it."""
+    if not isinstance(status, dict):
+        return False
+    try:
+        return home_route(status, port) == int(port)
+    except (AttributeError, TypeError, KeyError, ValueError):
+        return False
+
+
+def serve_off(port, plain_http):
+    """True only once `serve status` confirms the port is gone. A nonzero exit
+    from `off` is fine if the route is gone anyway (already removed); a zero
+    exit is not enough if it isn't."""
+    flag = f"--http={port}" if plain_http else f"--https={port}"
+    try:
+        ts("serve", flag, "off", timeout=SERVE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    st = serve_status()
+    return st is not None and str(port) not in (st.get("TCP") or {})
+
+
+# ---------- state ----------
+
+class serve_lock:
+    """Held while a route and its record change together, and while reap
+    sweeps, so a sweep can't catch a route between its record being written
+    and the route appearing (or the reverse on teardown)."""
+    FILE = "serve.lock"
+
+    def __enter__(self):
+        self.fd = os.open(os.path.join(STATE_DIR, self.FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)   # releases the flock
+
+
+class meta_lock(serve_lock):
+    FILE = "meta.lock"
+
+
+def ensure_state():
+    for d in (STATE_DIR, PENDING_DIR):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+
+
+def log(name, outcome):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    fd = os.open(LOG_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(f"{stamp}\t{name}\t{outcome}\n")
+
+
+def drop_pending(rec):
+    try:
+        os.unlink(os.path.join(PENDING_DIR, rec["id"] + ".json"))
+    except FileNotFoundError:
+        pass
+
+
+def write_pending(rec):
+    path = os.path.join(PENDING_DIR, rec["id"] + ".json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(rec, f)
+    return path
+
+
+def read_pending():
+    recs = []
+    if not os.path.isdir(PENDING_DIR):
+        return recs
+    for fn in sorted(os.listdir(PENDING_DIR)):
+        if fn.endswith(".json"):
+            try:
+                with open(os.path.join(PENDING_DIR, fn)) as f:
+                    recs.append(json.load(f))
+            except (OSError, ValueError):
+                continue
+    return recs
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    r = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+    return "keydrop" in r.stdout
+
+
+def keydrop_listening(local_port):
+    """True if a live keydrop process holds 127.0.0.1:local_port, or if that
+    can't be determined. Records live in one state dir, but a keydrop running
+    with another KEYDROP_STATE_DIR (a test run, a copy of the script) owns its
+    route just as much, and the sweep can't see its record."""
+    try:
+        r = subprocess.run(["/usr/sbin/lsof", "-nP", f"-iTCP@127.0.0.1:{local_port}",
+                            "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if r.returncode not in (0, 1) or (r.returncode == 1 and r.stderr.strip()):
+        return True   # lsof exits 1 with no output when nothing matches
+    return any(alive(int(pid)) for pid in r.stdout.split() if pid.isdigit())
+
+
+def reap():
+    """Clean up after a server that died without running its own teardown,
+    retry teardowns that failed, and sweep keydrop-shaped routes nothing owns."""
+    with serve_lock():
+        for rec in read_pending():
+            if not rec.get("teardown_failed") and alive(rec["pid"]):
+                continue
+            if rec.get("tailnet_port") and not serve_off(rec["tailnet_port"],
+                                                         rec.get("plain_http", False)):
+                if not rec.get("teardown_failed"):
+                    write_pending(dict(rec, teardown_failed=True))
+                    log(rec["name"], "teardown-failed")
+                continue
+            log(rec["name"], "reaped")
+            drop_pending(rec)
+        # Status before records: a route is only ever created after its record
+        # is written, so any route in this snapshot has a record by now.
+        st = serve_status()
+        if st is None:
+            return
+        owned = {str(r["tailnet_port"]) for r in read_pending() if r.get("tailnet_port")}
+        for port, plain_http, local in orphan_routes(st, owned):
+            if keydrop_listening(local):
+                continue
+            log("-", f"swept orphan :{port} " + ("ok" if serve_off(port, plain_http) else "failed"))
+
+
+# ---------- pages ----------
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>keydrop</title>
+<style>
+body{{font:17px -apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:480px}}
+h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:17px;margin:28px 0 8px}} p{{color:#555;margin:0 0 20px}}
+input,button{{font:inherit;width:100%;box-sizing:border-box;padding:14px;border-radius:10px}}
+input{{border:1px solid #bbb;margin-bottom:12px}} button{{border:0;background:#111;color:#fff}}
+.err{{color:#b00}} .ok{{color:#070}} .meta{{color:#777;font-size:14px;margin:2px 0 0}}
+.item{{border-top:1px solid #ddd;padding:12px 0}} .item b{{word-break:break-all}}
+summary{{color:#06c;margin-top:6px}} details form{{margin-top:10px}}
+button.del{{background:#b00}} button.quiet{{background:#eee;color:#111;margin-top:28px}}
+</style></head><body>{body}</body></html>"""
+
+
+def render_form(name, note, action, error=""):
+    body = (f"<h1>{html.escape(name)}</h1>"
+            + (f"<p>{html.escape(note)}</p>" if note else "")
+            + (f'<p class="err">{html.escape(error)}</p>' if error else "")
+            + f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
+            + '<input type="password" name="value" autocomplete="off" autocapitalize="off" '
+              'autocorrect="off" spellcheck="false" autofocus required>'
+            + '<button type="submit">Store</button></form>')
+    return PAGE.format(body=body)
+
+
+def render_message(text):
+    return PAGE.format(body=f"<h1>{html.escape(text)}</h1>")
+
+
+VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" autocomplete="off" '
+               'autocapitalize="off" autocorrect="off" spellcheck="false" required>')
+
+
+def vault_form(action, csrf, act, fields, button, cls=""):
+    """A POST form carrying the session's form token and an action name."""
+    return (f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
+            f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">'
+            f'<input type="hidden" name="action" value="{html.escape(act)}">'
+            + fields
+            + f'<button type="submit" class="{cls}">{html.escape(button)}</button></form>')
+
+
+def when(epoch):
+    return time.strftime("%b %-d %H:%M", time.localtime(epoch)) if epoch else "?"
+
+
+def render_vault(action, csrf, entries, notes, expires, flash="", error="",
+                 title="keydrop vault", done_label="Done, close this link"):
+    """Names, notes and times only. Nothing that builds a page reads a
+    stored value, so there is none to leak into one."""
+    rows = []
+    for name in sorted(entries):
+        e, hname = entries[name], html.escape(name)
+        hidden = f'<input type="hidden" name="name" value="{hname}">'
+        rows.append(
+            f'<div class="item"><b>{hname}</b>'
+            + (f'<p class="meta">{html.escape(notes[name])}</p>' if notes.get(name) else "")
+            + f'<p class="meta">added {when(e.get("created"))} · updated {when(e.get("updated"))}</p>'
+            + '<details><summary>Replace or delete</summary>'
+            + vault_form(action, csrf, "replace",
+                         hidden + VALUE_INPUT.format(ph="new value")
+                         + '<input type="text" name="note" placeholder="note (blank keeps it)" maxlength="200">',
+                         "Replace")
+            + vault_form(action, csrf, "delete", hidden, "Delete…", "del")
+            + "</details></div>")
+    lifetime = (f'Link ends {time.strftime("%H:%M", time.localtime(expires))}.' if expires
+                else "This page stays up until you stop it.")
+    body = (f"<h1>{html.escape(title)}</h1>"
+            + f'<p class="meta">{lifetime} Values are write-only here.</p>'
+            + (f'<p class="ok">{html.escape(flash)}</p>' if flash else "")
+            + (f'<p class="err">{html.escape(error)}</p>' if error else "")
+            + ("".join(rows) or '<p class="meta">Nothing stored yet.</p>')
+            + "<h2>Add</h2>"
+            + vault_form(action, csrf, "add",
+                         '<input type="text" name="name" placeholder="name (a-z 0-9 . _ -)" required '
+                         'maxlength="64" pattern="[a-z0-9._\\-]{1,64}" autocapitalize="off" autocorrect="off" '
+                         'spellcheck="false">'
+                         '<input type="text" name="note" placeholder="note (optional)" maxlength="200">'
+                         + VALUE_INPUT.format(ph="value"),
+                         "Store")
+            + vault_form(action, csrf, "done", "", done_label, "quiet"))
+    return PAGE.format(body=body)
+
+
+def render_confirm_delete(action, csrf, name):
+    hname = html.escape(name)
+    body = (f"<h1>Delete {hname}?</h1><p>It goes from the keychain for good.</p>"
+            + vault_form(action, csrf, "delete-confirm",
+                         f'<input type="hidden" name="name" value="{hname}">', f"Delete {name}", "del")
+            + vault_form(action, csrf, "back", "", "Keep it", "quiet"))
+    return PAGE.format(body=body)
+
+
+# ---------- server ----------
+
+def token_matches(path, token):
+    """Constant-time: compare fixed-length digests, so neither content nor
+    length of a wrong guess changes the timing."""
+    guess = path[1:] if path.startswith("/") else path
+    return hmac.compare_digest(hashlib.sha256(guess.encode("utf-8", "replace")).digest(),
+                               hashlib.sha256(token.encode()).digest())
+
+
+def login_ok(headers):
+    """Exactly one login header, spelled exactly, naming the owner. `headers` is an
+    email.message.Message: names compare case-insensitively, so 'exactly'
+    here means no underscore or other variant that some proxy might fold
+    into the real one."""
+    lookalike = [k for k in headers.keys()
+                 if re.sub(r"[^a-z]", "", k.lower()) == "tailscaleuserlogin"]
+    values = headers.get_all(LOGIN_HEADER) or []
+    if not OWNER_LOGIN:   # unconfigured: nobody matches, never everybody
+        return False
+    if len(lookalike) != 1 or len(values) != 1 or lookalike[0].lower() != LOGIN_HEADER.lower():
+        return False
+    return hmac.compare_digest(values[0].strip().lower().encode("utf-8", "replace"),
+                               OWNER_LOGIN.encode())
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "keydrop"
+    sys_version = ""
+    timeout = REQUEST_TIMEOUT
+
+    def log_message(self, *args):
+        pass   # the default request log line contains the token
+
+    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                         "frame-ancestors 'none'; base-uri 'none'")
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _not_found(self, path):
+        if not path.startswith(AUTO_FETCH) and self._strike_eligible():
+            self.server.bad += 1
+        self._send(404, b"", "text/plain")
+
+    def _strike_eligible(self):
+        """Whether a failure from this request counts toward the lockout."""
+        return True
+
+    def _admitted(self):
+        """A check between the login pin and the token; False means it has
+        already answered. Nothing here for short-lived pages."""
+        return True
+
+    def _route_gone(self):
+        """First thing on every request, before the Host allowlist and the
+        login pin: is serve still claiming this port? If not, the request may
+        have come straight from netstack with forged identity headers, so it
+        gets a bare 404 and the page ends (route-gone). The serve loop stops
+        once this response is written. True means it has already answered."""
+        if self.server.route_intact():
+            return False
+        self._send(404, b"", "text/plain")
+        self.server.outcome = "route-gone"
+        return True
+
+    def _turned_away(self):
+        """A pre-gate refusal on top of the Host allowlist; none here."""
+        return False
+
+    def _screened(self):
+        """The checks that answer before anything is charged or struck. True
+        means the request has already been answered."""
+        return self._route_gone() or self._turned_away() or self._host_refused()
+
+    def _host_refused(self):
+        """The Host allowlist, before anything else: a refusal is a bare 404,
+        not charged to any budget, not a strike, logged only within the
+        capped refusal bucket. True means it has already answered."""
+        if self.server.host_allowed(self.headers.get_all("Host") or []):
+            return False
+        if self.server.may_log_refusal():
+            log(self.server.name, "refused: host")
+        self._send(404, b"", "text/plain")
+        return True
+
+    def _login_passes(self, path):
+        """The login pin, if this server has one. A failure is answered here
+        (a bare 404, via _login_refused) and logged."""
+        if not self.server.pin or login_ok(self.headers):
+            return True
+        if not path.startswith(AUTO_FETCH) and self.server.may_log_refusal():
+            log(self.server.name, "refused: login")
+        self._login_refused(path)
+        return False
+
+    def _login_refused(self, path):
+        """Short-lived pages count a refused login toward the lockout."""
+        self._not_found(path)
+
+    def _authorised(self):
+        """The login pin first, then the token. Both failures look the same
+        from outside (a bare 404)."""
+        if self._screened():
+            return None
+        self.server.requests += 1
+        path = urllib.parse.urlsplit(self.path).path
+        if not self._login_passes(path) or not self._admitted():
+            return None
+        if self.server.token_ok(path):
+            return path
+        self._not_found(path)
+        return None
+
+    def _read_form(self, max_fields):
+        """The parsed POST body, or None after sending a 400."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            length = -1
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not 0 < length <= MAX_BODY or ctype != "application/x-www-form-urlencoded":
+            self._send(400, render_message("That didn't look like the form.").encode())
+            return None
+        try:
+            return urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"),
+                                         max_num_fields=max_fields, strict_parsing=True,
+                                         keep_blank_values=True)
+        except (UnicodeDecodeError, ValueError):
+            self._send(400, render_message("That didn't look like the form.").encode())
+            return None
+
+    def do_GET(self):
+        path = self._authorised()
+        if path:
+            self._send(200, render_form(self.server.name, self.server.note, path).encode())
+
+    def do_POST(self):
+        path = self._authorised()
+        if not path:
+            return
+        fields = self._read_form(4)
+        if fields is None:
+            return
+        value = (fields.get("value") or [""])[0].strip()
+        if not value:
+            self._send(400, render_form(self.server.name, self.server.note, path,
+                                        "Nothing was entered.").encode())
+            return
+        try:
+            keychain_store(self.server.name, value)
+        except (KeydropError, OSError, subprocess.TimeoutExpired):
+            self.server.outcome = "store-failed"
+            self._send(500, render_message("Couldn't store it. Tell whoever sent you the link.").encode())
+            return
+        finally:
+            value = fields = None
+        if self.server.note:
+            write_note(self.server.name, self.server.note)
+        self.server.outcome = "stored"
+        self._send(200, render_message("Stored. You can close this.").encode())
+
+    def _reject(self):
+        if self._screened():
+            return
+        self.server.requests += 1
+        self._not_found(urllib.parse.urlsplit(self.path).path)
+
+    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject
+
+
+def field(fields, key):
+    return (fields.get(key) or [""])[0]
+
+
+class VaultHandler(Handler):
+    """GET shows the list. Every change is a POST to the same /<token> with
+    the session's form token and an action; the response is a 303 back to the
+    list, so a reload never resubmits a value."""
+
+    def do_GET(self):
+        path = self._authorised()
+        if path:
+            self._page(path)
+
+    def _page(self, path, code=200, error=""):
+        srv = self.server
+        flash, srv.flash = srv.flash, ""
+        try:
+            entries = keychain_entries()
+        except (OSError, subprocess.TimeoutExpired):
+            entries, error = {}, error or "Couldn't read the keychain."
+        self._send(code, render_vault(path, srv.issue_csrf(), entries, read_notes(), srv.expires,
+                                      flash, error, srv.title, srv.done_label).encode())
+
+    def _done(self, path, flash):
+        self.server.flash = flash
+        self._send(303, b"", "text/plain", extra=(("Location", path),))
+
+    def _origin_ok(self):
+        """Pages here send no referrer, so a browser's own same-origin POST
+        carries `Origin: null` (or none). A real origin is only accepted if it
+        names the host the request was sent to; anything else is another
+        site's page posting here."""
+        origins = self.headers.get_all("Origin") or []
+        if len(origins) > 1:
+            return False
+        if not origins or origins[0].strip() == "null":
+            return True
+        host = (self.headers.get("Host") or "").strip().lower()
+        return bool(host) and urllib.parse.urlsplit(origins[0].strip()).netloc.lower() == host
+
+    def _csrf_check(self, fields):
+        """"ok", "stale" (a real form token that has aged out; not counted)
+        or "bad". Sec-Fetch-Site and Origin are second opinions where the
+        browser sends them."""
+        site = (self.headers.get("Sec-Fetch-Site") or "same-origin").lower()
+        if site not in ("same-origin", "none") or not self._origin_ok():
+            return "bad"
+        return self.server.check_csrf(field(fields, "csrf"))
+
+    def do_POST(self):
+        path = self._authorised()
+        if not path:
+            return
+        fields = self._read_form(8)
+        if fields is None:
+            return
+        try:
+            verdict = self._csrf_check(fields)
+            if verdict != "ok":
+                if verdict == "bad":
+                    if not self._strike_eligible():
+                        self._send(404, b"", "text/plain")
+                        return
+                    self.server.bad += 1
+                log(self.server.name, f"refused: form token ({verdict})")
+                self._send(403, render_message("That form is stale. Reload the page.").encode())
+                return
+            self._act(path, field(fields, "action"), fields)
+        finally:
+            fields = None
+
+    def _act(self, path, act, fields):
+        name = field(fields, "name").strip()
+        if act == "done":
+            self.server.outcome = self.server.done_outcome
+            self._send(200, render_message(self.server.done_message).encode())
+            return
+        if act == "back":
+            self._done(path, "")
+            return
+        if act not in ("add", "replace", "delete", "delete-confirm"):
+            self._page(path, 400, "Unknown action.")
+            return
+        if not valid_name(name):
+            self._page(path, 400, "Names are a-z, 0-9, . _ - and up to 64 characters.")
+            return
+        try:
+            exists = keychain_exists(name)
+        except (OSError, subprocess.TimeoutExpired):
+            self._page(path, 500, "Couldn't read the keychain.")
+            return
+        if act == "add" and exists:
+            self._page(path, 409, f"{name} already exists. Use Replace on it instead.")
+            return
+        if act != "add" and not exists:
+            self._page(path, 404, f"There's no {name}.")
+            return
+        if act == "delete":
+            self._send(200, render_confirm_delete(path, self.server.issue_csrf(), name).encode())
+            return
+        if act == "delete-confirm":
+            self._delete(path, name)
+            return
+        self._store(path, act, name, fields)
+
+    def _rate_limited(self, path, name, act):
+        """Booked only once a write is about to happen, so a refused form
+        doesn't use up a slot."""
+        if self.server.write_allowed():
+            return False
+        self.server.audit(name, f"{act} rate-limited")
+        self._page(path, 429, "Too many changes in the last hour. Try again later.")
+        return True
+
+    def _delete(self, path, name):
+        if self._rate_limited(path, name, "delete"):
+            return
+        try:
+            keychain_delete(name)
+        except (KeydropError, OSError, subprocess.TimeoutExpired):
+            self.server.audit(name, "delete failed")
+            self._page(path, 500, f"Couldn't delete {name}.")
+            return
+        write_note(name, None)
+        self.server.audit(name, "deleted")
+        self._done(path, f"Deleted {name}.")
+
+    def _store(self, path, act, name, fields):
+        try:
+            note = clean_note(field(fields, "note"))
+        except KeydropError as e:
+            self._page(path, 400, str(e).replace("--note", "The note"))
+            return
+        value = field(fields, "value").strip()
+        if not value:
+            self._page(path, 400, "Nothing was entered.")
+            return
+        if self._rate_limited(path, name, act):
+            return
+        try:
+            keychain_store(name, value)
+        except (KeydropError, OSError, subprocess.TimeoutExpired):
+            self.server.audit(name, f"{act} failed")
+            self._page(path, 500, f"Couldn't store {name}.")
+            return
+        finally:
+            value = None
+            fields.pop("value", None)
+        if note or act == "add":
+            write_note(name, note or None)
+        self.server.audit(name, f"{act} stored")
+        self._done(path, f"Stored {name}.")
+
+
+class Server(http.server.HTTPServer):
+    max_requests = MAX_REQUESTS
+
+    def __init__(self, handler, token, name, note="", pin=True, port=0):
+        # Bound, not listening: serve_child calls listen() once the route
+        # claims this port. Until then a SYN to it is dropped.
+        super().__init__(("127.0.0.1", port), handler, bind_and_activate=False)
+        try:
+            self.server_bind()
+        except OSError as e:
+            self.server_close()
+            raise KeydropError(f"127.0.0.1:{port} is already taken on this Mac ({e.strerror})")
+        self.listening = False
+        self.token, self.name, self.note, self.pin = token, name, note, pin
+        self.bad = self.requests = 0
+        self.outcome = None
+        self.tailnet_port = None   # set by allow_hosts; None fails route_intact
+        self.allow_hosts()
+
+    def listen(self):
+        self.server_activate()
+        self.listening = True
+
+    def watch(self):
+        """An outcome to end the serve loop with, or None to carry on."""
+        return None
+
+    def allow_hosts(self, tailnet_name=None, tailnet_port=None):
+        """The exact Host values this page answers: its loopback names on its
+        own port, plus the tailnet name with and without the tailnet port
+        (whether serve keeps the browser's Host or rewrites it to the
+        backend). A DNS-rebinding page always carries its own hostname."""
+        port = self.server_address[1]
+        hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if tailnet_name:
+            hosts |= {tailnet_name, f"{tailnet_name}:{tailnet_port}"}
+            self.tailnet_port = tailnet_port
+        self.hosts = frozenset(h.lower() for h in hosts)
+
+    def route_intact(self, status=None):
+        """Whether serve still claims this page's port with a route to this
+        listener. A page with no tailnet port has nothing claiming it."""
+        if self.tailnet_port is None or self.tailnet_port != self.server_address[1]:
+            return False
+        return route_ours(serve_status() if status is None else status, self.tailnet_port)
+
+    def host_allowed(self, values):
+        """Exactly one Host header, exactly one of ours. Anything else
+        (missing, duplicated, another name or port) is refused."""
+        return len(values) == 1 and values[0].lower() in self.hosts
+
+    def token_ok(self, path):
+        return token_matches(path, self.token)
+
+    def refusal(self):
+        """A reason not to start serving, checked under serve_lock right
+        before the route goes up. None: go ahead."""
+        return None
+
+    def may_log_refusal(self):
+        """Whether a refused login gets a log line. Short-lived pages die
+        after a handful of failures, so always."""
+        return True
+
+
+class OneShot(Server):
+    def __init__(self, token, name, note, pin=True, port=0):
+        super().__init__(Handler, token, name, note, pin, port)
+
+
+class Vault(Server):
+    max_requests = MAX_SESSION_REQUESTS
+    handler = VaultHandler
+    title, done_label = "keydrop vault", "Done, close this link"
+    done_outcome, done_message = "done", "Closed. The link is dead now."
+    label = "vault"
+
+    def __init__(self, token, expires, pin=True, name=VAULT, port=0):
+        super().__init__(self.handler, token, name, "", pin, port)
+        self.csrf = secrets.token_urlsafe(32)
+        self.expires = expires
+        self.flash = ""
+
+    def issue_csrf(self):
+        return self.csrf
+
+    def check_csrf(self, given):
+        same = hmac.compare_digest(hashlib.sha256(given.encode("utf-8", "replace")).digest(),
+                                   hashlib.sha256(self.csrf.encode()).digest())
+        return "ok" if same else "bad"
+
+    def write_allowed(self):
+        return True
+
+    def audit(self, name, event):
+        """Name and what happened. Never a value: no caller has one to pass."""
+        log(name, f"{self.label} {event}")
+
+
+def run_until_done(srv, deadline):
+    srv.timeout = 0.5
+    while srv.outcome is None:
+        if time.time() >= deadline:
+            return "expired"
+        if srv.bad >= MAX_BAD or srv.requests >= srv.max_requests:
+            return "locked-out"
+        why = srv.watch()
+        if why:
+            return why
+        srv.handle_request()
+    return srv.outcome
+
+
+class Terminated(BaseException):
+    pass
+
+
+class Refused(Exception):
+    """The server's refusal() said no at the last moment before routing."""
+
+
+def _on_signal(signum, _frame):
+    raise Terminated(signal.Signals(signum).name)
+
+
+def serve_child(srv, rec, report_fd):
+    """Runs in the detached child. Owns teardown from the first line."""
+    outcome = "crashed"
+    serving = False
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, _on_signal)
+    try:
+        with serve_lock():
+            write_pending(rec)   # before the route, so a route never exists unowned
+            # Checked after the record is written, and under the lock
+            # home_stop sets its flag under: a stop that lands during start-up
+            # is either seen here, or finds this record and SIGTERMs us.
+            why = srv.refusal()
+            if why:
+                raise Refused(why)
+            if rec["tailnet_port"]:
+                serving = True   # a timed-out `serve` may still have written config
+                serve_on(rec["tailnet_port"], rec["local_port"], rec["plain_http"])
+            srv.listen()   # only now: the route claims the port first
+        log(rec["name"], "requested")
+        os.write(report_fd, b"ok")
+        os.close(report_fd)
+        report_fd = None
+        outcome = run_until_done(srv, rec["expires"] or float("inf"))
+    except Terminated as e:
+        outcome = f"cancelled ({e})"
+    except Refused as e:
+        outcome = f"refused ({e})"
+    except KeydropError as e:
+        outcome = "serve-failed"
+        if report_fd is not None:
+            os.write(report_fd, str(e).encode()[:1000])
+    except Exception as e:   # noqa: BLE001 - last line before teardown
+        outcome = f"crashed ({type(e).__name__})"
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        srv.server_close()
+        log(rec["name"], outcome)
+        with serve_lock():
+            if serving and outcome == "route-gone" and route_left(rec["tailnet_port"]):
+                drop_pending(rec)   # gone, or someone else's now: not ours to remove
+            elif serving and not serve_off(rec["tailnet_port"], rec["plain_http"]):
+                # Keep the record so reap retries; the route may still be live
+                # or come back from tailscaled's persisted config.
+                write_pending(dict(rec, teardown_failed=True))
+                log(rec["name"], "teardown-failed")
+            else:
+                drop_pending(rec)
+        if report_fd is not None:
+            try:
+                os.close(report_fd)
+            except OSError:
+                pass
+    return outcome
+
+
+def route_left(port):
+    """After route-gone: True if serve status reads and :port is either absent
+    or no longer ours, so teardown must not touch it. False (unreadable, or
+    still ours) means tear down as usual, which keeps the record on failure."""
+    st = serve_status()
+    if st is None:
+        return False
+    try:
+        return str(port) not in (st.get("TCP") or {}) or not route_ours(st, port)
+    except (AttributeError, TypeError):
+        return False
+
+
+def detach_stdio(keep):
+    """Point 0-2 at /dev/null and close every other inherited fd, so the
+    child holds none of the caller's pipes open (a caller waiting for EOF
+    would otherwise wait out the whole TTL)."""
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    os.close(devnull)
+    lo = 3
+    for fd in sorted(keep):
+        os.closerange(lo, fd)
+        lo = fd + 1
+    os.closerange(lo, os.sysconf("SC_OPEN_MAX"))
+
+
+def claim_port(make, in_use, tries=PORT_PICK_TRIES):
+    """make() binds a server on a fresh loopback port. Keep the first one
+    whose port serve isn't already using, so the tailnet route can take the
+    same number; refuse rather than drift onto another one. Rejected binds
+    are held until the end so the kernel can't hand the same port back."""
+    rejected = []
+    try:
+        for _ in range(tries):
+            srv = make()
+            if str(srv.server_address[1]) not in in_use:
+                return srv
+            rejected.append(srv)
+    finally:
+        for srv in rejected:
+            srv.server_close()
+    raise KeydropError(f"no free loopback port serve isn't already using after {tries} tries")
+
+
+def request(name, note, ttl, plain_http=False):
+    if not valid_name(name):
+        raise KeydropError("name must be [a-z0-9._-], 1-64 chars")
+    note = clean_note(note)
+    ensure_state()
+    reap()
+    if any(r["name"] == name and not r.get("teardown_failed") for r in read_pending()):
+        raise KeydropError(f"a request for {name} is already pending (keydrop cancel {name})")
+    host = tailnet_host(plain_http)
+    token = secrets.token_urlsafe(32)
+    srv = claim_port(lambda: OneShot(token, name, note, True), serve_ports_in_use())
+    return launch(srv, token, {"name": name, "note": note}, ttl, host, plain_http)
+
+
+def vault(ttl, plain_http=False):
+    ensure_state()
+    reap()
+    if any(r.get("kind") == "vault" and not r.get("teardown_failed") for r in read_pending()):
+        raise KeydropError("a vault session is already open (keydrop cancel vault)")
+    host = tailnet_host(plain_http)
+    token = secrets.token_urlsafe(32)
+    expires = time.time() + ttl
+    srv = claim_port(lambda: Vault(token, expires, True), serve_ports_in_use())
+    return launch(srv, token, {"name": VAULT, "kind": "vault", "note": ""}, ttl, host,
+                  plain_http, expires)
+
+
+def launch(srv, token, rec_fields, ttl, host, plain_http, expires=None):
+    """Fork the detached server, wait for it to report its route is up, and
+    return the link."""
+    local_port = srv.server_address[1]
+    tailnet_port = local_port   # never another number: see claim_port
+    srv.allow_hosts(host, tailnet_port)
+    rec = dict(rec_fields, id=secrets.token_hex(4), local_port=local_port,
+               tailnet_port=tailnet_port, plain_http=plain_http, created=time.time(),
+               expires=expires or time.time() + ttl)
+
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        os.setsid()
+        detach_stdio({srv.fileno(), wfd})
+        rec["pid"] = os.getpid()
+        try:
+            serve_child(srv, rec, wfd)
+        finally:
+            os._exit(0)
+
+    os.close(wfd)
+    srv.server_close()
+    chunks = []
+    while True:
+        chunk = os.read(rfd, 4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(rfd)
+    status = b"".join(chunks).decode(errors="replace")
+    if status != "ok":
+        raise KeydropError(status or "server exited before it was ready")
+    scheme = "http" if plain_http else "https"
+    return f"{scheme}://{host}:{tailnet_port}/{token}"
+
+
+def cancel(name):
+    hit = False
+    for rec in read_pending():
+        mine = rec.get("kind") == "vault" if name == "vault" else (
+            rec["name"] == name and rec.get("kind") != "vault")
+        if mine and alive(rec["pid"]):
+            os.kill(rec["pid"], signal.SIGTERM)
+            hit = True
+    return hit
+
+
+def status_lines():
+    ensure_state()
+    reap()
+    now = time.time()
+    out = []
+    for rec in read_pending():
+        where = (f"tailnet :{rec['tailnet_port']}{' (http)' if rec['plain_http'] else ''}"
+                 if rec["tailnet_port"] else f"local :{rec['local_port']}")
+        if rec.get("teardown_failed"):
+            out.append(f"{rec['name']}\tteardown failed, retrying on every reap\t{where}")
+            continue
+        if rec.get("kind") == "home":
+            out.append(f"{rec['name']}\talways on\t{where}\tpid {rec['pid']}")
+            continue
+        left = max(0, int(rec["expires"] - now))
+        out.append(f"{rec['name']}\t{left // 60}m{left % 60:02d}s left\t{where}\tpid {rec['pid']}")
+    st = read_home()
+    for flag in ("locked", "stopped"):
+        if st.get(flag):
+            out.append(f"{HOME}\t{flag} since {when(st[flag].get('at'))} ({st[flag].get('why', '')})"
+                       "\tkeydrop home --unlock clears it")
+    return out
+
+# ---------- home ----------
+
+class home_lock(serve_lock):
+    FILE = "home.lock"
+
+
+def read_home():
+    """home.json: the link's SHA-256, recent bad requests and writes, the
+    lockout and stop flags, and the port it last served on. No token, no value."""
+    try:
+        with open(HOME_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def update_home(fn):
+    """Read, change and replace home.json whole under its lock. fn gets a
+    copy and returns the new state."""
+    with home_lock():
+        new = fn(dict(read_home()))
+        tmp = HOME_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(new, f, sort_keys=True)
+        os.replace(tmp, HOME_FILE)
+        return new
+
+
+def recent(stamps, window, now=None):
+    now = time.time() if now is None else now
+    return [t for t in stamps or [] if isinstance(t, (int, float)) and now - t < window]
+
+
+def audit_line(name, event):
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    fd = os.open(AUDIT_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        f.write(f"{stamp}\t{name}\t{event}\n")
+
+
+class HomeHandler(VaultHandler):
+    """The vault handler, made safe to leave up. Strikes persist and lock the
+    page until the owner unlocks it on the Mac, so nothing a web page they
+    visit, or another tailnet node, can make happen may count as one:
+
+    - a request a browser marks as from another site gets a bare 404 first;
+    - a request without the owner's login gets a bare 404, no strike (serve
+      sets the login from WhoIs, so it can't get in) and is not rate-charged,
+      so a peer can't spend the owner's per-minute budget;
+    - a strike needs the owner's login AND Sec-Fetch-Site of same-origin or none.
+      Browsers only send Fetch Metadata to HTTPS origins, and a request
+      without it (an <img> on some page, curl) can't be told from a
+      cross-site one, so it gets a bare 404 with no strike. This is also why
+      home has no --http.
+
+    The per-minute limit (429) applies to requests carrying the owner's login."""
+
+    def _turned_away(self):
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site in ("cross-site", "same-site"):
+            self._send(404, b"", "text/plain")
+            return True
+        return False
+
+    def _strike_eligible(self):
+        sites = self.headers.get_all("Sec-Fetch-Site") or []
+        return len(sites) == 1 and sites[0].strip().lower() in ("same-origin", "none")
+
+    def _admitted(self):
+        if self.server.under_rate():
+            return True
+        self._send(429, b"", "text/plain")
+        return False
+
+    def _login_refused(self, path):
+        """No strike. serve overwrites Tailscale-User-Login from WhoIs, so a
+        request without the owner's login can never get in, and counting it
+        would only let any other tailnet node lock the page. Strikes are for
+        requests carrying the owner's login with a wrong path or form token."""
+        self._send(404, b"", "text/plain")
+
+    def _reject(self):
+        if self._screened():
+            return
+        self.server.requests += 1
+        path = urllib.parse.urlsplit(self.path).path
+        if self._login_passes(path) and self._admitted():
+            self._not_found(path)
+
+    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject
+
+
+class Home(Vault):
+    """The vault, always on. The counters that matter live in home.json, so
+    a restart (or a crash and a launchd respawn) starts where it left off."""
+    max_requests = float("inf")
+    handler = HomeHandler
+    title, done_label = "keydrop", "Stop this page"
+    done_outcome = "stopped"
+    done_message = "Stopped. It stays down until keydrop home --unlock is run on the Mac."
+    label = "home"
+
+    def __init__(self, pin=True, port=None):
+        """port: HOME_PORT unless a unit test needs a second one beside it."""
+        self.started = time.time()
+        self._csrf_key = secrets.token_bytes(32)
+        self._minute, self._refusals = [], []
+        self._next_watch = 0.0
+        super().__init__(None, None, pin, HOME, HOME_PORT if port is None else port)
+
+    def watch(self, now=None, status=None):
+        """Every watch_interval() seconds, read `serve status`; if the route
+        for HOME_PORT is gone or no longer proxies here, end the loop so the
+        listener closes before netstack forwards a peer straight to it."""
+        now = time.time() if now is None else now
+        if not self.listening or now < self._next_watch:
+            return None
+        self._next_watch = now + watch_interval()
+        if route_ours(serve_status() if status is None else status, HOME_PORT):
+            return None
+        return "route-gone"
+
+    # The path token is checked against the SHA-256 in home.json, read per
+    # request, so `home --new-link` kills the old bookmark without a restart.
+    def token_ok(self, path):
+        want = read_home().get("token_sha256") or ""
+        if not re.fullmatch(r"[0-9a-f]{64}", want):
+            return False
+        guess = path[1:] if path.startswith("/") else path
+        return hmac.compare_digest(hashlib.sha256(guess.encode("utf-8", "replace")).digest(),
+                                   bytes.fromhex(want))
+
+    # Strikes are persisted. Handler code does `server.bad += 1`; the setter
+    # records the new strikes and locks the page once there are MAX_BAD in
+    # the window.
+    # A lock or a stop reads as a full count, so run_until_done ends the
+    # serve loop as soon as either is set, whoever set it.
+    @staticmethod
+    def _strike_count(st, now=None):
+        if st.get("locked") or st.get("stopped"):
+            return MAX_BAD
+        return len(recent(st.get("bad"), HOME_BAD_WINDOW, now))
+
+    @property
+    def bad(self):
+        return self._strike_count(read_home())
+
+    @bad.setter
+    def bad(self, value):
+        def add(st):
+            now = time.time()
+            strikes = recent(st.get("bad"), HOME_BAD_WINDOW, now)
+            more = value - self._strike_count(st, now)
+            if more <= 0:
+                return st
+            strikes = strikes + [now] * more
+            locked = st.get("locked") or (
+                {"at": now, "why": f"{len(strikes)} bad requests"} if len(strikes) >= MAX_BAD else None)
+            return dict(st, bad=strikes, locked=locked)
+        update_home(add)
+
+    def refusal(self):
+        st = read_home()
+        for flag in ("locked", "stopped"):
+            if st.get(flag):
+                return flag
+        return None
+
+    # Sliding one-minute buckets. A request over the limit isn't recorded,
+    # so a bucket never holds more than REQUESTS_PER_MINUTE stamps.
+    def _within_minute(self, attr):
+        now = time.time()
+        kept = [t for t in getattr(self, attr) if now - t < 60]
+        ok = len(kept) < REQUESTS_PER_MINUTE
+        setattr(self, attr, kept + [now] if ok else kept)
+        return ok
+
+    def under_rate(self):
+        """The owner's budget: charged only once a request has passed the login pin."""
+        return self._within_minute("_minute")
+
+    def may_log_refusal(self):
+        """Refused logins aren't rate-charged, so their log lines are capped
+        on their own bucket instead of growing keydrop.log without bound."""
+        return self._within_minute("_refusals")
+
+    # Form tokens are stamped and MACed with a per-process key, so each page
+    # gets a fresh one and any open tab keeps working. An old one that is
+    # really ours is "stale" (reload, no strike); a forged one is "bad".
+    # A well-formed token stamped in an earlier second than this process
+    # started can't be checked (its key died with the old process): that is
+    # a tab left open across a restart, so it is "stale" too. A forger can
+    # pick an old stamp to dodge the strike, but not to get in.
+    def issue_csrf(self):
+        stamp = str(int(time.time()))
+        mac = hmac.new(self._csrf_key, stamp.encode(), hashlib.sha256).hexdigest()
+        return f"{stamp}.{mac}"
+
+    def check_csrf(self, given):
+        stamp, _, mac = (given or "").partition(".")
+        if not re.fullmatch(r"[0-9]{1,12}", stamp):
+            return "bad"
+        want = hmac.new(self._csrf_key, stamp.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac.encode("utf-8", "replace"), want.encode()):
+            prestart = int(stamp) < int(self.started)
+            return "stale" if prestart and re.fullmatch(r"[0-9a-f]{64}", mac) else "bad"
+        age = time.time() - int(stamp)
+        return "ok" if -60 <= age <= CSRF_MAX_AGE else "stale"
+
+    def write_allowed(self):
+        """Checks and books a write in one locked step."""
+        verdict = []
+
+        def book(st):
+            now = time.time()
+            writes = recent(st.get("writes"), WRITE_WINDOW, now)
+            verdict.append(len(writes) < WRITE_LIMIT)
+            return dict(st, writes=writes + [now] if verdict[0] else writes)
+        update_home(book)
+        return verdict[0]
+
+    def audit(self, name, event):
+        super().audit(name, event)
+        audit_line(name, event)
+
+
+def home_route(status, port):
+    """The local port the home route at :port proxies to, or None if :port
+    isn't a single `/` proxy to 127.0.0.1 (so not ours to touch)."""
+    port = str(port)
+    entry = (status.get("TCP") or {}).get(port)
+    hosts = [h for h in (status.get("Web") or {}) if h.rsplit(":", 1)[-1] == port]
+    if not isinstance(entry, dict) or len(hosts) != 1:
+        return None
+    handlers = (status["Web"][hosts[0]] or {}).get("Handlers") or {}
+    m = re.fullmatch(r"http://127\.0\.0\.1:(\d+)", ((handlers.get("/") or {}).get("Proxy") or ""))
+    return int(m.group(1)) if m and set(handlers) == {"/"} else None
+
+
+def home_backend(backend, port):
+    """Whether a route's backend is keydrop home's: its own port, or an
+    ephemeral one from a version that picked its port at random."""
+    return backend is not None and (backend == int(port) or backend in EPHEMERAL_PORTS)
+
+
+def watch_interval():
+    try:
+        n = float(os.environ.get("KEYDROP_WATCH_INTERVAL") or WATCH_INTERVAL)
+    except ValueError:
+        n = WATCH_INTERVAL
+    return min(max(n, 0.1), WATCH_INTERVAL)
+
+
+def home_new_link():
+    """Mints the path token, keeps only its SHA-256, prints the URL once.
+    Whoever runs this sees the token; nothing else ever does."""
+    ensure_state()
+    host = tailnet_host(http_hint=False)
+    token = secrets.token_urlsafe(32)
+    update_home(lambda st: dict(st, token_sha256=hashlib.sha256(token.encode()).hexdigest()))
+    log(HOME, "new link")
+    return f"https://{host}:{HOME_PORT}/{token}"
+
+
+def home():
+    """Runs in the foreground until stopped, locked out, or killed. Exit 0
+    means "stay down" (launchd's KeepAlive only restarts on failure)."""
+    ensure_state()
+    st = read_home()
+    for flag in ("locked", "stopped"):
+        if st.get(flag):
+            print(f"keydrop home: {flag} ({st[flag].get('why', '')}); "
+                  "`keydrop home --unlock` on the Mac clears it", file=sys.stderr)
+            return 0
+    if not st.get("token_sha256"):
+        print("keydrop home: no link yet; run `keydrop home --new-link` first", file=sys.stderr)
+        return 0
+    reap()
+    if any(r.get("kind") == "home" and not r.get("teardown_failed") for r in read_pending()):
+        raise KeydropError("the home page is already running")
+    host = tailnet_host(http_hint=False)
+    if str(HOME_PORT) in serve_ports_in_use():
+        raise KeydropError(f"tailnet port {HOME_PORT} is already served by something else")
+    srv = Home(pin=True)   # binds 127.0.0.1:HOME_PORT, doesn't listen yet
+    srv.allow_hosts(host, HOME_PORT)
+    rec = {"name": HOME, "kind": "home", "note": "", "id": secrets.token_hex(4),
+           "local_port": HOME_PORT, "tailnet_port": HOME_PORT,
+           "plain_http": False, "created": time.time(), "expires": None, "pid": os.getpid()}
+    update_home(lambda st: dict(st, port=rec["tailnet_port"], plain_http=False))
+    rfd, wfd = os.pipe()
+    outcome = serve_child(srv, rec, wfd)
+    os.set_blocking(rfd, False)
+    try:
+        report = os.read(rfd, 4096).decode(errors="replace")
+    except BlockingIOError:
+        report = ""
+    os.close(rfd)
+    if outcome == "stopped":
+        mark_stopped("the page's Stop button")
+    if outcome in ("stopped", "locked-out") or outcome.startswith(("cancelled", "refused")):
+        return 0
+    if outcome == "route-gone":
+        raise KeydropError(f"the serve route for :{HOME_PORT} went away while the page was up; "
+                           "closed the listener so netstack can't forward peers to it")
+    if report and report != "ok":
+        raise KeydropError(report)
+    raise KeydropError(f"home page ended: {outcome}")
+
+
+def mark_stopped(why):
+    update_home(lambda st: dict(st, stopped={"at": time.time(), "why": why}))
+    log(HOME, f"stopped ({why})")
+
+
+def home_stop():
+    """The kill switch. Flag first, so a launchd respawn stays down; then end
+    the process (its own teardown removes the route) and remove the route
+    directly in case the process was already dead. True once serve status
+    confirms the route is gone."""
+    ensure_state()
+    with serve_lock():
+        # A starting page writes its record, then reads this flag; we write
+        # the flag, then read records. Either it sees the flag and refuses,
+        # or we see its record and SIGTERM it. That ordering is what makes a
+        # stop during start-up safe; the lock only narrows the window further.
+        mark_stopped("home --stop")
+    pids = [r["pid"] for r in read_pending()
+            if r.get("kind") == "home" and not r.get("teardown_failed") and alive(r["pid"])]
+    for pid in pids:
+        os.kill(pid, signal.SIGTERM)
+    end = time.time() + 15
+    while time.time() < end and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    reap()
+    st = read_home()
+    port = st.get("port")
+    if not port:
+        return True
+    with serve_lock():
+        status = serve_status()
+        if status is None:
+            return False
+        backend = home_route(status, port) if str(port) in (status.get("TCP") or {}) else None
+        if str(port) in (status.get("TCP") or {}) and not home_backend(backend, port):
+            # someone else's route on our port: say what's there, leave it
+            print(f"keydrop: :{port} is routed to {backend or 'something else'}, not "
+                  f"keydrop home; leaving it", file=sys.stderr)
+            return False
+        if backend is not None:
+            serve_off(port, st.get("plain_http", False))
+            status = serve_status()
+    return status is not None and str(port) not in (status.get("TCP") or {})
+
+
+def home_unlock():
+    update_home(lambda st: dict(st, bad=[], locked=None, stopped=None))
+    log(HOME, "unlocked")
+
+
+# ---------- cli ----------
+
+USAGE = __doc__.split("\n\n")[1]
+
+
+NO_LOCAL = ("has no --local: a loopback listener with no serve route on its port is "
+            "reachable by every tailnet peer through tailscaled's userspace networking, "
+            "with any identity headers it likes")
+
+
+def home_cli(rest):
+    flags = set(rest)
+    if "--http" in flags:
+        raise KeydropError("home is HTTPS only: browsers send no Fetch Metadata over plain "
+                           "HTTP, and without it the lockout can't tell the owner from any "
+                           "page they visit. Enable HTTPS certificates for the tailnet instead")
+    if "--local" in flags:
+        raise KeydropError("home " + NO_LOCAL)
+    known = {"--new-link", "--stop", "--unlock"}
+    if flags - known or len(flags) != len(rest) or len(flags) > 1:
+        raise KeydropError("usage: keydrop home | --new-link | --stop | --unlock")
+    if not flags & {"--stop", "--unlock"}:
+        require_owner()
+    if "--new-link" in flags:
+        print(home_new_link())
+        print("Bookmark it. This is the only time it's shown; --new-link again replaces it.",
+              file=sys.stderr)
+        return 0
+    if "--stop" in flags:
+        if not home_stop():
+            print("keydrop: stopped, but couldn't confirm the serve route is gone "
+                  "(is tailscaled up?); run --stop again", file=sys.stderr)
+            return 1
+        print("home page stopped; it stays down until `keydrop home --unlock`")
+        return 0
+    if "--unlock" in flags:
+        home_unlock()
+        print("unlocked. Start it again with: "
+              f"launchctl kickstart gui/$(id -u)/{LAUNCHD_LABEL}")
+        return 0
+    return home()
+
+
+def config_lines():
+    return [f"config file      {CONFIG_PATH}" + ("" if os.path.exists(CONFIG_PATH) else " (not found)"),
+            f"owner_login      {OWNER_LOGIN or '(not set: request, vault and home will refuse to start)'}",
+            f"account          {ACCOUNT}",
+            f"service_prefix   {SERVICE_PREFIX}",
+            f"state_dir        {STATE_DIR}",
+            f"launchd_label    {LAUNCHD_LABEL}",
+            f"home_port        {HOME_PORT}",
+            f"tailscale        {TAILSCALE}",
+            f"tailscale_socket {TS_SOCKET or '(default)'}"]
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    try:
+        require_config()
+        if cmd == "config" and not rest:
+            for line in config_lines():
+                print(line)
+            return 0
+        if cmd == "request":
+            name, note, ttl, plain_http = None, "", DEFAULT_TTL, False
+            it = iter(rest)
+            for a in it:
+                if a == "--note":
+                    note = next(it, "")
+                elif a == "--ttl":
+                    ttl = parse_ttl(next(it, ""))
+                elif a == "--http":
+                    plain_http = True
+                elif a == "--local":
+                    raise KeydropError("request " + NO_LOCAL)
+                elif name is None and not a.startswith("-"):
+                    name = a
+                else:
+                    raise KeydropError(f"unexpected argument {a!r}")
+            if name is None:
+                raise KeydropError("request needs a name")
+            require_owner()
+            print(request(name, note, ttl, plain_http))
+            return 0
+        if cmd == "vault":
+            ttl, plain_http = DEFAULT_TTL, False
+            it = iter(rest)
+            for a in it:
+                if a == "--ttl":
+                    ttl = parse_ttl(next(it, ""))
+                elif a == "--http":
+                    plain_http = True
+                elif a == "--local":
+                    raise KeydropError("vault " + NO_LOCAL)
+                else:
+                    raise KeydropError(f"unexpected argument {a!r}")
+            require_owner()
+            print(vault(ttl, plain_http))
+            return 0
+        if cmd == "home":
+            return home_cli(rest)
+        if cmd == "get" and len(rest) == 1:
+            if not valid_name(rest[0]):
+                raise KeydropError("bad name")
+            value = keychain_get(rest[0])
+            if value is None:
+                print(f"keydrop: no key named {rest[0]}", file=sys.stderr)
+                return 1
+            sys.stdout.write(value + ("\n" if sys.stdout.isatty() else ""))
+            return 0
+        if cmd == "list" and not rest:
+            for n in keychain_list():
+                print(n)
+            return 0
+        if cmd == "status" and not rest:
+            lines = status_lines()
+            print("\n".join(lines) if lines else "no pending requests")
+            return 0
+        if cmd == "cancel" and len(rest) == 1:
+            if not cancel(rest[0]):
+                print(f"keydrop: nothing pending for {rest[0]}", file=sys.stderr)
+                return 1
+            return 0
+        print(USAGE, file=sys.stderr)
+        return 2
+    except KeydropError as e:
+        print(f"keydrop: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

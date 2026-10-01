@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the launchd agent that runs `keydrop home`, the always-on
+  page. Render it with real values before loading; README.md, "Running the
+  home page under launchd", has the sed line. Placeholders:
+
+    __LABEL__    the launchd label; must match launchd_label in keydrop's config
+    __PYTHON__   absolute path to python3
+    __KEYDROP__  absolute path to the installed copy (e.g. ~/.local/bin/keydrop,
+                 expanded). An installed copy, not a git checkout, so launchd
+                 runs the version you reviewed and not whatever is checked out.
+    __LOG__      absolute path for launchd's stdout/stderr log
+
+  keydrop reads its settings from ~/.config/keydrop/config.json, so there
+  is no EnvironmentVariables block.
+
+  KeepAlive only on failure: a lockout, the stop flag and the page's Stop
+  button all exit 0, so launchd leaves it down until you unlock it and
+  kickstart the job (README.md, "Stopping and unlocking"). This comment
+  avoids double hyphens, which XML forbids inside comments.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__KEYDROP__</string>
+        <string>home</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>

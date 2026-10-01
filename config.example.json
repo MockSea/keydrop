@@ -1,0 +1,10 @@
+{
+  "owner_login": "you@example.com",
+  "account": "keydrop",
+  "service_prefix": "keydrop.",
+  "state_dir": "~/.local/state/keydrop",
+  "launchd_label": "local.keydrop.home",
+  "home_port": 9443,
+  "tailscale": "",
+  "tailscale_socket": ""
+}
