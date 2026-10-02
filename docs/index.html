@@ -324,15 +324,16 @@ footer p { margin: 0 0 8px; }
         </div>
       </div>
       <figure class="install">
-        <figcaption class="cap"><b>Install, or upgrade.</b> The <code>log -p</code> line is the review. The last line installs the commit you read, never the working tree.</figcaption>
+        <figcaption class="cap"><b>Install, or upgrade.</b> The <code>diff</code> line is the review. The last line installs the commit you read, never the working tree.</figcaption>
 <pre><code>mkdir -p ~/.local/bin
 git clone https://github.com/MockSea/keydrop ~/src/keydrop   <span class="c"># first time</span>
 git -C ~/src/keydrop fetch -q origin
 sha=$(git -C ~/src/keydrop rev-parse origin/main) &amp;&amp; echo "$sha"
-git -C ~/src/keydrop log -p HEAD.."$sha" -- keydrop
+git -C ~/src/keydrop diff HEAD "$sha" -- keydrop
 t=$(mktemp) &amp;&amp; git -C ~/src/keydrop show "$sha":keydrop &gt; "$t" \
-  &amp;&amp; install -m 0755 "$t" ~/.local/bin/keydrop &amp;&amp; rm -f "$t"</code></pre>
-        <p class="after">On a first install the log is empty, so read the file itself: <code>git -C ~/src/keydrop show "$sha":keydrop</code>. Then put your Tailscale login in <code>~/.config/keydrop/config.json</code> as <code>owner_login</code>. Without it nothing starts.</p>
+  &amp;&amp; install -m 0755 "$t" ~/.local/bin/keydrop &amp;&amp; rm -f "$t"
+git -C ~/src/keydrop merge --ff-only "$sha"</code></pre>
+        <p class="after">On a first install the diff is empty, so read the file itself: <code>git -C ~/src/keydrop show "$sha":keydrop</code>. Then put your Tailscale login in <code>~/.config/keydrop/config.json</code> as <code>owner_login</code>. Without it nothing starts.</p>
       </figure>
     </div>
   </div>
@@ -653,6 +654,7 @@ ledger</code></pre>
         <li>No adapter seam. The keychain and Tailscale calls are made directly, not behind the interfaces above.</li>
         <li>No expired, cancelled or used screens, and no "Link ends HH:MM." line on the request form. A finished page is simply gone, which the spec allows.</li>
         <li>A blank submit answers "Nothing was entered." as a message page instead of re-rendering the form.</li>
+        <li>Has an opt-in <code>--http</code> for tailnets without HTTPS certificates, which I11 and spec 9.4 rule out.</li>
         <li>Some copy says "keychain" and "on the Mac" where the spec says "vault" and "on this machine".</li>
         <li>Exit codes don't follow section 6 exactly, and the test suites are white-box Python rather than the black-box checks.</li>
       </ul>
