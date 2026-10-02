@@ -264,6 +264,16 @@ class Management(unittest.TestCase):
         self.assertIn("totp", err.getvalue())
         KD.check_policy(KD.credential_schema("site", ("url",)))
 
+    def test_field_policy_sees_a_renamed_totp_field(self):
+        Path(KD.POLICY_FILE).write_text(json.dumps(
+            {"types_enabled": ["secret", "credential"], "credential_fields_enabled": ["url"]}))
+        schema = KD.validate_schema({"service": "bank", "fields": [
+            {"name": "login", "label": "Username", "kind": "text", "required": True},
+            {"name": "pw", "label": "Password", "kind": "secret", "required": True},
+            {"name": "otp_seed", "label": "One-time code secret", "kind": "secret", "required": True, "check": "totp"}]})
+        with self.assertRaises(KD.PolicyError):
+            KD.check_policy(schema)
+
     def test_types_disabled_refuses_with_exit_2(self):
         Path(KD.POLICY_FILE).unlink()
         with contextlib.redirect_stderr(io.StringIO()):
