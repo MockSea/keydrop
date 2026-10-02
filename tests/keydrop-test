@@ -337,31 +337,47 @@ def test_orphan_shape():
         return out
 
     ours = [route("60183", "http://127.0.0.1:60183"),
-            route("60190", "http://127.0.0.1:60188", "HTTPS")]
-    decoys = [
-        route("7317", "http://127.0.0.1:7317"),               # a local service on a chosen port
-        route("443", "http://127.0.0.1:3000", "HTTPS"),        # the usual `serve 3000`
-        route("61000", "http://localhost:61000"),              # not the literal keydrop target
-        route("61001", "http://127.0.0.1:61001/app"),          # a path on the target
-        route("61002", "https+insecure://127.0.0.1:61002"),
-        route("61003", "http://10.0.0.5:61003"),               # somewhere else entirely
-        route("61004", "http://127.0.0.1:61100"),              # tailnet port below local
-        route("62000", "http://127.0.0.1:61000"),              # too far above local
-        route("61005", "http://127.0.0.1:61005",
-              handlers={"/": {"Proxy": "http://127.0.0.1:61005"}, "/x": {"Path": "/tmp"}}),
-        route("61006", "", handlers={"/": {"Path": "/srv/files"}}),
-        {"TCP": {"61007": {"TCPForward": "127.0.0.1:61007"}}, "Web": {}},
-        {"TCP": {"61008": {"HTTP": True, "TCPForward": "127.0.0.1:61008"}},
-         "Web": {f"{host}:61008": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:61008"}}}}},
+            route("60190", "http://127.0.0.1:60190", "HTTPS")]
+    ledger = {"60183": {"local": 60183, "plain_http": True},
+              "60190": {"local": 60190, "plain_http": False}}
+    # Another tool's routes, several shaped exactly like keydrop's. None is in
+    # the ledger, so none may ever be swept.
+    foreign = [
+        route("61000", "http://127.0.0.1:61000"),              # identical shape to keydrop's
+        route("61001", "http://127.0.0.1:61001", "HTTPS"),
+        route("7317", "http://127.0.0.1:7317"),
+        route("443", "http://127.0.0.1:3000", "HTTPS"),
     ]
-    st = merged(*ours, *decoys)
-    check(KD.orphan_routes(st, set()) == [("60183", True, 60183), ("60190", False, 60188)],
-          "orphan sweep picks exactly the keydrop-shaped routes (HTTP and HTTPS)")
-    check(KD.orphan_routes(st, {"60183", "60190"}) == [], "orphan sweep skips routes a record owns")
-    check(KD.orphan_routes(merged(*decoys), set()) == [],
-          f"orphan sweep leaves all {len(decoys)} non-keydrop routes alone")
-    check(KD.orphan_routes({}, set()) == [] and KD.orphan_routes({"TCP": None}, set()) == [],
+    st = merged(*ours, *foreign)
+    check(KD.orphan_routes(st, set(), ledger) == ([("60183", True, 60183), ("60190", False, 60190)], []),
+          "orphan sweep picks exactly the ledgered routes (HTTP and HTTPS)")
+    check(KD.orphan_routes(st, {"60183", "60190"}, ledger) == ([], []),
+          "orphan sweep skips routes a record owns")
+    check(KD.orphan_routes(st, set(), {}) == ([], []),
+          f"orphan sweep leaves all {len(foreign)} unledgered routes alone, same-shape ones included")
+    # Ledgered, but the route is gone or isn't what keydrop made any more:
+    # the entry is stale, and the route (if any) is someone else's now.
+    changed = [
+        route("62000", "http://127.0.0.1:62001"),              # repointed
+        route("62002", "http://127.0.0.1:62002", "HTTPS"),     # HTTP when made, HTTPS now
+        route("62003", "http://127.0.0.1:62003",
+              handlers={"/": {"Proxy": "http://127.0.0.1:62003"}, "/x": {"Path": "/tmp"}}),
+        {"TCP": {"62004": {"HTTP": True, "TCPForward": "127.0.0.1:62004"}},
+         "Web": {f"{host}:62004": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:62004"}}}}},
+    ]
+    stale_ledger = {p: {"local": int(p), "plain_http": True} for p in ("62000", "62002", "62003", "62004", "62005")}
+    check(KD.orphan_routes(merged(*changed), set(), stale_ledger) == ([], sorted(stale_ledger)),
+          "a ledgered route that's gone, repointed or reshaped is stale, never swept")
+    check(KD.orphan_routes({}, set(), {}) == ([], []) and KD.orphan_routes({"TCP": None}, set(), None) == ([], []),
           "orphan sweep copes with an empty config")
+
+    # Funnel on for the page's port means the route isn't ours to trust.
+    page = route("60183", "http://127.0.0.1:60183")
+    check(KD.route_ours(page, 60183), "route_ours: a plain keydrop route")
+    check(not KD.route_ours(dict(page, AllowFunnel={f"{host}:60183": True}), 60183),
+          "route_ours refuses when Funnel is on for the port")
+    check(KD.route_ours(dict(page, AllowFunnel={f"{host}:443": True, f"{host}:60183": False}), 60183),
+          "route_ours ignores Funnel on another port")
 
 
 # ---------- argv, deterministic ----------
@@ -888,9 +904,27 @@ def test_orphan_sweep(before):
     os.unlink(os.path.join(KD.PENDING_DIR, rec["id"] + ".json"))   # record lost too
     time.sleep(0.3)
     check(port in serve_ports() and name not in pending_names(), "route left with no record")
+    check(port in KD.read_ledger(), "the route is in the ledger")
+    # Another tool's route, shaped exactly like keydrop's, in the ephemeral range.
+    foreign = next(str(p) for p in range(61500, 62000) if str(p) not in serve_ports())
+    with open(STUB_JSON) as f:
+        cfg = json.load(f)
+    cfg.setdefault("TCP", {})[foreign] = {"HTTP": True}
+    cfg.setdefault("Web", {})[f"{STUB_HOST}:{foreign}"] = {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{foreign}"}}}
+    with open(STUB_JSON, "w") as f:
+        json.dump(cfg, f)
     run("status")
-    check(port not in serve_ports(), "reap sweeps an unowned keydrop-shaped route")
+    check(port not in serve_ports(), "reap sweeps an unowned ledgered route")
+    check(port not in KD.read_ledger(), "and drops its ledger entry")
+    check(foreign in serve_ports(), "a foreign same-shape route with no ledger entry survives the sweep")
     check(any(o == f"swept orphan :{port} ok" for o in log_outcomes("-")), "log: swept orphan")
+    check(not any(o.startswith(f"swept orphan :{foreign}") for o in log_outcomes("-")), "log: foreign route not swept")
+    with open(STUB_JSON) as f:
+        cfg = json.load(f)
+    cfg["TCP"].pop(foreign)
+    cfg["Web"].pop(f"{STUB_HOST}:{foreign}")
+    with open(STUB_JSON, "w") as f:
+        json.dump(cfg, f)
     check(serve_ports() == before, "sweep touched nothing else")
 
 

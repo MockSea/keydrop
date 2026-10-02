@@ -66,7 +66,7 @@ What's asserted:
 
     tests/keydrop-home-test
 """
-import html, importlib.machinery, importlib.util, json, os, re, secrets, signal, subprocess, sys
+import html, importlib.machinery, importlib.util, json, os, re, secrets, shlex, signal, subprocess, sys
 import tempfile, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +94,7 @@ os.environ.update(KEYDROP_CONFIG=os.path.join(BASE, "no-such-config.json"), KEYD
                   KEYDROP_TAILSCALE=STUB, KEYDROP_OWNER_LOGIN=OWNER, KEYDROP_SECURITY=FAKE_SECURITY)
 ORDER_LOG = os.path.join(BASE, "serve-order.log")   # the stub: was the backend listening at `serve`?
 GARBLE = os.path.join(BASE, "garble-status")   # present: `serve status` prints its contents ("fail": exits 1)
+NOOFF = os.path.join(BASE, "no-off")             # present: `serve ... off` exits 0 and removes nothing
 
 
 def free_port():
@@ -140,7 +141,7 @@ def check(cond, label):
 
 STUB_SRC = r'''#!/usr/bin/env python3
 import json, os, re, sys, time
-SERVE, LOG, HOST, SLOW, STALLING, NOCERTS, ORDER, GARBLE = %r, %r, %r, %r, %r, %r, %r, %r
+SERVE, LOG, HOST, SLOW, STALLING, NOCERTS, ORDER, GARBLE, NOOFF = %r, %r, %r, %r, %r, %r, %r, %r, %r
 import socket
 args = [a for a in sys.argv[1:] if not a.startswith("--socket=")]
 with open(LOG, "a") as f:
@@ -165,6 +166,8 @@ elif args[:3] == ["serve", "status", "--json"]:
     if g == "fail":
         sys.exit("failed to connect to local tailscaled")
     print(g if g else json.dumps(load()))
+elif args and args[0] == "serve" and args[-1] == "off" and os.path.exists(NOOFF):
+    pass
 elif args and args[0] == "serve" and args[-1] == "off":
     m = re.fullmatch(r"--https?=(\d+)", args[1])
     st = load()
@@ -194,7 +197,7 @@ else:
 
 def make_stub():
     with open(STUB, "w") as f:
-        f.write(STUB_SRC % (SERVE_JSON, ARGV_LOG, HOST, SLOW, STALLING, NOCERTS, ORDER_LOG, GARBLE))
+        f.write(STUB_SRC % (SERVE_JSON, ARGV_LOG, HOST, SLOW, STALLING, NOCERTS, ORDER_LOG, GARBLE, NOOFF))
     os.chmod(STUB, 0o700)
 
 
@@ -217,7 +220,7 @@ def run(*args, timeout=60, **kw):
 
 
 def new_link():
-    r = run("home", "--new-link")
+    r = run("home", "--new-link", "--force")
     url = r.stdout.strip()
     m = re.fullmatch(rf"https://{re.escape(HOST)}:{KD.HOME_PORT}/([A-Za-z0-9_-]{{43}})", url)
     if m:
@@ -343,7 +346,7 @@ def restart(page):
 
 
 def unlock():
-    run("home", "--unlock")
+    run("home", "--unlock", "--force")
 
 
 def unlock_in_process():
@@ -409,7 +412,19 @@ def test_units():
     st2 = {"TCP": {"9443": {"HTTPS": True}},
            "Web": {f"{HOST}:9443": {"Handlers": {"/": {"Proxy": "http://10.0.0.1:80"}}}}}
     check(KD.home_route(st2, 9443) is None, "unit: home_route won't claim someone else's route on 9443")
-    check(KD.orphan_routes(st, set()) == [], "unit: reap's orphan sweep never matches the home route")
+    check(KD.orphan_routes(st, set(), {}) == ([], []),
+          "unit: reap's orphan sweep never touches a route the ledger doesn't list")
+    same = {"TCP": {"9443": {"HTTPS": True}},
+            "Web": {f"{HOST}:9443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9443"}}}}}
+    check(KD.route_ours(same, 9443), "unit: route_ours accepts the same-port home route")
+    check(not KD.route_ours(dict(same, AllowFunnel={f"{HOST}:9443": True}), 9443),
+          "unit: route_ours refuses the home route once Funnel is on for it")
+    check(KD.route_ours(dict(same, AllowFunnel={f"{HOST}:443": True}), 9443),
+          "unit: Funnel on another port doesn't count")
+    form = KD.render_form("name", "a note", "/t")
+    for what, html in (("home page", page), ("one-shot form", form)):
+        check('autocomplete="new-password"' in html and "data-1p-ignore" in html,
+              f"unit: the {what}'s password field asks managers not to save it")
 
 
 # ---------- start-up ----------
@@ -636,7 +651,7 @@ def test_new_link_replaces(page, old):
 
 def test_stop(page, token):
     check(route_up(), "route up before --stop")
-    r = run("home", "--stop")
+    r = run("home", "--stop", "--force")
     check(r.returncode == 0, "--stop succeeds")
     check(page.wait() == 0, "--stop ends the process, exit 0")
     check(not route_up(), "--stop: route gone from serve config")
@@ -650,7 +665,7 @@ def test_stop(page, token):
     os.kill(page.proc.pid, signal.SIGKILL)
     page.wait()
     check(route_up(), "SIGKILL leaves the route behind (expected)")
-    r = run("home", "--stop")
+    r = run("home", "--stop", "--force")
     check(r.returncode == 0 and not route_up(), "--stop removes a dead page's route")
 
     unlock()
@@ -664,7 +679,7 @@ def test_stop(page, token):
              "Web": {f"{HOST}:{KD.HOME_PORT}": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:3000"}}}}}
     with open(SERVE_JSON, "w") as f:
         json.dump(other, f)
-    r = run("home", "--stop")
+    r = run("home", "--stop", "--force")
     check(r.returncode != 0 and "leaving it" in r.stderr, "--stop refuses a route that isn't home's")
     check(serve_cfg() == other, "--stop leaves someone else's route on the port alone")
     with open(SERVE_JSON, "w") as f:
@@ -770,7 +785,7 @@ def test_stop_race(token):
     while time.time() < end and not os.path.exists(STALLING):
         time.sleep(0.02)
     check(os.path.exists(STALLING) and proc.poll() is None, "race: home is stalled inside start-up")
-    r = run("home", "--stop")
+    r = run("home", "--stop", "--force")
     check(r.returncode == 0, "race: --stop reports the page stopped")
     seen = len(log_lines(ARGV_LOG))
     try:
@@ -790,6 +805,61 @@ def test_stop_race(token):
           "race: the page logs that it refused to start")
     check(not [x for x in KD.read_pending() if x.get("kind") == "home"], "race: no record left")
     check(KD.read_home().get("stopped"), "race: still flagged stopped")
+    unlock()
+
+
+def test_stop_guards(token):
+    """--new-link and --unlock refuse while KEYDROP_* is set unless --force;
+    --stop warns and goes ahead, confirms against serve status rather than
+    its own records, and isn't blocked by config errors that don't affect
+    where it looks."""
+    unlock()
+    before = KD.read_home().get("token_sha256")
+    r = run("home", "--new-link")
+    check(r.returncode != 0 and "KEYDROP_" in r.stderr and "--force" in r.stderr
+          and KD.read_home().get("token_sha256") == before,
+          "--new-link with KEYDROP_* set and no --force: refused, names the vars, link unchanged")
+    KD.update_home(lambda st: dict(st, stopped={"at": time.time(), "why": "test"}))
+    r = run("home", "--unlock")
+    check(r.returncode != 0 and "--force" in r.stderr and KD.read_home().get("stopped"),
+          "--unlock with KEYDROP_* set and no --force: refused, still stopped")
+    check(run("home", "--force").returncode != 0, "--force on its own is refused")
+    unlock()
+
+    # A page this state dir doesn't know about: --stop has to find it by its route.
+    page = Page()
+    check(page.port is not None and route_up(), "guards: page up")
+    elsewhere = tempfile.mkdtemp(dir=BASE)
+    env = dict(os.environ, KEYDROP_STATE_DIR=elsewhere)
+    open(NOOFF, "w").close()
+    try:
+        r = run("home", "--stop", "--force", env=env)
+        check(r.returncode != 0 and route_up(),
+              "--stop from another state dir: route won't come down, so it reports failure")
+    finally:
+        os.unlink(NOOFF)
+    r = run("home", "--stop", "--force", env=env)
+    check(r.returncode == 0 and not route_up(),
+          "--stop from another state dir removes the route and says so")
+    check(page.wait() == 1, "and the page, finding its route gone, exits 1")
+    unlock()
+
+    page = Page()
+    r = run("home", "--stop")
+    check(r.returncode == 0 and "WARNING" in r.stderr and "KEYDROP_" in r.stderr and not route_up(),
+          "--stop without --force: warns about KEYDROP_*, stops anyway")
+    page.wait()
+    unlock()
+    for var, val in (("KEYDROP_ACCOUNT", "bad account!"), ("KEYDROP_OWNER_LOGIN", "not a login")):
+        env = dict(os.environ, **{var: val})
+        r = run("home", "--stop", "--force", env=env)
+        check(r.returncode == 0, f"--stop runs past a bad {var}")
+        r = run("request", "guard-test", env=env, timeout=10)
+        check(r.returncode != 0 and var[len("KEYDROP_"):].lower() in r.stderr,
+              f"while other commands refuse it ({var})")
+        unlock()
+    r = run("home", "--stop", "--force", env=dict(os.environ, KEYDROP_HOME_PORT="nope"))
+    check(r.returncode != 0 and "home_port" in r.stderr, "--stop refuses a bad home_port")
     unlock()
 
 
@@ -870,12 +940,12 @@ def test_no_http():
             ok = r.returncode != 0 and "HTTPS" in r.stderr and not route_up()
         except subprocess.TimeoutExpired:
             ok = False
-            run("home", "--stop")
+            run("home", "--stop", "--force")
             unlock()
         check(ok, f"keydrop {' '.join(args)}: refused, says why, serves nothing")
     open(NOCERTS, "w").close()
     try:
-        r = run("home", "--new-link")
+        r = run("home", "--new-link", "--force")
         check(r.returncode != 0 and "HTTPS" in r.stderr and "--http" not in r.stderr,
               "home on a tailnet without certs: fails without suggesting --http")
         r = run("request", "test-home-hint")
@@ -902,11 +972,12 @@ def test_install_line():
     the working tree or an unpushed commit. Run for real against a throwaway
     HOME with its own clone and bare origin."""
     with open(README) as f:
-        lines = [l.strip() for l in f.read().splitlines() if "install -m 0755" in l]
-    check(len(lines) == 1, "README documents one install line")
-    if len(lines) != 1:
+        blocks = re.findall(r"(?:^    \S.*\n)+", f.read(), re.M)
+    blocks = [b for b in blocks if "install -m 0755" in b]
+    check(len(blocks) == 1, "README documents one install block")
+    if len(blocks) != 1:
         return
-    line = lines[0]
+    lines = [l[4:] for l in blocks[0].splitlines()]
     home = os.path.join(BASE, "install-home")
     origin, clone = os.path.join(BASE, "origin.git"), os.path.join(home, "src", "keydrop")
     git = ["/usr/bin/git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
@@ -935,12 +1006,22 @@ def test_install_line():
     commit("unpushed\n", False)
     with open(target, "w") as f:
         f.write("uncommitted\n")
-    r = subprocess.run(["/bin/bash", "-c", line], capture_output=True, text=True, env=env)
+    # While the user reads the log, another push lands and gets fetched.
+    g = " ".join(shlex.quote(a) for a in git)
+    late = (f"printf 'unreviewed\\n' > {shlex.quote(os.path.join(other, 'keydrop'))} && "
+            f"{g} -C {shlex.quote(other)} commit -qam unreviewed && "
+            f"{g} -C {shlex.quote(other)} push -q origin HEAD:main && "
+            f"{g} -C ~/src/keydrop fetch -q origin")
+    at = next(i for i, l in enumerate(lines) if "install -m 0755" in l)
+    script = "\n".join(lines[:at] + [late] + lines[at:]) + "\n"
+    r = subprocess.run(["/bin/bash", "-e", "-c", script], capture_output=True, text=True, env=env)
     installed = os.path.join(home, ".local", "bin", "keydrop")
     got = open(installed).read() if os.path.exists(installed) else None
     check(r.returncode == 0 and got == "reviewed\n",
-          "install line fetches and installs origin/main, not a stale origin/main, "
-          f"an unpushed commit or the working tree ({got!r})")
+          "install block installs the commit it showed for review, not a later push, "
+          f"an unpushed commit or the working tree ({got!r}, {r.stderr.strip()[:200]!r})")
+    check("+reviewed" in r.stdout and "unreviewed" not in r.stdout,
+          "the review step shows the change that gets installed")
     check(got is not None and oct(os.stat(installed).st_mode & 0o777) == "0o755", "installed 0755")
 
 
@@ -1173,7 +1254,7 @@ def test_watchdog(token):
               f"watchdog: route {label}: no home record left")
         page.kill()
         page = Page(fast) if label == "removed" else None
-    check(not route_up() or run("home", "--stop").returncode == 0, "watchdog: tidy")
+    check(not route_up() or run("home", "--stop", "--force").returncode == 0, "watchdog: tidy")
     unlock()
 
 
@@ -1230,7 +1311,7 @@ def test_route_check_home(token):
         set_garble(None)
         run("status")   # reap: retries a teardown the garbled status made fail
         if route_up():
-            run("home", "--stop")
+            run("home", "--stop", "--force")
             unlock()
         check(not route_up() and not any(r.get("kind") == "home" for r in KD.read_pending()),
               f"route check, {label}: no route and no record left")
@@ -1376,6 +1457,7 @@ def main():
         page = None
         test_stop_flag_ends_loop(token)
         test_stop_race(token)
+        test_stop_guards(token)
         test_plist()
         test_host_units()
         test_same_port_units()

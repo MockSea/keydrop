@@ -16,6 +16,8 @@ instead of pasting it into a chat.
                               mint the home page's link (prints it once)
     keydrop home --stop       kill switch: take the home page down and keep it down
     keydrop home --unlock     clear a lockout or a stop
+                              (--new-link and --unlock refuse while any KEYDROP_*
+                              env var is set unless given --force; --stop warns)
     keydrop config            print the settings in effect (never a value)
 
 `request` binds a one-shot HTTP server to 127.0.0.1, exposes it on the tailnet
@@ -106,8 +108,12 @@ and `status` also reap pending records whose process is gone. A teardown only
 counts once `serve status` shows the port gone; until then the record stays,
 marked teardown-failed, and every reap retries it. Otherwise a teardown that
 ran while tailscaled was down would leave the route in tailscaled's persisted
-config with nothing left to remove it. Reap also sweeps keydrop-shaped routes
-that no record owns (see orphan_routes).
+config with nothing left to remove it. Reap also sweeps orphans, but only
+routes in keydrop's own ledger (routes.json in the state dir: an entry is
+written before `serve` runs and dropped once the route is confirmed gone)
+that no record owns and that still point where keydrop pointed them. A route
+keydrop has no ledger entry for is never removed, even one shaped exactly
+like keydrop's (see orphan_routes).
 
 `home` is the vault page with no TTL, meant to run under launchd on its own
 tailnet port (HOME_PORT). It reuses the vault handler and adds what the TTL
@@ -174,21 +180,23 @@ LOGIN_RE = re.compile(r"[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+")
 
 def load_config():
     """(settings, problems). Env vars win over the file; a missing file is
-    fine, an unreadable or malformed one is a problem, never a silent default."""
+    fine, an unreadable or malformed one is a problem, never a silent default.
+    Each problem is (key, message); key is None for the file as a whole."""
     problems, data = [], {}
     try:
         with open(CONFIG_PATH) as f:
             data = json.load(f)
         if not isinstance(data, dict):
-            problems.append(f"{CONFIG_PATH}: not a JSON object")
+            problems.append((None, f"{CONFIG_PATH}: not a JSON object"))
             data = {}
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as e:
-        problems.append(f"{CONFIG_PATH}: {e}")
+        problems.append((None, f"{CONFIG_PATH}: {e}"))
     unknown = sorted(set(data) - set(CONFIG_KEYS))
     if unknown:
-        problems.append(f"{CONFIG_PATH}: unknown keys {', '.join(unknown)}")
+        # A typo'd key (state-dir) silently means the default: never ignorable.
+        problems.append((None, f"{CONFIG_PATH}: unknown keys {', '.join(unknown)}"))
     out = {}
     for key, (env, default) in CONFIG_KEYS.items():
         val = os.environ.get(env)
@@ -197,33 +205,38 @@ def load_config():
         out[key] = str(val).strip() if val is not None else ""
     out["owner_login"] = out["owner_login"].lower()
     if out["owner_login"] and not LOGIN_RE.fullmatch(out["owner_login"]):
-        problems.append(f"owner_login {out['owner_login']!r} doesn't look like a tailnet login (user@domain)")
+        problems.append(("owner_login", f"owner_login {out['owner_login']!r} doesn't look like a tailnet login (user@domain)"))
     if not ACCOUNT_RE.fullmatch(out["account"]):
-        problems.append("account must be 1-64 of A-Z a-z 0-9 . _ @ + -")
+        problems.append(("account", "account must be 1-64 of A-Z a-z 0-9 . _ @ + -"))
     if not PREFIX_RE.fullmatch(out["service_prefix"]):
-        problems.append("service_prefix must be 1-64 of A-Z a-z 0-9 . _ -")
+        problems.append(("service_prefix", "service_prefix must be 1-64 of A-Z a-z 0-9 . _ -"))
     if not LABEL_RE.fullmatch(out["launchd_label"]):
-        problems.append("launchd_label must be 1-128 of A-Z a-z 0-9 . _ -")
+        problems.append(("launchd_label", "launchd_label must be 1-128 of A-Z a-z 0-9 . _ -"))
     try:
         port = int(out["home_port"])
         if not 1 <= port <= 65535:
             raise ValueError
     except ValueError:
-        problems.append(f"home_port {out['home_port']!r} is not a port number")
+        problems.append(("home_port", f"home_port {out['home_port']!r} is not a port number"))
         port = 9443
     out["home_port"] = port
     if not out["state_dir"]:
-        problems.append("state_dir is empty")
+        problems.append(("state_dir", "state_dir is empty"))
         out["state_dir"] = CONFIG_KEYS["state_dir"][1]
     out["state_dir"] = os.path.abspath(os.path.expanduser(out["state_dir"]))
     return out, problems
 
 
-CONFIG, CONFIG_PROBLEMS = load_config()
+CONFIG, _PROBLEMS = load_config()
+CONFIG_PROBLEMS = [m for _, m in _PROBLEMS]
+# What `home --stop` can't run past: anything that might point it at the wrong
+# state dir or port. A bad owner_login or account shouldn't block the kill switch.
+STOP_PROBLEMS = [m for k, m in _PROBLEMS if k in (None, "state_dir", "home_port")]
 STATE_DIR = CONFIG["state_dir"]
 PENDING_DIR = os.path.join(STATE_DIR, "pending")
 LOG_FILE = os.path.join(STATE_DIR, "keydrop.log")
 META_FILE = os.path.join(STATE_DIR, "meta.json")
+ROUTES_FILE = os.path.join(STATE_DIR, "routes.json")   # the ledger: every route keydrop made
 TS_SOCKET = os.path.expanduser(CONFIG["tailscale_socket"]) if CONFIG["tailscale_socket"] else ""
 TAILSCALE = CONFIG["tailscale"] or shutil.which("tailscale") or "/opt/homebrew/bin/tailscale"
 SECURITY = os.environ.get("KEYDROP_SECURITY", "/usr/bin/security")
@@ -254,10 +267,6 @@ CSRF_MAX_AGE = 12 * 3600      # a home form older than this asks for a reload
 MAX_BODY = 16 * 1024
 REQUEST_TIMEOUT = 10   # per-connection socket timeout; one slow client can't hold the link
 SERVE_TIMEOUT = 20     # `tailscale serve` blocks forever if serve isn't enabled
-# macOS ephemeral range (net.inet.ip.portrange.first/last). Keydrop's local
-# port always comes from here, and its tailnet port is the same number.
-EPHEMERAL_PORTS = range(49152, 65536)
-PORT_PROBE_MAX = 64    # how far an older version's tailnet port drifted above its local one
 PORT_PICK_TRIES = 32   # loopback ports tried before claim_port gives up
 # Paths browsers fetch on their own. 404'd, but not counted as guesses.
 AUTO_FETCH = ("/favicon", "/apple-touch-icon", "/robots.txt")
@@ -267,9 +276,10 @@ class KeydropError(Exception):
     pass
 
 
-def require_config():
-    if CONFIG_PROBLEMS:
-        raise KeydropError("config: " + "; ".join(CONFIG_PROBLEMS))
+def require_config(stop=False):
+    problems = STOP_PROBLEMS if stop else CONFIG_PROBLEMS
+    if problems:
+        raise KeydropError("config: " + "; ".join(problems))
 
 
 def require_owner():
@@ -278,8 +288,10 @@ def require_owner():
     require_config()
     if not OWNER_LOGIN:
         raise KeydropError(f"no owner login configured. Set owner_login in {CONFIG_PATH} "
-                           "(or KEYDROP_OWNER_LOGIN) to your tailnet login, e.g. you@example.com; "
-                           "`tailscale status --json` shows it under User")
+                           "(or KEYDROP_OWNER_LOGIN) to the tailnet login allowed to submit values, "
+                           "e.g. you@example.com. Confirm it yourself: `tailscale status --json` "
+                           "(under User) or the admin console are places to look, but it's your call "
+                           "which login that is")
 
 
 # ---------- validation ----------
@@ -487,39 +499,49 @@ def serve_ports_in_use():
     return set(((serve_status() or {}).get("TCP") or {}).keys())
 
 
-def orphan_routes(status, owned):
-    """Serve entries that look like keydrop made them and that no record owns.
-    Returns [(port, plain_http, local_port)].
+def ledger_route(status, port, entry):
+    """True if serve status still has :port exactly as keydrop made it for
+    this ledger entry: HTTP or HTTPS (whichever it was) and nothing else, one
+    web host, one handler at "/", proxying to http://127.0.0.1:<entry local>."""
+    tcp = (status.get("TCP") or {}).get(str(port))
+    if not isinstance(tcp, dict) or not isinstance(entry, dict):
+        return False
+    want = {"HTTP"} if entry.get("plain_http") else {"HTTPS"}
+    if set(k for k, v in tcp.items() if v) != want:
+        return False
+    try:
+        return home_route(status, port) == int(entry.get("local"))
+    except (AttributeError, TypeError, ValueError):
+        return False
 
-    Keydrop-shaped means all of: a TCP entry for port N that is HTTP or HTTPS
-    and nothing else, one web host for N, one handler at "/", proxying to
-    exactly http://127.0.0.1:L, with L in the ephemeral range and
-    L <= N <= L + PORT_PROBE_MAX. Anything else, including a route to a local
-    service on a port someone picked (a dashboard, a dev server), is left alone."""
-    out = []
-    web = status.get("Web") or {}
-    for port, entry in (status.get("TCP") or {}).items():
-        if port in owned or not port.isdigit() or not isinstance(entry, dict):
+
+def orphan_routes(status, owned, ledger):
+    """Split the ledger's unowned entries into (sweep, stale).
+
+    Only routes keydrop recorded creating are ever candidates: the ledger
+    (routes.json) gets an entry before `serve` runs and loses it once
+    `serve status` shows the route gone. An entry with a live record (owned)
+    is skipped. sweep: [(port, plain_http, local)] whose route is still
+    exactly as keydrop made it. stale: ports whose route is gone or now
+    points somewhere else, so it isn't ours any more; those entries are only
+    dropped. A route keydrop has no ledger entry for is never touched, however
+    much it looks like one of keydrop's."""
+    sweep, stale = [], []
+    for port, entry in sorted((ledger or {}).items()):
+        if port in owned:
             continue
-        kind = set(k for k, v in entry.items() if v)
-        if kind not in ({"HTTP"}, {"HTTPS"}):
-            continue
-        hosts = [h for h in web if h.rsplit(":", 1)[-1] == port]
-        if len(hosts) != 1:
-            continue
-        handlers = (web[hosts[0]] or {}).get("Handlers") or {}
-        if set(handlers) != {"/"} or set(handlers["/"] or {}) != {"Proxy"}:
-            continue
-        m = re.fullmatch(r"http://127\.0\.0\.1:(\d+)", handlers["/"]["Proxy"] or "")
-        if not m:
-            continue
-        local, n = int(m.group(1)), int(port)
-        if local in EPHEMERAL_PORTS and local <= n <= local + PORT_PROBE_MAX:
-            out.append((port, kind == {"HTTP"}, local))
-    return sorted(out)
+        if ledger_route(status, port, entry):
+            sweep.append((port, bool(entry.get("plain_http")), int(entry["local"])))
+        else:
+            stale.append(port)
+    return sweep, stale
 
 
 def serve_on(port, local_port, plain_http):
+    # Ledgered before `serve` runs: a serve that times out may still write
+    # its config, and the sweep can only ever remove what the ledger lists.
+    ledger_set(port, {"local": int(local_port), "plain_http": bool(plain_http),
+                      "created": time.time()})
     flag = f"--http={port}" if plain_http else f"--https={port}"
     try:
         r = ts("serve", "--bg", "--yes", flag, f"http://127.0.0.1:{local_port}",
@@ -535,12 +557,16 @@ def serve_on(port, local_port, plain_http):
 
 def route_ours(status, port):
     """True only if serve status was read and still has :port as a single `/`
-    proxy to 127.0.0.1:<the same port>. Unreadable (None), garbled, gone or
-    repointed are all False: fail closed, because a page that can't prove
-    serve is claiming its port has to assume netstack is forwarding to it."""
+    proxy to 127.0.0.1:<the same port>, with Funnel off for it. Unreadable
+    (None), garbled, gone, repointed or funnelled are all False: fail closed,
+    because a page that can't prove serve is claiming its port has to assume
+    netstack is forwarding to it, and a funnelled port is open to the internet."""
     if not isinstance(status, dict):
         return False
     try:
+        funnel = status.get("AllowFunnel") or {}
+        if any(v for k, v in funnel.items() if str(k).rsplit(":", 1)[-1] == str(port)):
+            return False
         return home_route(status, port) == int(port)
     except (AttributeError, TypeError, KeyError, ValueError):
         return False
@@ -556,7 +582,10 @@ def serve_off(port, plain_http):
     except (OSError, subprocess.TimeoutExpired):
         pass
     st = serve_status()
-    return st is not None and str(port) not in (st.get("TCP") or {})
+    gone = st is not None and str(port) not in (st.get("TCP") or {})
+    if gone:
+        ledger_drop(port)
+    return gone
 
 
 # ---------- state ----------
@@ -578,6 +607,42 @@ class serve_lock:
 
 class meta_lock(serve_lock):
     FILE = "meta.lock"
+
+
+class ledger_lock(serve_lock):
+    FILE = "routes.lock"
+
+
+def read_ledger():
+    """{port: {"local", "plain_http", "created"}} for every route keydrop
+    created and hasn't yet seen gone. Unreadable means empty: the sweep then
+    removes nothing, which is the safe direction."""
+    try:
+        with open(ROUTES_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def _ledger_update(fn):
+    ensure_state()
+    with ledger_lock():
+        data = fn(read_ledger())
+        tmp = ROUTES_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, ROUTES_FILE)
+
+
+def ledger_set(port, entry):
+    _ledger_update(lambda d: dict(d, **{str(port): entry}))
+
+
+def ledger_drop(port):
+    if str(port) in read_ledger():
+        _ledger_update(lambda d: {k: v for k, v in d.items() if k != str(port)})
 
 
 def ensure_state():
@@ -650,7 +715,8 @@ def keydrop_listening(local_port):
 
 def reap():
     """Clean up after a server that died without running its own teardown,
-    retry teardowns that failed, and sweep keydrop-shaped routes nothing owns."""
+    retry teardowns that failed, and sweep routes the ledger says keydrop made
+    that no record owns."""
     with serve_lock():
         for rec in read_pending():
             if not rec.get("teardown_failed") and alive(rec["pid"]):
@@ -669,7 +735,10 @@ def reap():
         if st is None:
             return
         owned = {str(r["tailnet_port"]) for r in read_pending() if r.get("tailnet_port")}
-        for port, plain_http, local in orphan_routes(st, owned):
+        sweep, stale = orphan_routes(st, owned, read_ledger())
+        for port in stale:
+            ledger_drop(port)   # gone, or someone else's now: never ours to remove
+        for port, plain_http, local in sweep:
             if keydrop_listening(local):
                 continue
             log("-", f"swept orphan :{port} " + ("ok" if serve_off(port, plain_http) else "failed"))
@@ -695,13 +764,22 @@ button.del{{background:#b00}} button.quiet{{background:#eee;color:#111;margin-to
 </style></head><body>{body}</body></html>"""
 
 
+# Discourage the browser and password managers from offering to save the
+# value: new-password stops autofill of an old one and makes most browsers
+# treat it as a sign-up field; the data-* attributes are 1Password's,
+# LastPass's and Bitwarden's opt-outs. None of it is a guarantee, so the
+# skill tells the human to answer "Never" if a save prompt appears anyway.
+NO_SAVE = ('autocomplete="new-password" autocapitalize="off" autocorrect="off" '
+           'spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore '
+           'data-form-type="other"')
+
+
 def render_form(name, note, action, error=""):
     body = (f"<h1>{html.escape(name)}</h1>"
             + (f"<p>{html.escape(note)}</p>" if note else "")
             + (f'<p class="err">{html.escape(error)}</p>' if error else "")
             + f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
-            + '<input type="password" name="value" autocomplete="off" autocapitalize="off" '
-              'autocorrect="off" spellcheck="false" autofocus required>'
+            + '<input type="password" name="value" ' + NO_SAVE + ' autofocus required>'
             + '<button type="submit">Store</button></form>')
     return PAGE.format(body=body)
 
@@ -710,8 +788,7 @@ def render_message(text):
     return PAGE.format(body=f"<h1>{html.escape(text)}</h1>")
 
 
-VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" autocomplete="off" '
-               'autocapitalize="off" autocorrect="off" spellcheck="false" required>')
+VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" ' + NO_SAVE + ' required>')
 
 
 def vault_form(action, csrf, act, fields, button, cls=""):
@@ -1278,6 +1355,7 @@ def serve_child(srv, rec, report_fd):
         with serve_lock():
             if serving and outcome == "route-gone" and route_left(rec["tailnet_port"]):
                 drop_pending(rec)   # gone, or someone else's now: not ours to remove
+                ledger_drop(rec["tailnet_port"])
             elif serving and not serve_off(rec["tailnet_port"], rec["plain_http"]):
                 # Keep the record so reap retries; the route may still be live
                 # or come back from tailscaled's persisted config.
@@ -1680,9 +1758,9 @@ def home_route(status, port):
 
 
 def home_backend(backend, port):
-    """Whether a route's backend is keydrop home's: its own port, or an
-    ephemeral one from a version that picked its port at random."""
-    return backend is not None and (backend == int(port) or backend in EPHEMERAL_PORTS)
+    """Whether a route's backend is keydrop home's: home always proxies to
+    127.0.0.1 on the same port number as its tailnet port."""
+    return backend is not None and backend == int(port)
 
 
 def watch_interval():
@@ -1757,8 +1835,10 @@ def mark_stopped(why):
 def home_stop():
     """The kill switch. Flag first, so a launchd respawn stays down; then end
     the process (its own teardown removes the route) and remove the route
-    directly in case the process was already dead. True once serve status
-    confirms the route is gone."""
+    directly in case the process was already dead. True only once serve
+    status confirms no route on the port still proxies to home's backend.
+    The flag and the process lookup both live in this config's state dir: a
+    page started with another one is only reached through its route."""
     ensure_state()
     with serve_lock():
         # A starting page writes its record, then reads this flag; we write
@@ -1775,9 +1855,10 @@ def home_stop():
         time.sleep(0.1)
     reap()
     st = read_home()
-    port = st.get("port")
-    if not port:
-        return True
+    # No port in this state dir's home.json doesn't mean nothing is serving:
+    # a page run under another config (the launchd job, say) wrote its own.
+    # So check HOME_PORT anyway, and only report stopped once serve agrees.
+    port = st.get("port") or HOME_PORT
     with serve_lock():
         status = serve_status()
         if status is None:
@@ -1809,6 +1890,10 @@ NO_LOCAL = ("has no --local: a loopback listener with no serve route on its port
             "with any identity headers it likes")
 
 
+def env_overrides():
+    return sorted(k for k in os.environ if k.startswith("KEYDROP_"))
+
+
 def home_cli(rest):
     flags = set(rest)
     if "--http" in flags:
@@ -1817,9 +1902,24 @@ def home_cli(rest):
                            "page they visit. Enable HTTPS certificates for the tailnet instead")
     if "--local" in flags:
         raise KeydropError("home " + NO_LOCAL)
+    force = "--force" in flags
+    flags.discard("--force")
     known = {"--new-link", "--stop", "--unlock"}
-    if flags - known or len(flags) != len(rest) or len(flags) > 1:
-        raise KeydropError("usage: keydrop home | --new-link | --stop | --unlock")
+    if (flags - known or len(set(rest)) != len(rest) or len(flags) > 1
+            or (force and not flags)):
+        raise KeydropError("usage: keydrop home | --new-link | --stop | --unlock  [--force]")
+    # The launchd job has no EnvironmentVariables: it runs on the config file
+    # alone. With KEYDROP_* set here, these commands may act on a different
+    # state dir or port than the page that's actually up.
+    env = env_overrides()
+    if flags and env and not force:
+        what = (f"KEYDROP_* is set here ({', '.join(env)}), so this may not be the "
+                f"state dir or port the launchd page uses (it reads only {CONFIG_PATH}).")
+        if "--stop" in flags:
+            print(f"keydrop: WARNING: {what} Stopping anyway; if the page comes back, "
+                  "unset them and run --stop again.", file=sys.stderr)
+        else:
+            raise KeydropError(f"{what} Unset them, or add --force if this is the config you mean")
     if not flags & {"--stop", "--unlock"}:
         require_owner()
     if "--new-link" in flags:
@@ -1829,7 +1929,7 @@ def home_cli(rest):
         return 0
     if "--stop" in flags:
         if not home_stop():
-            print("keydrop: stopped, but couldn't confirm the serve route is gone "
+            print("keydrop: stop flag set, but couldn't confirm the serve route is gone "
                   "(is tailscaled up?); run --stop again", file=sys.stderr)
             return 1
         print("home page stopped; it stays down until `keydrop home --unlock`")
@@ -1860,7 +1960,7 @@ def main(argv):
         return 0 if argv else 2
     cmd, rest = argv[0], argv[1:]
     try:
-        require_config()
+        require_config(stop=(cmd == "home" and "--stop" in rest))
         if cmd == "config" and not rest:
             for line in config_lines():
                 print(line)
