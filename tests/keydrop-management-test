@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Typed items and key management, as unit tests: no sockets, no tailscale.
+
+The vault handler is built without a server (object.__new__ plus a namespace
+standing in for it), and the keychain is the fake in tests/fakes.py, so this
+runs on any machine with python3. Covers SPEC 5 (schemas, credential fields,
+policy), 6 (request --type/--fields, get --field, list --long) and the keychain
+adapter's limits.
+
+    tests/keydrop-management-test
+"""
+import contextlib, copy, importlib.machinery, importlib.util, io, json, os, sys
+from pathlib import Path
+import tempfile, time, types, unittest
+from unittest.mock import patch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from fakes import fake_security  # noqa: E402
+
+BASE = tempfile.TemporaryDirectory(prefix="keydrop-management-")
+for var in ("KEYDROP_ACCOUNT", "KEYDROP_SERVICE_PREFIX", "KEYDROP_LAUNCHD_LABEL", "KEYDROP_TS_SOCKET"):
+    os.environ.pop(var, None)
+os.environ.update(KEYDROP_CONFIG=os.path.join(BASE.name, "no-such-config.json"),
+                  KEYDROP_STATE_DIR=os.path.join(BASE.name, "state"),
+                  KEYDROP_TAILSCALE=os.path.join(BASE.name, "no-tailscale"),
+                  KEYDROP_OWNER_LOGIN="owner@example.com",
+                  KEYDROP_SECURITY=fake_security(BASE.name))
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("kd", os.path.join(ROOT, "keydrop"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+KD = importlib.util.module_from_spec(spec)
+loader.exec_module(KD)
+
+
+class Management(unittest.TestCase):
+    def setUp(self):
+        KD.ensure_state()
+        Path(KD.POLICY_FILE).write_text(json.dumps({'types_enabled': ['secret', 'credential']}))
+        self.schema = KD.template_schema('linkedin')
+        self.events, self.responses = [], []
+        self.h = object.__new__(KD.VaultHandler)
+        self.h.server = types.SimpleNamespace(write_allowed=lambda: True,
+            audit=lambda *x: self.events.append(x), issue_csrf=lambda: 'csrf')
+        self.h._page = lambda path, code=200, error='', **kw: self.responses.append((code, error, kw))
+        self.h._done = lambda path, msg: self.responses.append((303, msg))
+        self.h._send = lambda code, body, *a, **kw: self.responses.append((code, body))
+
+    def fields(self, **extra):
+        data = {'schema': json.dumps(self.schema), 'f_client_id': 'private-client-id',
+                'f_client_secret': 'private-secret-value', 'f_redirect_uri': 'https://example.com/callback'}
+        data.update(extra)
+        return {k: [v] for k, v in data.items()}
+
+    def test_type_marker_survives_metadata_loss(self):
+        self.h._store('/token','add','lost-meta',self.fields())
+        raw=KD.keychain_get('lost-meta')
+        Path(KD.ITEMS_FILE).unlink()
+        with self.assertRaises(KD.KeydropError):KD.item_value('lost-meta',raw)
+        self.assertEqual(KD.item_value('lost-meta',raw,'client_id'),'private-client-id')
+        with patch.object(KD, 'keychain_entries', return_value={}):
+            with self.assertRaises(KD.KeydropError):KD.item_value('lost-meta',raw)
+
+    def test_schema_parse_limits_and_argv(self):
+        with self.assertRaises((ValueError, KD.KeydropError)):KD.validate_schema(KD.schema_json('[' * 2000 + ']' * 2000))
+        bad=copy.deepcopy(self.schema);bad['fields'][0]['label']='\ud800'
+        with self.assertRaises(KD.KeydropError):KD.validate_schema(bad)
+        raw,_=KD.submitted_item(self.fields())
+        run=KD.subprocess.run
+        with patch.object(KD.subprocess, 'run', wraps=run) as spy:
+            KD.keychain_store('typed-argv',raw,typed=True)
+        for call in spy.call_args_list:
+            self.assertNotIn('private-secret-value',repr(call.args))
+            self.assertNotIn('private-secret-value'.encode().hex(),repr(call.args))
+        self.assertIn(raw.encode().hex(),spy.call_args_list[0].kwargs['input'])
+
+    def test_metadata_failure_does_not_report_success(self):
+        with patch.object(KD, 'write_item_meta', side_effect=OSError('disk full')):
+            self.h._store('/token','add','metadata-failed',self.fields())
+        self.assertEqual(self.responses[-1][0],500)
+        raw=KD.keychain_get('metadata-failed')
+        self.assertIsNotNone(raw)
+        with self.assertRaises(KD.KeydropError):KD.item_value('metadata-failed',raw)
+
+    def test_bounds_and_disabled_ui(self):
+        fields=[KD.schema_field('secret')]
+        fields += [dict(name='select_'+str(i),label='Select',kind='select',required=False,
+                        options=[str(j)+'x'*75 for j in range(20)]) for i in range(11)]
+        with self.assertRaises(KD.KeydropError):KD.validate_schema({'service':'test','fields':fields})
+        with self.assertRaises(ValueError):KD.schema_json(' ' * 16385)
+        with self.assertRaises(KD.KeydropError):KD.submitted_item(self.fields(f_client_secret='😀'*3000))
+        Path(KD.POLICY_FILE).unlink(missing_ok=True)
+        page=KD.render_vault('/t','csrf',{}, {},None)
+        self.assertNotIn('<option>linkedin</option>',page)
+        self.assertIn('disabled',KD.schema_editor('/t','csrf','',None))
+        page=KD.render_form('request','','/t',expires=time.time()+900)
+        self.assertIn('Link ends',page)
+        self.assertNotIn('<script',page)
+
+    def test_templates(self):
+        for name in KD.TEMPLATES:
+            self.assertEqual(KD.template_schema(name)['service'], name)
+
+    def test_hostile_schema(self):
+        bad = [None, [], {}, {'service': 'x', 'fields': []}]
+        for key, value in [('service','../bad'), ('service','<script>'), ('service','a\n'), ('fields', [{}] * 13)]:
+            x=copy.deepcopy(self.schema);x[key]=value;bad.append(x)
+        for key, values in {'name':['A','x\n','../x','x'*33,[],None],
+                            'label':['<img onerror=x>','x\x00','x'*81,None],
+                            'kind':['file','script',[],None], 'required':['true',1,None],
+                            'max':[0,8193,True,'5'], 'options':[['x']]}.items():
+            for v in values:
+                x=copy.deepcopy(self.schema);x['fields'][0][key]=v;bad.append(x)
+        for extra in [{'default':'secret'}, {'script':'alert(1)'}, {'id':'other'}]:
+            x=copy.deepcopy(self.schema);x['fields'][0].update(extra);bad.append(x)
+        x=copy.deepcopy(self.schema);x['fields'][1]['name']=x['fields'][0]['name'];bad.append(x)
+        x=copy.deepcopy(self.schema);x['fields'][1]['kind']='text';bad.append(x)
+        for x in bad:
+            with self.subTest(x=x), self.assertRaises(KD.KeydropError):KD.validate_schema(x)
+        with self.assertRaises(ValueError):KD.schema_json('{"service":"x","service":"y"}')
+
+    def test_values_and_select(self):
+        for extra in [{'f_client_secret':''}, {'f_redirect_uri':'javascript:alert(1)'},
+                      {'f_redirect_uri':'http://['}, {'f_client_secret':'x'*8193}, {'unknown':'x'}]:
+            with self.assertRaises(KD.KeydropError):KD.submitted_item(self.fields(**extra))
+        fields=self.fields();fields['f_client_id'].append('duplicate')
+        with self.assertRaises(KD.KeydropError):KD.submitted_item(fields)
+        schema=KD.validate_schema({'service':'test','fields':[KD.schema_field('key'),
+            dict(name='region',label='Region',kind='select',required=False,options=['US','EU'])]})
+        values={'schema':[json.dumps(schema)],'f_key':['a'], 'f_region':['US']}
+        self.assertEqual(json.loads(KD.submitted_item(values)[0])['fields']['region'],'US')
+        values['f_region']=['evil']
+        with self.assertRaises(KD.KeydropError):KD.submitted_item(values)
+
+    def test_policy_before_transport(self):
+        Path(KD.POLICY_FILE).unlink(missing_ok=True)
+        with patch.object(KD,'tailnet_host') as transport:
+            with self.assertRaises(KD.KeydropError):KD.request('linkedin','',60,schema=self.schema)
+            transport.assert_not_called()
+        KD.check_policy(None)
+
+    def test_cli_schema_and_get(self):
+        schema_path=Path(BASE.name)/'schema.json';schema_path.write_text(json.dumps(self.schema))
+        with patch.object(KD,'request',return_value='test-link') as request, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(KD.main(['request','custom','--schema',str(schema_path)]),0)
+            self.assertEqual(request.call_args.args[-1],self.schema)
+            KD.main(['request','linkedin'])
+            self.assertEqual(request.call_args.args[-1],self.schema)
+            KD.main(['request','custom','--fields',json.dumps(self.schema['fields'])])
+            self.assertEqual(request.call_args.args[-1]['service'],'custom')
+        self.h._store('/token','add','cli',self.fields())
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):self.assertEqual(KD.main(['get','cli','--field','client_secret']),0)
+        self.assertEqual(out.getvalue(),'private-secret-value')
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertNotEqual(KD.main(['get','cli']),0)
+
+    def test_store_rotate_metadata_and_no_leaks(self):
+        self.h._store('/token','add','typed',self.fields(note='Development',rotate_by='2000-01-01'))
+        self.assertEqual(self.responses[-1][0],303)
+        raw=KD.keychain_get('typed')
+        self.assertEqual(KD.item_value('typed',raw,'client_secret'),'private-secret-value')
+        with self.assertRaises(KD.KeydropError):KD.item_value('typed',raw)
+        page=KD.render_vault('/token','csrf',KD.keychain_entries(),KD.read_notes(),None)
+        self.assertIn('Overdue',page);self.assertIn('Development',page)
+        for value in ['private-secret-value','private-client-id','https://example.com/callback']:
+            self.assertNotIn(value,page)
+            for p in Path(KD.STATE_DIR).rglob('*'):
+                if p.is_file():self.assertNotIn(value,p.read_text())
+        self.h._store('/token','rotate','typed',self.fields(f_client_secret='rotated-secret',rotate_by='2099-01-01'))
+        self.assertEqual(self.events[-1],('typed','rotate stored'))
+        self.assertEqual(KD.item_value('typed',KD.keychain_get('typed'),'client_secret'),'rotated-secret')
+        self.assertEqual(KD.read_items()['typed']['rotate_by'],'2099-01-01')
+        self.assertEqual(os.stat(KD.ITEMS_FILE).st_mode & 0o777,0o600)
+        self.h._delete('/token','typed');self.assertIsNone(KD.keychain_get('typed'))
+        self.assertNotIn('typed',KD.read_items())
+
+    def test_failed_verification_and_rate_limit(self):
+        with patch.object(KD,'keychain_get',return_value=None):
+            self.h._store('/token','add','mismatch',self.fields())
+        self.assertEqual(self.responses[-1][0],500)
+        self.assertNotIn('mismatch',KD.read_items())
+        self.h.server.write_allowed=lambda:False
+        self.h._store('/token','add','limited',self.fields())
+        self.assertEqual(self.responses[-1][0],429)
+        self.assertIsNone(KD.keychain_get('limited'))
+
+    def test_legacy(self):
+        raw='{"keydrop":1,"type":"credential","fields":{"a":"b"}}'
+        KD.keychain_store('legacy',raw)
+        self.assertEqual(KD.item_value('legacy',raw),raw)
+        self.h._store('/token','replace','legacy',{'value':['new single secret']})
+        self.assertEqual(KD.item_value('legacy',KD.keychain_get('legacy')),'new single secret')
+
+    def test_edit_fields_and_render(self):
+        data={'service':['custom'], 'n0':['renamed'], 'l0':['Renamed secret'], 'k0':['secret'], 'r0':['yes'],
+            'n1':['account'], 'l1':['Account'], 'k1':['text']}
+        schema=KD.schema_from_editor(data)
+        self.assertEqual([f['name'] for f in schema['fields']],['renamed','account'])
+        self.assertFalse(schema['fields'][1]['required'])
+        data['n1']=[''];self.assertEqual(len(KD.schema_from_editor(data)['fields']),1)
+        page=KD.render_form('test','<script>','/token',schema=schema)
+        self.assertIn('f_renamed',page);self.assertIn('Edit proposed fields',page)
+        self.assertNotIn('<script>',page);self.assertIn('&lt;script&gt;',page)
+        self.assertIn('data-1p-ignore',page)
+        self.assertIn('prefers-color-scheme:dark',page)
+        self.assertIn('@media(max-width:650px)',page)
+
+    def test_dates_search_activity_and_flows(self):
+        for date in ['2026-02-30','junk','2026-1-01']:
+            with self.assertRaises(KD.KeydropError):KD.rotation_date(date)
+        self.assertEqual(KD.rotation_date('2028-02-29'),'2028-02-29')
+        KD.write_item_meta('alpha',None,'2000-01-01')
+        entries={'alpha':{'created':1,'updated':2},'beta':{'created':1,'updated':2}}
+        page=KD.render_vault('/t','c',entries,{},None,query='alpha')
+        self.assertIn('<b>alpha</b>',page);self.assertNotIn('<b>beta</b>',page)
+        page=KD.render_vault('/t','c',entries,{},None,status='overdue')
+        self.assertNotIn('<b>beta</b>',page)
+        KD.log('alpha','rotate stored');self.assertEqual(KD.read_activity()[0][1: ],['alpha','rotate stored'])
+        self.h._act('/t','new',{'template':['aws']})
+        self.assertIn(b'f_access_key_id',self.responses[-1][1])
+        self.h._act('/t','search',{'query':['alpha']})
+        self.assertEqual(self.responses[-1][2]['query'],'alpha')
+        page=KD.render_confirm_delete('/t','c','alpha')
+        self.assertIn('delete-confirm',page);self.assertIn('Keep it',page)
+
+    def test_request_handler(self):
+        h=object.__new__(KD.Handler)
+        h.server=types.SimpleNamespace(name='request-typed',note='',schema=self.schema,outcome=None)
+        h._authorised=lambda:'/token'
+        h._read_form=lambda n:self.fields()
+        h._send=lambda *args:self.responses.append(args)
+        h.do_POST()
+        self.assertEqual(h.server.outcome,'stored')
+        self.assertEqual(self.responses[-1][0],200)
+        self.assertNotIn(b'private-secret-value',self.responses[-1][1])
+        self.assertEqual(KD.item_value('request-typed',KD.keychain_get('request-typed'),'client_secret'),'private-secret-value')
+
+    # SPEC 5.3 / 5.5 / 6 and the keychain adapter's limits.
+
+    def test_spec_credential_fields(self):
+        schema = KD.request_schema("site", "credential", fields_arg="totp,url")
+        self.assertEqual([f["name"] for f in schema["fields"]], ["username", "password", "totp", "url"])
+        self.assertEqual(KD.request_schema("site", "credential"), KD.credential_schema("site"))
+        self.assertIsNone(KD.request_schema("site", "secret"))
+        for typ, fields in [("credential", "pin"), ("secret", "url"), ("no-such-type", None)]:
+            with self.subTest(typ=typ), self.assertRaises(KD.RefusedError):
+                KD.request_schema("site", typ, fields_arg=fields)
+
+    def test_bare_name_stays_secret_when_credentials_off(self):
+        Path(KD.POLICY_FILE).unlink()
+        self.assertIsNone(KD.request_schema("linkedin"))
+        self.assertIsNone(KD.request_schema("github"))
+
+    def test_field_policy_refuses_with_exit_2_before_transport(self):
+        Path(KD.POLICY_FILE).write_text(json.dumps(
+            {"types_enabled": ["secret", "credential"], "credential_fields_enabled": ["url"]}))
+        with patch.object(KD, "tailnet_host") as transport, patch.object(KD, "claim_port") as local, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(KD.main(["request", "site", "--type", "credential", "--fields", "totp"]), 2)
+            transport.assert_not_called()
+            local.assert_not_called()
+        self.assertIn("totp", err.getvalue())
+        KD.check_policy(KD.credential_schema("site", ("url",)))
+
+    def test_types_disabled_refuses_with_exit_2(self):
+        Path(KD.POLICY_FILE).unlink()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(KD.main(["request", "site", "--type", "credential"]), 2)
+
+    def test_totp_check(self):
+        schema = KD.credential_schema("site", ("totp",))
+        values = {"schema": [json.dumps(schema)], "f_username": ["me"], "f_password": ["pw"]}
+        for good in ["JBSWY3DPEHPK3PXP", "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&issuer=x"]:
+            raw, _ = KD.submitted_item(dict(values, f_totp=[good]))
+            self.assertEqual(json.loads(raw)["fields"]["totp"], good)
+        for bad in ["123456", "not base32 at all!", "otpauth://totp/x?issuer=x", "https://example.com/?secret=JBSWY3DPEHPK3PXP"]:
+            with self.subTest(bad=bad), self.assertRaises(KD.KeydropError):
+                KD.submitted_item(dict(values, f_totp=[bad]))
+        bad = copy.deepcopy(schema)
+        bad["fields"][0]["check"] = "totp"      # username is text: a check only goes on a secret
+        with self.assertRaises(KD.KeydropError):
+            KD.validate_schema(bad)
+
+    def test_real_keychain_label_line(self):
+        """macOS prints the label as attribute 0x00000007, not "labl"."""
+        svce = KD.service("site")
+        out = (f'keychain: "/x/login.keychain-db"\nattributes:\n'
+               f'    0x00000007 <blob>="{svce}.credential-v1"\n'
+               f'    "acct"<blob>="{KD.ACCOUNT}"\n    "svce"<blob>="{svce}"\n'
+               f'keychain: "/x/login.keychain-db"\nattributes:\n'
+               f'    0x00000007 <blob>="{KD.service("plain")}"\n'
+               f'    "acct"<blob>="{KD.ACCOUNT}"\n    "svce"<blob>="{KD.service("plain")}"\n')
+        with patch.object(KD.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=out, stderr="")):
+            entries = KD.keychain_entries()
+        self.assertEqual(entries["site"]["type"], "credential")
+        self.assertEqual(entries["plain"]["type"], "secret")
+
+    def test_security_line_limit_refuses_and_keeps_old_value(self):
+        KD.keychain_store("big", "old value")
+        too_long = "x" * (KD.KeychainVault().capabilities()["max_bytes"] + 100)
+        with self.assertRaises(KD.KeydropError):
+            KD.keychain_store("big", too_long)
+        self.assertEqual(KD.keychain_get("big"), "old value")
+        self.h._store("/token", "replace", "big", {"value": [too_long]})
+        self.assertEqual(self.responses[-1][:2], (400, KD.TOO_LONG))
+        self.assertEqual(KD.keychain_get("big"), "old value")
+        fits = "y" * KD.KeychainVault().capabilities()["max_bytes"]
+        KD.keychain_store("big", fits)
+        self.assertEqual(KD.keychain_get("big"), fits)
+
+    def test_list_long(self):
+        self.h._store("/token", "add", "listed", self.fields())
+        KD.keychain_store("plainlisted", "v")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(KD.main(["list", "--long"]), 0)
+        rows = {r.split("\t")[0]: r.split("\t") for r in out.getvalue().splitlines()}
+        self.assertEqual(rows["listed"][1], "credential")
+        self.assertEqual(rows["plainlisted"][1], "secret")
+        self.assertEqual(len(rows["listed"]), 4)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            KD.main(["list"])
+        self.assertIn("listed\n", out.getvalue())
+        self.assertNotIn("\t", out.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

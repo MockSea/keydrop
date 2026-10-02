@@ -422,7 +422,8 @@ def test_units():
     check(KD.route_ours(dict(same, AllowFunnel={f"{HOST}:443": True}), 9443),
           "unit: Funnel on another port doesn't count")
     form = KD.render_form("name", "a note", "/t")
-    for what, html in (("home page", page), ("one-shot form", form)):
+    entry = KD.render_entry("/t", "csrf")   # the vault's add page, reached from "Add a credential"
+    for what, html in (("home add page", entry), ("one-shot form", form)):
         check('autocomplete="new-password"' in html and "data-1p-ignore" in html,
               f"unit: the {what}'s password field asks managers not to save it")
 
@@ -573,6 +574,33 @@ def test_writes(page, token):
     check(all(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}\t[a-z0-9._-]+\t[a-z -]+", l) for l in audit),
           "audit lines are time, name, event and nothing else")
     check(oct(os.stat(KD.AUDIT_FILE).st_mode & 0o777) == "0o600", "audit log is 0600")
+
+
+def test_typed_home(page, token):
+    with open(KD.POLICY_FILE, "w") as f:
+        json.dump({"types_enabled": ["secret", "credential"]}, f)
+    try:
+        url = page.url(token)
+        csrf = csrf_of(get(url)[1])
+        n, v = name("typed"), value()
+        schema = KD.template_schema("api-key")
+        fields = {"csrf": csrf, "action": "add", "name": n,
+                  "schema": json.dumps(schema), "f_api_key": v, "rotate_by": "2000-01-01"}
+        code, body = post(url, fields)
+        check(code == 200 and "Overdue" in body and v not in body,
+              "home typed add shows schedule but never value")
+        check(KD.item_value(n, KD.keychain_get(n), "api_key") == v, "home typed item verifies in fake keychain")
+        v2 = value()
+        code, body = post(url, dict(fields, action="rotate", f_api_key=v2, rotate_by="2099-01-01"))
+        check(code == 200 and v2 not in body and KD.item_value(n, KD.keychain_get(n), "api_key") == v2,
+              "home rotation replaces the typed item")
+        check(any(n + "\trotate stored" in line for line in log_lines(KD.AUDIT_FILE)), "home audits typed rotation")
+        code, body = post(url, {"csrf": csrf, "action": "delete", "name": n})
+        check(code == 200 and KD.keychain_exists(n), "home typed delete requires confirmation")
+        code, body = post(url, {"csrf": csrf, "action": "delete-confirm", "name": n})
+        check(code == 200 and not KD.keychain_exists(n) and n not in KD.read_items(), "home deletes typed metadata with item")
+    finally:
+        os.unlink(KD.POLICY_FILE)
 
 
 def test_flood(page, token):
@@ -1447,6 +1475,8 @@ def main():
         test_rebinding(page, token)
         page = restart(page)    # the per-minute request cap is per process
         test_writes(page, token)
+        page = restart(page)
+        test_typed_home(page, token)
         page = restart(page)
         test_flood(page, token)
         page = restart(page)

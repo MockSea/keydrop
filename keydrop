@@ -2,12 +2,14 @@
 """keydrop — hand a secret to a local tool or agent through a one-shot link
 instead of pasting it into a chat.
 
-    keydrop request <name> [--note "what it's for"] [--ttl 15m] [--http]
+    keydrop request <name> [--type secret|credential|<template>] [--fields totp,url,notes]
+                   [--note "what it's for"] [--ttl 15m] [--http]
     keydrop vault [--ttl 15m] [--http]
                               a session link for listing, adding, replacing
                               and deleting entries under the service prefix
-    keydrop get <name>        print the stored value (for local tools)
-    keydrop list              names only
+    keydrop get <name> [--field F]
+                              print the stored value, or one credential field
+    keydrop list [--long]     names only; --long adds type, created, updated
     keydrop status            pending requests and vault sessions
     keydrop cancel <name>     stop a pending request (`cancel vault` ends a session)
     keydrop home              the vault page held up for good, for launchd
@@ -22,12 +24,14 @@ instead of pasting it into a chat.
 
 `request` binds a one-shot HTTP server to 127.0.0.1, exposes it on the tailnet
 with `tailscale serve` on the same port number, prints the URL and detaches. The
-page is a single password field. One good submit, or the TTL, or a handful of
+page proposes a single secret or validated credential fields. One good submit, or the TTL, or a handful of
 bad guesses, and it tears its serve config down and exits.
 
 The vault is the login keychain: service `<prefix><name>` (prefix `keydrop.`
 by default), account from the config (`keydrop` by default).
-Created/updated times are the keychain item's own cdat/mdat. Notes live in
+Created/updated times are the keychain item's own cdat/mdat. Typed fields are
+stored together in the spec v1 JSON envelope, with a non-secret label marker.
+Field definitions and rotate-by dates live in items.json, never field values. Notes live in
 meta.json in the state dir, because a note isn't a secret and `security -i`
 has no quoting that's safe for free text; values never go there.
 
@@ -155,7 +159,7 @@ path in KEYDROP_CONFIG), and environment variables, which win over the file:
 Test-only overrides: KEYDROP_SECURITY (the `security` binary) and
 KEYDROP_WATCH_INTERVAL (seconds, capped at WATCH_INTERVAL).
 """
-import calendar, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
+import base64, calendar, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
 import signal, subprocess, sys, time, urllib.parse
 
 CONFIG_PATH = os.environ.get("KEYDROP_CONFIG") or os.path.expanduser("~/.config/keydrop/config.json")
@@ -273,6 +277,15 @@ AUTO_FETCH = ("/favicon", "/apple-touch-icon", "/robots.txt")
 
 
 class KeydropError(Exception):
+    exit_code = 1
+
+
+class RefusedError(KeydropError):
+    """A refused request (SPEC 6): exit status 2."""
+    exit_code = 2
+
+
+class PolicyError(RefusedError):
     pass
 
 
@@ -319,29 +332,337 @@ def clean_note(note):
     return note
 
 
+# ---------- typed items (definitions only; never field values in state) ----------
+
+ITEMS_FILE = os.path.join(STATE_DIR, "items.json")
+POLICY_FILE = os.path.join(STATE_DIR, "policy.json")
+FIELD_LIMIT = 12
+
+
+def schema_field(name, kind="secret", required=True, label=None, max=8192, check=None):
+    return {"name": name, "label": label or name.replace("_", " ").capitalize(),
+            "kind": kind, "required": required, "max": max, **({"check": check} if check else {})}
+
+
+# SPEC 5.3. The optional fields are shown only when asked for with
+# --fields totp,url,notes, and policy can forbid each one.
+CREDENTIAL_FIELDS = [
+    schema_field("username", "text", True, "Username", 512),
+    schema_field("password", "secret", True, "Password"),
+    schema_field("totp", "secret", False, "One-time code secret", 1024, "totp"),
+    schema_field("url", "url", False, "Website", 2048),
+    schema_field("notes", "secret", False, "Notes", 2000),
+]
+CREDENTIAL_OPTIONAL = ("totp", "url", "notes")
+
+
+def credential_schema(name, optional=()):
+    unknown = set(optional) - set(CREDENTIAL_OPTIONAL)
+    if unknown:
+        raise RefusedError(f"unknown credential field {sorted(unknown)[0]!r} "
+                           f"(choose from {','.join(CREDENTIAL_OPTIONAL)})")
+    return validate_schema({"service": name, "fields": [
+        f for f in CREDENTIAL_FIELDS if f["required"] or f["name"] in optional]})
+
+
+TEMPLATES = {
+    "api-key": [schema_field("api_key")],
+    "username-password": [schema_field("username", "text"), schema_field("password")],
+    "linkedin": [schema_field("client_id", "text"), schema_field("client_secret"), schema_field("redirect_uri", "url")],
+    "github": [schema_field("token")], "openai": [schema_field("api_key")],
+    "anthropic": [schema_field("api_key")],
+    "aws": [schema_field("access_key_id", "text"), schema_field("secret_access_key"), schema_field("session_token", required=False)],
+    "google-oauth": [schema_field("client_id", "text"), schema_field("client_secret"), schema_field("redirect_uri", "url")],
+    "stripe": [schema_field("secret_key"), schema_field("publishable_key", "text", False)],
+    "credential": [f for f in CREDENTIAL_FIELDS if f["required"]],
+}
+
+
+def schema_json(raw):
+    if len(raw.encode("utf-8", "surrogatepass")) > 16384:
+        raise ValueError("schema is too large")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate schema property")
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw, object_pairs_hook=unique)
+    except RecursionError:
+        raise ValueError("schema nesting is too deep")
+
+
+def safe_label(value, limit=80):
+    return (isinstance(value, str) and 0 < len(value) <= limit
+            and value.isprintable() and value.strip() != "" and not re.search(r"[<>]", value))
+
+
+def validate_schema(data):
+    """Fail the entire untrusted definition; never accept defaults/values/code."""
+    fail = RefusedError("Invalid credential schema.")
+    if not isinstance(data, dict) or set(data) != {"service", "fields"}:
+        raise fail
+    if not isinstance(data["service"], str) or not valid_name(data["service"]):
+        raise fail
+    fs = data["fields"]
+    if not isinstance(fs, list) or not 1 <= len(fs) <= FIELD_LIMIT:
+        raise fail
+    seen, result = set(), []
+    for f in fs:
+        if not isinstance(f, dict) or set(f) - {"name", "id", "label", "kind", "required", "max", "options", "check"}:
+            raise fail
+        if "check" in f and (f["check"] != "totp" or f.get("kind") != "secret"):
+            raise fail
+        name = f.get("name", f.get("id"))
+        if ("name" in f and "id" in f or not isinstance(name, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", name) or name in seen
+                or not safe_label(f.get("label")) or f.get("kind") not in ("secret", "text", "url", "select")
+                or type(f.get("required")) is not bool
+                or type(f.get("max", 8192)) is not int or not 1 <= f.get("max", 8192) <= 8192):
+            raise fail
+        opts = f.get("options")
+        if f["kind"] == "select":
+            if (not isinstance(opts, list) or not 1 <= len(opts) <= 20
+                    or not all(safe_label(v) for v in opts) or len(set(opts)) != len(opts)):
+                raise fail
+        elif opts is not None:
+            raise fail
+        seen.add(name)
+        result.append(dict(name=name, label=f["label"], kind=f["kind"], required=f["required"],
+                           max=f.get("max", 8192), **({"options": opts} if opts is not None else {}),
+                           **({"check": f["check"]} if "check" in f else {})))
+    if not any(f["kind"] == "secret" for f in result):
+        raise fail
+    normalized = {"service": data["service"], "fields": result}
+    if len(json.dumps(normalized, ensure_ascii=False).encode("utf-8")) > 8192:
+        raise fail
+    return normalized
+
+
+def template_schema(service):
+    if service not in TEMPLATES:
+        raise RefusedError("Unknown template. Supply --schema with the service requirements.")
+    return validate_schema({"service": service, "fields": TEMPLATES[service]})
+
+
+def read_policy():
+    """SPEC 5.5. No policy file means secret-only; credentials are opt-in.
+    credential_fields_enabled defaults to every optional credential field."""
+    try:
+        with open(POLICY_FILE) as f:
+            policy = json.load(f)
+    except FileNotFoundError:
+        policy = {}
+    except (OSError, ValueError):
+        raise PolicyError("can't read the item policy")
+    if not isinstance(policy, dict):
+        raise PolicyError("can't read the item policy")
+    types = policy.get("types_enabled", ["secret"])
+    fields = policy.get("credential_fields_enabled", list(CREDENTIAL_OPTIONAL))
+    if not (isinstance(types, list) and isinstance(fields, list)
+            and all(isinstance(x, str) for x in types + fields)):
+        raise PolicyError("can't read the item policy")
+    return {"types_enabled": types, "credential_fields_enabled": fields}
+
+
+def check_policy(schema):
+    policy = read_policy()
+    typ = "credential" if schema else "secret"
+    if typ not in policy["types_enabled"]:
+        raise PolicyError(f"{typ} requests are turned off on this machine")
+    for f in (schema or {}).get("fields", []):
+        if f["name"] in CREDENTIAL_OPTIONAL and f["name"] not in policy["credential_fields_enabled"]:
+            raise PolicyError(f"credential requests with a {f['name']} field are turned off on this machine")
+
+
+def credentials_enabled():
+    try:
+        check_policy(template_schema("api-key"))
+        return True
+    except KeydropError:
+        return False
+
+
+def read_items():
+    try:
+        with open(ITEMS_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        result = {}
+        for name, item in data.items():
+            if not valid_name(name) or not isinstance(item, dict):
+                continue
+            schema = validate_schema(item["schema"]) if item.get("schema") else None
+            date = rotation_date(item.get("rotate_by", ""))
+            result[name] = {"schema": schema, "rotate_by": date}
+        return result
+    except (OSError, ValueError, KeydropError, TypeError):
+        return {}
+
+
+def write_item_meta(name, schema, rotate_by):
+    with meta_lock():
+        data = read_items()
+        if schema is None and rotate_by is None:
+            data.pop(name, None)
+        else:
+            data[name] = {"schema": schema, "rotate_by": rotate_by or ""}
+        fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(ITEMS_FILE + ".tmp", ITEMS_FILE)
+
+
+def rotation_date(value):
+    if not isinstance(value, str):
+        raise KeydropError("Use a valid rotate-by date.")
+    if value:
+        try:
+            if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+                raise ValueError()
+            time.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            raise KeydropError("Use a valid rotate-by date.")
+    return value
+
+
+TOO_LONG = "That's too long to store in this vault."
+
+
+def submitted_item(fields, fallback=None):
+    if any(len(v) != 1 for v in fields.values()):
+        raise KeydropError("That didn't look like the form.")
+    raw = field(fields, "schema")
+    try:
+        schema = validate_schema(schema_json(raw)) if raw else fallback
+    except (ValueError, TypeError):
+        raise KeydropError("Invalid credential schema.")
+    check_policy(schema)
+    if not schema:
+        if set(fields) - {"csrf", "action", "name", "note", "rotate_by", "value", "schema"}:
+            raise KeydropError("That didn't look like the form.")
+        value = field(fields, "value").strip()
+        if not value:
+            raise KeydropError("Nothing was entered.")
+        if len(value.encode()) > 8192:
+            raise KeydropError("Value is too long.")
+        return value, None
+    schema = validate_schema(schema)
+    allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"} | {"f_" + f["name"] for f in schema["fields"]}
+    if set(fields) - allowed:
+        raise KeydropError("That didn't look like the form.")
+    values = {}
+    for f in schema["fields"]:
+        v = field(fields, "f_" + f["name"])
+        if f["required"] and not v.strip():
+            raise KeydropError("Nothing was entered.")
+        if len(v.encode()) > f["max"]:
+            raise KeydropError("A field is too long.")
+        if v and f["kind"] == "url":
+            try:
+                url = urllib.parse.urlsplit(v)
+            except ValueError:
+                raise KeydropError("A URL doesn't look right.")
+            if url.scheme not in ("http", "https") or not url.netloc or re.search(r"[\x00-\x20]", v):
+                raise KeydropError("A URL doesn't look right.")
+        if v and f.get("check") == "totp" and not totp_ok(v):
+            raise KeydropError("The one-time code secret doesn't look right.")
+        if v and f["kind"] == "select" and v not in f["options"]:
+            raise KeydropError("Choose a listed option.")
+        if v:
+            values[f["name"]] = v
+    return json.dumps({"keydrop": 1, "type": "credential", "fields": values}, ensure_ascii=False), schema
+
+
+def totp_ok(value):
+    """base32, or an otpauth:// URI carrying a base32 secret (SPEC 5.3)."""
+    if value.startswith("otpauth://"):
+        try:
+            url = urllib.parse.urlsplit(value)
+            secret = urllib.parse.parse_qs(url.query).get("secret", [""])
+        except ValueError:
+            return False
+        if url.netloc not in ("totp", "hotp") or len(secret) != 1:
+            return False
+        value = secret[0]
+    b32 = re.sub(r"[\s-]", "", value).upper().rstrip("=")
+    if not re.fullmatch(r"[A-Z2-7]{16,}", b32):
+        return False
+    try:
+        base64.b32decode(b32 + "=" * (-len(b32) % 8))
+        return True
+    except ValueError:
+        return False
+
+
+def item_value(name, raw, selected=None):
+    # State marks envelopes we wrote: a legacy secret that resembles JSON stays raw.
+    entry = STORE.list().get(name)
+    if entry is None:
+        raise KeydropError("Cannot establish the item type.")
+    typed = entry.get("type") == "credential"
+    schema = read_items().get(name, {}).get("schema")
+    if not schema and not typed:
+        if selected not in (None, "value"):
+            raise KeydropError("Unknown field.")
+        return raw
+    if not selected:
+        raise KeydropError("Credentials require get <name> --field <name>.")
+    try:
+        data = json.loads(raw)
+        if data.get("keydrop") != 1 or data.get("type") != "credential" or not isinstance(data.get("fields"), dict):
+            raise ValueError()
+        value = data["fields"][selected]
+        if not isinstance(value, str):
+            raise ValueError()
+        return value
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise KeydropError("Field is absent or the item is invalid.")
+
+
 # ---------- keychain ----------
 
 def service(name):
     return SERVICE_PREFIX + name
 
 
-def store_command(name, value):
+# `security -i` reads at most 4096 characters per line and runs the rest as a
+# second command, so a longer line would store a truncated value (measured on
+# macOS 15/26). Hex doubles the value, which leaves about 1.9KB per item.
+SECURITY_LINE_MAX = 4096
+
+
+def store_command(name, value, typed=False):
     """The `security -i` line. Goes to stdin, never argv. Hex means no quoting
     rules to get wrong, whatever the value contains."""
     if not (valid_name(name) and ACCOUNT_RE.fullmatch(ACCOUNT) and PREFIX_RE.fullmatch(SERVICE_PREFIX)):
         raise KeydropError("bad name or config")
-    return (f"add-generic-password -U -a {ACCOUNT} -s {service(name)} "
-            f"-l {service(name)} -X {value.encode('utf-8').hex()}\n")
+    line = (f"add-generic-password -U -a {ACCOUNT} -s {service(name)} "
+            f"-l {service(name) + ('.credential-v1' if typed else '')} -X {value.encode('utf-8').hex()}")
+    if len(line) > SECURITY_LINE_MAX:
+        raise KeydropError("too long for the keychain")
+    return line + "\n"
 
 
-def keychain_store(name, value):
+def keychain_fits(name, value, typed=False):
+    try:
+        store_command(name, value, typed)
+        return True
+    except KeydropError:
+        return False
+
+
+def keychain_store(name, value, typed=False):
     """`security -i` does exit with the inner command's status, but only its
     low 8 bits (errSecDuplicateItem, -25299, exits 45), so an OSStatus that is
     a multiple of 256 would exit 0. The exit code alone can't be trusted to
     mean stored: read the item back and compare digests."""
     if not valid_name(name):
         raise KeydropError("bad name")
-    r = subprocess.run([SECURITY, "-i"], input=store_command(name, value),
+    r = subprocess.run([SECURITY, "-i"], input=store_command(name, value, typed),
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         # security echoes the failing command name and a code, never the input line.
@@ -351,6 +672,10 @@ def keychain_store(name, value):
             hashlib.sha256(back.encode("utf-8")).digest(),
             hashlib.sha256(value.encode("utf-8")).digest()):
         raise KeydropError("security exited 0 but the item doesn't read back as stored")
+    # The label is the type marker. Check it both ways, so a credential
+    # replaced by a single secret can't keep reading back as a credential.
+    if keychain_entries().get(name, {}).get("type") != ("credential" if typed else "secret"):
+        raise KeydropError("the type marker didn't read back as stored")
 
 
 def keychain_get(name):
@@ -372,26 +697,34 @@ def keychain_get(name):
 
 
 def keychain_entries():
-    """{name: {"created": epoch, "updated": epoch}} for every <prefix>* item,
+    """{name: {"created": epoch, "updated": epoch, "type": ...}} for every <prefix>* item,
     from dump-keychain's attribute listing. Without -d it prints no secret
     data. cdat survives an -U update and mdat moves with it."""
     r = subprocess.run([SECURITY, "dump-keychain"], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise KeydropError("Couldn't read the keychain.")
     out, cur = {}, {}
 
     def flush(item):
         svce = item.get("svce") or ""
         name = svce[len(SERVICE_PREFIX):]
         if item.get("acct") == ACCOUNT and svce.startswith(SERVICE_PREFIX) and valid_name(name):
-            out[name] = {"created": item.get("cdat"), "updated": item.get("mdat")}
+            out[name] = {"created": item.get("cdat"), "updated": item.get("mdat"),
+                         "type": "credential" if item.get("labl") == service(name) + ".credential-v1" else "secret"}
 
     for line in r.stdout.splitlines():
         if line.startswith("keychain:"):
             flush(cur)
             cur = {}
             continue
-        m = re.match(r'\s+"(svce|acct)"<blob>="(.*)"$', line)
+        m = re.match(r'\s+"(svce|acct|labl)"<blob>="(.*)"$', line)
         if m:
             cur = dict(cur, **{m.group(1): m.group(2)})
+            continue
+        # The real tool prints the label by attribute number, not as "labl".
+        m = re.match(r'\s+0x00000007 <blob>="(.*)"$', line)
+        if m:
+            cur = dict(cur, labl=m.group(1))
             continue
         m = re.match(r'\s+"(cdat|mdat)"<timedate>=\S+\s+"(\d{14})Z', line)
         if m:
@@ -423,6 +756,39 @@ def keychain_delete(name):
                    capture_output=True, text=True, timeout=30)
     if keychain_exists(name):
         raise KeydropError("security didn't delete it")
+
+
+class KeychainVault:
+    """The macOS login keychain, behind the SPEC 8.1 vault interface. This is
+    the only macOS-specific part of keydrop: pages, handlers and the CLI reach
+    the store through STORE, so another store is another class with these
+    methods. A typed item arrives already encoded per SPEC 5.4."""
+    name = "keychain"
+
+    def capabilities(self):
+        return {"native_types": [], "write_channel": "stdin", "lists_without_unlock": True,
+                "max_bytes": (SECURITY_LINE_MAX - 160) // 2}
+
+    def fits(self, name, value, typed=False):
+        return keychain_fits(name, value, typed)
+
+    def store(self, name, value, typed=False):
+        keychain_store(name, value, typed)
+
+    def get(self, name):
+        return keychain_get(name)
+
+    def list(self):
+        return keychain_entries()
+
+    def exists(self, name):
+        return keychain_exists(name)
+
+    def delete(self, name):
+        keychain_delete(name)
+
+
+STORE = KeychainVault()
 
 
 # ---------- notes ----------
@@ -704,7 +1070,7 @@ def keydrop_listening(local_port):
     with another KEYDROP_STATE_DIR (a test run, a copy of the script) owns its
     route just as much, and the sweep can't see its record."""
     try:
-        r = subprocess.run(["/usr/sbin/lsof", "-nP", f"-iTCP@127.0.0.1:{local_port}",
+        r = subprocess.run([shutil.which("lsof") or "/usr/sbin/lsof", "-nP", f"-iTCP@127.0.0.1:{local_port}",
                             "-sTCP:LISTEN", "-t"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return True
@@ -746,22 +1112,54 @@ def reap():
 
 # ---------- pages ----------
 
-PAGE = """<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<link rel="icon" href="data:,">
-<title>keydrop</title>
-<style>
-body{{font:17px -apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:480px}}
-h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:17px;margin:28px 0 8px}} p{{color:#555;margin:0 0 20px}}
-input,button{{font:inherit;width:100%;box-sizing:border-box;padding:14px;border-radius:10px}}
-input{{border:1px solid #bbb;margin-bottom:12px}} button{{border:0;background:#111;color:#fff}}
-.err{{color:#b00}} .ok{{color:#070}} .meta{{color:#777;font-size:14px;margin:2px 0 0}}
-.item{{border-top:1px solid #ddd;padding:12px 0}} .item b{{word-break:break-all}}
-summary{{color:#06c;margin-top:6px}} details form{{margin-top:10px}}
-button.del{{background:#b00}} button.quiet{{background:#eee;color:#111;margin-top:28px}}
-</style></head><body>{body}</body></html>"""
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,"><title>keydrop · Key management</title><style>*{{box-sizing:border-box}}
+:root{{color-scheme:light dark;--bg:#f5f6f7;--panel:#fff;--ink:#172328;--muted:#657278;--line:#dce2e4;--accent:#136b58}}
+body{{margin:0;background:var(--bg);color:var(--ink);font:15px -apple-system,BlinkMacSystemFont,system-ui,sans-serif}}
+header{{background:var(--panel);border-bottom:1px solid var(--line);padding:20px 5%;display:flex;justify-content:space-between;align-items:center}}
+header strong{{font-size:20px;letter-spacing:-.8px}}
+header span{{font:11px monospace;color:var(--accent);letter-spacing:1px}}
+main{{max-width:1180px;margin:auto;padding:44px 28px}}
+h1{{font-size:32px;letter-spacing:-1.2px;margin:0 0 12px}}
+h2{{font-size:20px;margin:32px 0 16px}}
+p{{line-height:1.6;color:var(--muted)}}
+.meta,small{{font-size:12px;color:var(--muted)}}
+label{{display:block;font-size:13px;margin:15px 0 7px}}
+input,select,button{{font:inherit;font-size:16px;padding:12px;border-radius:5px;min-height:44px}}
+input,select{{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink)}}
+input[type=checkbox]{{width:auto}}
+button{{border:1px solid transparent;background:var(--accent);color:white;cursor:pointer;margin:12px 0}}
+button.quiet{{background:var(--panel);border-color:var(--line);color:var(--ink)}}
+button.del{{background:#a73239}}
+form{{margin:0}}
+.editor,.entry{{max-width:620px}}
+details{{border-top:1px solid var(--line);padding:16px 0}}
+summary{{cursor:pointer;font-weight:600;min-height:32px}}
+.err{{color:#bc3540}}
+.ok{{color:var(--accent)}}
+.toolbar{{display:flex;gap:12px;align-items:end;margin:28px 0}}
+.toolbar label{{flex:1}}
+.toolbar select{{max-width:180px}}
+table{{width:100%;border-collapse:collapse;text-align:left;background:var(--panel)}}
+th{{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-weight:500;padding:14px 16px;border-bottom:1px solid var(--line)}}
+td{{padding:20px 16px;border-bottom:1px solid var(--line);vertical-align:top}}
+td b{{font-family:ui-monospace,monospace;font-size:14px;overflow-wrap:anywhere}}
+td p{{margin:6px 0}}
+.badge{{font-size:11px;border:1px solid var(--line);border-radius:20px;padding:4px 8px;white-space:nowrap}}
+.overdue{{color:#b73d38;border-color:#d99894}}
+.row-actions{{display:flex;gap:8px}}
+.row-actions button{{font-size:12px;margin:0;padding:8px;min-height:44px}}
+.metrics{{display:flex;gap:32px;margin:28px 0;color:var(--muted)}}
+.metrics strong{{color:var(--ink);font-size:24px;margin-right:8px}}
+.field-row{{border-bottom:1px solid var(--line);padding:16px 0}}
+.field-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+a{{color:var(--accent)}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#101719;--panel:#162023;--ink:#e1e9e9;--muted:#97a9af;--line:#304044;--accent:#65cbb0}}
+button{{color:#10231e}}
+button.del{{color:white}}}}
+@media(max-width:650px){{main{{padding:28px 18px}}header{{padding:18px}}h1{{font-size:28px}}.toolbar{{flex-wrap:wrap;gap:6px}}.toolbar label{{min-width:160px}}.metrics{{gap:18px}}.metrics strong{{font-size:22px}}table,tbody,tr,td{{display:block}}thead{{display:none}}tr{{border-bottom:1px solid var(--line);padding:16px}}td{{padding:5px 0;border:0}}td[data-label]:before{{content:attr(data-label) "  ";font-size:12px;color:var(--muted)}}.row-actions{{margin-top:8px}}.field-grid{{grid-template-columns:1fr}}}}</style></head>
+<body><header><strong>◈ keydrop</strong><span>PRIVATE / TAILNET</span></header><main>{body}</main></body></html>"""
 
 
 # Discourage the browser and password managers from offering to save the
@@ -774,21 +1172,104 @@ NO_SAVE = ('autocomplete="new-password" autocapitalize="off" autocorrect="off" '
            'data-form-type="other"')
 
 
-def render_form(name, note, action, error=""):
-    body = (f"<h1>{html.escape(name)}</h1>"
+def hidden(name, value):
+    return f'<input type="hidden" name="{html.escape(name)}" value="{html.escape(value)}">'
+
+
+def credential_inputs(schema, focus=False):
+    if not schema:
+        return ('<label for="value">Secret value</label><input id="value" type="password" name="value" '
+                + NO_SAVE + (' autofocus' if focus else '') + ' required>')
+    out = hidden("schema", json.dumps(schema))
+    for i, f in enumerate(schema["fields"]):
+        ident = "f_" + f["name"]
+        out += f'<label for="{ident}">{html.escape(f["label"])}' + ("" if f["required"] else " (optional)") + '</label>'
+        req = (" autofocus" if focus and i == 0 else "") + (" required" if f["required"] else "")
+        if f["kind"] == "select":
+            out += f'<select id="{ident}" name="{ident}"{req}><option value="">Choose…</option>'
+            out += ''.join(f'<option>{html.escape(v)}</option>' for v in f["options"]) + '</select>'
+        else:
+            kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
+            attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
+            out += f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{req}>'
+    return out
+
+
+def render_form(name, note, action, error="", schema=None, expires=None):
+    body = (f'<div class="entry"><p class="meta">CREDENTIAL REQUEST</p><h1>{html.escape(name)}</h1>'
             + (f"<p>{html.escape(note)}</p>" if note else "")
+            + '<p>It goes straight into the vault. Stored values never appear on this page.</p>'
             + (f'<p class="err">{html.escape(error)}</p>' if error else "")
             + f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
-            + '<input type="password" name="value" ' + NO_SAVE + ' autofocus required>'
-            + '<button type="submit">Store</button></form>')
+            + credential_inputs(schema, focus=True) + '<button type="submit">Store</button></form>')
+    if expires:
+        body += '<p class="meta">Link ends ' + time.strftime("%H:%M", time.localtime(expires)) + '.</p>'
+    body += schema_editor(action, "", name, schema, request=True) + '</div>'
     return PAGE.format(body=body)
+
+
+def schema_editor(action, csrf, name, schema, request=False, act="add"):
+    if not credentials_enabled():
+        return '<p class="meta">Additional credential types are disabled by this vault’s policy.</p>'
+    schema = schema or {"service": "generic", "fields": [schema_field("value")]}
+    out = '<details><summary>Edit proposed fields</summary><p>Definitions only. Remove a field by clearing its name. Add fields in the empty rows. Applying changes clears entered values.</p>'
+    controls = hidden("name", name) + hidden("target", act)
+    controls += '<label>Service</label><input name="service" value="' + html.escape(schema["service"]) + '" required>'
+    for i in range(FIELD_LIMIT):
+        f = schema["fields"][i] if i < len(schema["fields"]) else {}
+        if not f:
+            controls += '<details><summary>Add another field</summary>'
+        controls += hidden(f"m{i}", str(f.get("max", 8192)))
+        controls += f'<div class="field-row"><div class="field-grid"><div><label>Field {i+1} · name</label><input name="n{i}" value="{html.escape(f.get("name", ""))}" maxlength="32"></div>'
+        controls += f'<div><label>Label</label><input name="l{i}" value="{html.escape(f.get("label", ""))}" maxlength="80"></div></div>'
+        controls += f'<label>Kind</label><select name="k{i}">' + ''.join(f'<option{(" selected" if k == f.get("kind", "secret") else "")}>{k}</option>' for k in ("secret", "text", "url", "select")) + '</select>'
+        controls += f'<label><input type="checkbox" name="r{i}" value="yes"' + (' checked' if f.get("required", True) else '') + '> Required</label>'
+        controls += f'<label>Select options (one per comma)</label><input name="o{i}" value="{html.escape(",".join(f.get("options", [])))}"></div>'
+        if not f:
+            controls += '</details>'
+    if request:
+        out += f'<form method="post" action="{html.escape(action)}" autocomplete="off">' + hidden("action", "edit-schema") + controls + '<button>Apply fields</button></form>'
+    else:
+        out += vault_form(action, csrf, "edit-schema", controls, "Apply fields")
+    return out + '</details>'
+
+
+def schema_from_editor(fields):
+    if any(len(v) != 1 for v in fields.values()):
+        raise KeydropError("Invalid credential schema.")
+    fs = []
+    for i in range(FIELD_LIMIT):
+        name = field(fields, f"n{i}")
+        if not name:
+            continue
+        f = dict(name=name, label=field(fields, f"l{i}"), kind=field(fields, f"k{i}"), required=field(fields, f"r{i}") == "yes")
+        if f["kind"] == "select":
+            f["options"] = field(fields, f"o{i}").split(",")
+        try:
+            f["max"] = int(field(fields, f"m{i}") or "8192")
+        except ValueError:
+            raise KeydropError("Invalid credential schema.")
+        fs.append(f)
+    schema = validate_schema({"service": field(fields, "service"), "fields": fs})
+    check_policy(schema)
+    return schema
+
+
+def render_entry(action, csrf, name="", schema=None, act="add", rotate_by=""):
+    title = "Rotate " + name if act == "rotate" else "Add a credential"
+    fields = (hidden("name", name) if name else '<label>Name</label><input name="name" required pattern="[a-z0-9._-]{1,64}" maxlength="64">')
+    fields += '<label>Note · never put secrets here</label><input name="note" maxlength="200">'
+    fields += '<label>Rotate by (optional)</label><input type="date" name="rotate_by" value="' + html.escape(rotate_by) + '">' + credential_inputs(schema)
+    return PAGE.format(body='<div class="entry"><p class="meta">KEY MANAGEMENT</p><h1>' + html.escape(title) + '</h1><p>Rotation replaces the complete credential. Update the service first, then store all new fields here.</p>'
+        + vault_form(action, csrf, act, fields, "Rotate credential" if act == "rotate" else "Store")
+        + schema_editor(action, csrf, name, schema, act=act) + vault_form(action, csrf, "back", "", "Back", "quiet") + '</div>')
+
+
+VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" ' + NO_SAVE + ' required>')
 
 
 def render_message(text):
     return PAGE.format(body=f"<h1>{html.escape(text)}</h1>")
-
-
-VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" ' + NO_SAVE + ' required>')
 
 
 def vault_form(action, csrf, act, fields, button, cls=""):
@@ -800,45 +1281,62 @@ def vault_form(action, csrf, act, fields, button, cls=""):
             + f'<button type="submit" class="{cls}">{html.escape(button)}</button></form>')
 
 
+def iso(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch)) if epoch else "-"
+
+
 def when(epoch):
-    return time.strftime("%b %-d %H:%M", time.localtime(epoch)) if epoch else "?"
+    return time.strftime("%b %-d, %Y · %H:%M", time.localtime(epoch)) if epoch else "?"
+
+
+def read_activity():
+    events = []
+    try:
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        for line in lines:
+            parts = line.split("\t")
+            if len(parts) == 3 and (valid_name(parts[1]) or parts[1] in (HOME, VAULT)):
+                events.append(parts)
+    except OSError:
+        pass
+    return events[-100:][::-1]
 
 
 def render_vault(action, csrf, entries, notes, expires, flash="", error="",
-                 title="keydrop vault", done_label="Done, close this link"):
-    """Names, notes and times only. Nothing that builds a page reads a
-    stored value, so there is none to leak into one."""
+                 title="keydrop vault", done_label="Done, close this link", query="", status="all"):
+    metadata = read_items()
+    today = time.strftime("%Y-%m-%d")
+    overdue = lambda n: bool(metadata.get(n, {}).get("rotate_by") and metadata[n]["rotate_by"] < today)
     rows = []
     for name in sorted(entries):
+        if query.lower() not in (name + " " + notes.get(name, "") + " " + (metadata.get(name, {}).get("schema") or {}).get("service", "")).lower():
+            continue
+        if status == "overdue" and not overdue(name):
+            continue
         e, hname = entries[name], html.escape(name)
-        hidden = f'<input type="hidden" name="name" value="{hname}">'
-        rows.append(
-            f'<div class="item"><b>{hname}</b>'
-            + (f'<p class="meta">{html.escape(notes[name])}</p>' if notes.get(name) else "")
-            + f'<p class="meta">added {when(e.get("created"))} · updated {when(e.get("updated"))}</p>'
-            + '<details><summary>Replace or delete</summary>'
-            + vault_form(action, csrf, "replace",
-                         hidden + VALUE_INPUT.format(ph="new value")
-                         + '<input type="text" name="note" placeholder="note (blank keeps it)" maxlength="200">',
-                         "Replace")
-            + vault_form(action, csrf, "delete", hidden, "Delete…", "del")
-            + "</details></div>")
-    lifetime = (f'Link ends {time.strftime("%H:%M", time.localtime(expires))}.' if expires
-                else "This page stays up until you stop it.")
-    body = (f"<h1>{html.escape(title)}</h1>"
-            + f'<p class="meta">{lifetime} Values are write-only here.</p>'
-            + (f'<p class="ok">{html.escape(flash)}</p>' if flash else "")
-            + (f'<p class="err">{html.escape(error)}</p>' if error else "")
-            + ("".join(rows) or '<p class="meta">Nothing stored yet.</p>')
-            + "<h2>Add</h2>"
-            + vault_form(action, csrf, "add",
-                         '<input type="text" name="name" placeholder="name (a-z 0-9 . _ -)" required '
-                         'maxlength="64" pattern="[a-z0-9._\\-]{1,64}" autocapitalize="off" autocorrect="off" '
-                         'spellcheck="false">'
-                         '<input type="text" name="note" placeholder="note (optional)" maxlength="200">'
-                         + VALUE_INPUT.format(ph="value"),
-                         "Store")
-            + vault_form(action, csrf, "done", "", done_label, "quiet"))
+        date = metadata.get(name, {}).get("rotate_by", "")
+        schema = metadata.get(name, {}).get("schema")
+        description = (schema["service"] + " · " + str(len(schema["fields"])) + " fields") if schema else e.get("type", "secret")
+        age = str(max(0, int((time.time() - e["updated"]) / 86400))) + "d" if e.get("updated") else "Unknown"
+        rows.append('<tr><td><b>' + hname + '</b><p class="meta">' + html.escape(notes.get(name, "")) + '</p><span class="meta">' + html.escape(description) + '</span></td>'
+            + f'<td data-label="Created">{when(e.get("created"))}</td><td data-label="Updated">{when(e.get("updated"))}<p class="meta">Age {age}</p></td>'
+            + '<td><span class="badge' + (' overdue' if overdue(name) else '') + '">' + ('Overdue · ' if overdue(name) else 'Rotate by · ' if date else '') + html.escape(date or 'No schedule') + '</span></td>'
+            + '<td><div class="row-actions">' + vault_form(action, csrf, "rotate-form", hidden("name", name), "Rotate", "quiet")
+            + vault_form(action, csrf, "delete", hidden("name", name), "Delete…", "quiet") + '</div></td></tr>')
+    lifetime = f'Link ends {time.strftime("%H:%M", time.localtime(expires))}.' if expires else "This page stays up until you stop it."
+    toolbar = '<label>Search names, notes or services<input name="query" value="' + html.escape(query) + '" placeholder="Search credentials"></label><label>Schedule<select name="status"><option value="all">All keys</option><option value="overdue"' + (' selected' if status == 'overdue' else '') + '>Overdue</option></select></label>'
+    body = '<p class="meta">' + html.escape(title) + ' / VAULT</p><h1>Credentials</h1><p>Manage access. Keep secrets out of sight.</p>'
+    body += '<div class="metrics"><span><strong>' + str(len(entries)) + '</strong>keys</span><span><strong>' + str(sum(overdue(n) for n in entries)) + '</strong>overdue</span></div>'
+    body += (f'<p class="ok" role="status">{html.escape(flash)}</p>' if flash else '') + (f'<p class="err" role="alert">{html.escape(error)}</p>' if error else '')
+    body += vault_form(action, csrf, "search", '<div class="toolbar">' + toolbar + '</div>', "Filter", "quiet")
+    body += '<table><thead><tr><th>Name / note</th><th>Created</th><th>Updated / age</th><th>Rotation</th><th>Actions</th></tr></thead><tbody>' + (''.join(rows) or '<tr><td>No matching keys. Add your first credential below.</td></tr>') + '</tbody></table>'
+    body += '<h2>Add a credential</h2>' + vault_form(action, csrf, "new", '<label>Proposed template</label><select name="template"><option value="">Single secret</option>' + ''.join('<option>' + t + '</option>' for t in (TEMPLATES if credentials_enabled() else [])) + '</select>', "Continue")
+    body += '<details><summary>Activity · recent outcomes</summary><p class="meta">Names, times and outcomes only. Latest 100 events.</p><table><thead><tr><th>Time</th><th>Name</th><th>Outcome</th></tr></thead><tbody>' + ''.join('<tr>' + ''.join('<td>' + html.escape(v) + '</td>' for v in ev) + '</tr>' for ev in read_activity()) + '</tbody></table></details>'
+    body += f'<p class="meta">{lifetime} Values are write-only here.</p>' + vault_form(action, csrf, "done", "", done_label, "quiet")
     return PAGE.format(body=body)
 
 
@@ -997,22 +1495,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self._authorised()
         if path:
-            self._send(200, render_form(self.server.name, self.server.note, path).encode())
+            self._send(200, render_form(self.server.name, self.server.note, path, schema=self.server.schema, expires=getattr(self.server, "expires", None)).encode())
 
     def do_POST(self):
         path = self._authorised()
         if not path:
             return
-        fields = self._read_form(4)
+        fields = self._read_form(90)
         if fields is None:
             return
-        value = (fields.get("value") or [""])[0].strip()
-        if not value:
-            self._send(400, render_form(self.server.name, self.server.note, path,
-                                        "Nothing was entered.").encode())
+        proposal = self.server.schema
+        try:
+            if field(fields, "schema"):
+                proposal = validate_schema(schema_json(field(fields, "schema")))
+            if field(fields, "action") == "edit-schema":
+                schema = schema_from_editor(fields)
+                self._send(200, render_form(self.server.name, self.server.note, path, schema=schema, expires=getattr(self.server, "expires", None)).encode())
+                return
+            value, schema = submitted_item(fields, self.server.schema)
+            if not STORE.fits(self.server.name, value, bool(schema)):
+                raise KeydropError(TOO_LONG)
+        except (KeydropError, ValueError) as e:
+            message = str(e) if isinstance(e, KeydropError) else "Invalid credential schema."
+            self._send(400, render_form(self.server.name, self.server.note, path, message, proposal, getattr(self.server, "expires", None)).encode())
             return
         try:
-            keychain_store(self.server.name, value)
+            STORE.store(self.server.name, value, typed=bool(schema))
+            # A one-shot store keeps whatever rotate-by date the owner set.
+            write_item_meta(self.server.name, schema,
+                            read_items().get(self.server.name, {}).get("rotate_by", ""))
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.outcome = "store-failed"
             self._send(500, render_message("Couldn't store it. Tell whoever sent you the link.").encode())
@@ -1047,15 +1558,15 @@ class VaultHandler(Handler):
         if path:
             self._page(path)
 
-    def _page(self, path, code=200, error=""):
+    def _page(self, path, code=200, error="", query="", status="all"):
         srv = self.server
         flash, srv.flash = srv.flash, ""
         try:
-            entries = keychain_entries()
-        except (OSError, subprocess.TimeoutExpired):
+            entries = STORE.list()
+        except (KeydropError, OSError, subprocess.TimeoutExpired):
             entries, error = {}, error or "Couldn't read the keychain."
         self._send(code, render_vault(path, srv.issue_csrf(), entries, read_notes(), srv.expires,
-                                      flash, error, srv.title, srv.done_label).encode())
+                                      flash, error, srv.title, srv.done_label, query, status).encode())
 
     def _done(self, path, flash):
         self.server.flash = flash
@@ -1087,7 +1598,7 @@ class VaultHandler(Handler):
         path = self._authorised()
         if not path:
             return
-        fields = self._read_form(8)
+        fields = self._read_form(90)
         if fields is None:
             return
         try:
@@ -1106,6 +1617,33 @@ class VaultHandler(Handler):
             fields = None
 
     def _act(self, path, act, fields):
+        if act in ("search", "new", "edit-schema", "rotate-form"):
+            try:
+                if act == "search":
+                    self._page(path, query=field(fields, "query")[:200], status=field(fields, "status"))
+                    return
+                name = field(fields, "name")
+                target = field(fields, "target") or "add"
+                schema = None
+                if act == "new":
+                    template = field(fields, "template")
+                    schema = template_schema(template) if template else None
+                    name, target = "", "add"
+                elif act == "edit-schema":
+                    schema = schema_from_editor(fields)
+                    if target not in ("add", "rotate") or (name and not valid_name(name)):
+                        raise KeydropError("Invalid item.")
+                else:
+                    if not valid_name(name) or not STORE.exists(name):
+                        raise KeydropError("Item no longer exists.")
+                    schema = read_items().get(name, {}).get("schema")
+                    target = "rotate"
+                check_policy(schema)
+                rotate_by = read_items().get(name, {}).get("rotate_by", "") if target == "rotate" else ""
+                self._send(200, render_entry(path, self.server.issue_csrf(), name, schema, target, rotate_by).encode())
+            except (KeydropError, OSError, subprocess.TimeoutExpired) as e:
+                self._page(path, 400, str(e) if isinstance(e, KeydropError) else "Couldn't read the keychain.")
+            return
         name = field(fields, "name").strip()
         if act == "done":
             self.server.outcome = self.server.done_outcome
@@ -1114,14 +1652,14 @@ class VaultHandler(Handler):
         if act == "back":
             self._done(path, "")
             return
-        if act not in ("add", "replace", "delete", "delete-confirm"):
+        if act not in ("add", "replace", "rotate", "delete", "delete-confirm"):
             self._page(path, 400, "Unknown action.")
             return
         if not valid_name(name):
             self._page(path, 400, "Names are a-z, 0-9, . _ - and up to 64 characters.")
             return
         try:
-            exists = keychain_exists(name)
+            exists = STORE.exists(name)
         except (OSError, subprocess.TimeoutExpired):
             self._page(path, 500, "Couldn't read the keychain.")
             return
@@ -1152,12 +1690,13 @@ class VaultHandler(Handler):
         if self._rate_limited(path, name, "delete"):
             return
         try:
-            keychain_delete(name)
+            STORE.delete(name)
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.audit(name, "delete failed")
             self._page(path, 500, f"Couldn't delete {name}.")
             return
         write_note(name, None)
+        write_item_meta(name, None, None)
         self.server.audit(name, "deleted")
         self._done(path, f"Deleted {name}.")
 
@@ -1167,14 +1706,20 @@ class VaultHandler(Handler):
         except KeydropError as e:
             self._page(path, 400, str(e).replace("--note", "The note"))
             return
-        value = field(fields, "value").strip()
-        if not value:
-            self._page(path, 400, "Nothing was entered.")
+        try:
+            previous = read_items().get(name, {})
+            value, schema = submitted_item(fields, previous.get("schema") if act != "add" else None)
+            rotate_by = rotation_date(field(fields, "rotate_by")) if "rotate_by" in fields else previous.get("rotate_by", "")
+            if not STORE.fits(name, value, bool(schema)):
+                raise KeydropError(TOO_LONG)
+        except (KeydropError, ValueError) as e:
+            self._page(path, 400, str(e) if isinstance(e, KeydropError) else "Invalid field.")
             return
         if self._rate_limited(path, name, act):
             return
         try:
-            keychain_store(name, value)
+            STORE.store(name, value, typed=bool(schema))
+            write_item_meta(name, schema, rotate_by)
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.audit(name, f"{act} failed")
             self._page(path, 500, f"Couldn't store {name}.")
@@ -1254,8 +1799,9 @@ class Server(http.server.HTTPServer):
 
 
 class OneShot(Server):
-    def __init__(self, token, name, note, pin=True, port=0):
+    def __init__(self, token, name, note, pin=True, port=0, schema=None):
         super().__init__(Handler, token, name, note, pin, port)
+        self.schema = schema
 
 
 class Vault(Server):
@@ -1417,7 +1963,54 @@ def claim_port(make, in_use, tries=PORT_PICK_TRIES):
     raise KeydropError(f"no free loopback port serve isn't already using after {tries} tries")
 
 
-def request(name, note, ttl, plain_http=False):
+def request_schema(name, typ=None, template=None, fields_arg=None, schema_path=None):
+    """The field definition a `request` proposes, or None for a single secret.
+
+    --type secret|credential is SPEC 6; --fields a,b picks credential's
+    optional fields (SPEC 5.3). A JSON list in --fields, --schema and
+    --template (or --type <template>) define other services' fields."""
+    if not valid_name(name):
+        raise RefusedError("name must be [a-z0-9._-], 1-64 chars")
+    if template is not None and typ is not None:
+        raise RefusedError("choose one of --type and --template")
+    typ = typ if typ is not None else template
+    json_fields = fields_arg is not None and fields_arg.lstrip().startswith("[")
+    if fields_arg is not None and not json_fields:
+        if typ not in (None, "credential") or schema_path is not None:
+            raise RefusedError("--fields a,b goes with --type credential")
+        return credential_schema(name, [f.strip() for f in fields_arg.split(",") if f.strip()])
+    if sum(x is not None for x in (schema_path, typ, fields_arg)) > 1:
+        raise RefusedError("choose one of --schema, --fields or --type")
+    try:
+        if schema_path is not None:
+            with open(schema_path) as f:
+                raw = f.read(16385)
+            if len(raw) > 16384:
+                raise ValueError()
+            return validate_schema(schema_json(raw))
+        if json_fields:
+            return validate_schema({"service": name, "fields": schema_json(fields_arg)})
+    except (OSError, ValueError):
+        raise RefusedError("can't read a valid schema")
+    if typ == "secret":
+        return None
+    if typ == "credential":
+        return credential_schema(name)
+    if typ is not None:
+        if typ not in TEMPLATES:
+            raise RefusedError(f"unknown type {typ!r} (secret, credential or one of: {', '.join(TEMPLATES)})")
+        return template_schema(typ)
+    # A bare name that matches a multi-field template proposes it, but only
+    # where credentials are on: elsewhere `request <name>` stays the plain
+    # secret it always was, and so does `get <name>`.
+    if name in TEMPLATES and len(TEMPLATES[name]) > 1 and credentials_enabled():
+        return template_schema(name)
+    return None
+
+
+def request(name, note, ttl, plain_http=False, schema=None):
+    schema = validate_schema(schema) if schema else None
+    check_policy(schema)
     if not valid_name(name):
         raise KeydropError("name must be [a-z0-9._-], 1-64 chars")
     note = clean_note(note)
@@ -1427,7 +2020,8 @@ def request(name, note, ttl, plain_http=False):
         raise KeydropError(f"a request for {name} is already pending (keydrop cancel {name})")
     host = tailnet_host(plain_http)
     token = secrets.token_urlsafe(32)
-    srv = claim_port(lambda: OneShot(token, name, note, True), serve_ports_in_use())
+    srv = claim_port(lambda: OneShot(token, name, note, True, schema=schema), serve_ports_in_use())
+    srv.expires = time.time() + ttl
     return launch(srv, token, {"name": name, "note": note}, ttl, host, plain_http)
 
 
@@ -1882,7 +2476,17 @@ def home_unlock():
 
 # ---------- cli ----------
 
-USAGE = __doc__.split("\n\n")[1]
+USAGE = __doc__.split("\n\n")[1] + """
+    request <name> --type credential [--fields totp,url,notes]
+                                          username + password, plus the optional fields asked for
+    request <name> --template <service>   propose a known service's fields (also --type <service>)
+    request <name> --schema <file.json>   a validated service + field definition
+    request <name> --fields '<JSON list>' custom fields (definitions, never values)
+    request <name> --type secret          one value, the default
+
+Anything but secret needs "types_enabled": ["secret", "credential"] in
+policy.json in the state directory. SPEC.md section 5 has the field model.
+"""
 
 
 NO_LOCAL = ("has no --local: a loopback listener with no serve route on its port is "
@@ -1967,10 +2571,19 @@ def main(argv):
             return 0
         if cmd == "request":
             name, note, ttl, plain_http = None, "", DEFAULT_TTL, False
+            schema_path, typ, template, fields_arg = None, None, None, None
             it = iter(rest)
             for a in it:
                 if a == "--note":
                     note = next(it, "")
+                elif a == "--schema":
+                    schema_path = next(it, "")
+                elif a == "--type":
+                    typ = next(it, "")
+                elif a == "--template":
+                    template = next(it, "")
+                elif a == "--fields":
+                    fields_arg = next(it, "")
                 elif a == "--ttl":
                     ttl = parse_ttl(next(it, ""))
                 elif a == "--http":
@@ -1983,8 +2596,9 @@ def main(argv):
                     raise KeydropError(f"unexpected argument {a!r}")
             if name is None:
                 raise KeydropError("request needs a name")
+            schema = request_schema(name, typ, template, fields_arg, schema_path)
             require_owner()
-            print(request(name, note, ttl, plain_http))
+            print(request(name, note, ttl, plain_http, schema))
             return 0
         if cmd == "vault":
             ttl, plain_http = DEFAULT_TTL, False
@@ -2003,18 +2617,22 @@ def main(argv):
             return 0
         if cmd == "home":
             return home_cli(rest)
-        if cmd == "get" and len(rest) == 1:
+        if cmd == "get" and (len(rest) == 1 or len(rest) == 3 and rest[1] == "--field"):
             if not valid_name(rest[0]):
                 raise KeydropError("bad name")
-            value = keychain_get(rest[0])
+            value = STORE.get(rest[0])
             if value is None:
                 print(f"keydrop: no key named {rest[0]}", file=sys.stderr)
                 return 1
+            value = item_value(rest[0], value, rest[2] if len(rest) == 3 else None)
             sys.stdout.write(value + ("\n" if sys.stdout.isatty() else ""))
             return 0
-        if cmd == "list" and not rest:
-            for n in keychain_list():
-                print(n)
+        if cmd == "list" and rest in ([], ["--long"]):
+            entries = STORE.list()
+            for n in sorted(entries):
+                e = entries[n]
+                print("\t".join([n, e.get("type", "secret"), iso(e.get("created")), iso(e.get("updated"))])
+                      if rest else n)
             return 0
         if cmd == "status" and not rest:
             lines = status_lines()
@@ -2029,7 +2647,7 @@ def main(argv):
         return 2
     except KeydropError as e:
         print(f"keydrop: {e}", file=sys.stderr)
-        return 1
+        return e.exit_code
 
 
 if __name__ == "__main__":

@@ -75,9 +75,10 @@ in effect.
 ## Use
 
     keydrop request <name> [--note "what it's for"] [--ttl 15m] [--http]
+                    [--type secret|credential|<template>] [--fields totp,url,notes]
     keydrop vault [--ttl 15m] [--http]
-    keydrop get <name>
-    keydrop list
+    keydrop get <name> [--field F]
+    keydrop list [--long]
     keydrop status
     keydrop cancel <name>          (cancel vault ends a vault session)
     keydrop home                   always-on vault page, for launchd
@@ -104,6 +105,34 @@ stdout isn't a terminal, so `KEY=$(keydrop get openai-api-key)` works.
 `keydrop vault` prints a session link to a page that lists names, notes and
 times and lets you add, replace and delete entries under the service prefix.
 It never shows a stored value.
+
+### Credentials and other typed items
+
+By default every item is a single secret. To accept logins, turn the type on
+in `policy.json` in the state dir:
+
+    {"types_enabled": ["secret", "credential"],
+     "credential_fields_enabled": ["url", "notes"]}
+
+`keydrop request staging-admin --type credential --fields url` then shows
+username, password and website inputs, and `keydrop get staging-admin --field
+password` reads one field back. `get` on a typed item without `--field`
+refuses, so a careless `get` can't print a username next to its password.
+`credential_fields_enabled` limits which optional fields (`totp`, `url`,
+`notes`) a request may ask for; leave it out to allow all three. A refused
+request exits 2 and opens nothing.
+
+`--type` also takes a built-in template (`api-key`, `username-password`,
+`aws`, `google-oauth`, `stripe` and others), and `--fields '<JSON list>'` or
+`--schema <file>` proposes any fields an agent needs; the owner can edit the
+proposed fields on the page before storing. The type, field names and an
+optional rotate-by date are kept in `items.json` in the state dir (mode
+0600), never the values. The vault and home pages search items, flag overdue
+rotations and show recent activity.
+
+The keychain marks a typed item in its label, so the type survives losing the
+state dir. One keychain item holds about 1.9 KB once encoded; a bigger item is
+refused before anything is written, and an existing value stays as it was.
 
 ### The home page under launchd
 
@@ -205,8 +234,9 @@ don't put secrets in them.
 
     tests/keydrop-test
     tests/keydrop-home-test
+    tests/keydrop-management-test
 
-Neither suite touches a real keychain or a real tailnet. `security` is a fake
+No suite touches a real keychain or a real tailnet. `security` is a fake
 (`tests/fakes.py`) that keeps items in a JSON file, and `tailscale` is a stub
 that keeps the serve config in another JSON file. Pages run on 127.0.0.1, and
 the suites send the headers serve would set. They do bind loopback ports and

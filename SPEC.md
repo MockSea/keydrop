@@ -211,7 +211,7 @@ Every field has:
 |---|---|
 | `id` | lowercase identifier, used in the form and in `get --field` |
 | `label` | exact text shown above the input |
-| `kind` | `secret`, `text` or `url` |
+| `kind` | `secret`, `text`, `url` or `select` (one of a fixed `options` list) |
 | `required` | whether the submit is refused without it |
 | `max` | maximum length in bytes after UTF-8 encoding |
 | `check` | optional validation, applied server-side |
@@ -220,6 +220,10 @@ Fields of kind `secret` are covered by I5 and I8. They use a password input
 with the no-save attributes in 7.3. Fields of kind `text` and `url` are also
 never logged, and never rendered back, but they use visible inputs so the
 owner can check what they typed.
+
+The reference implementation's schema JSON spells `id` as `name`, and accepts
+one `check`, `"totp"`, on a `secret` field. Any other key in a field is
+refused.
 
 ### 5.2 `secret`
 
@@ -265,6 +269,17 @@ per item:
   `{"keydrop":1,"type":"credential","fields":{"username":"…","password":"…"}}`,
   with absent optional fields omitted.
 
+An adapter without native types MUST be able to tell a typed item from a raw
+secret without any keydrop-side file, so the type survives losing keydrop's
+state. The keychain adapter appends `.credential-v1` to the item's label and
+reads it back after every store.
+
+An adapter whose write channel has a size limit reports it as `max_bytes`
+(8.1) and refuses a larger item before calling the store, leaving any existing
+item untouched. The keychain adapter's limit is about 1.9 KB per item, encoded:
+`security -i` reads at most 4096 characters per line, and the value goes on
+the line as hex.
+
 ### 5.5 Policy
 
 Each implementation reads a policy with at least:
@@ -276,6 +291,9 @@ Each implementation reads a policy with at least:
 
 A request for a disabled type or field is refused with
 `keydrop: <type> requests are turned off on this machine` and exit status 2.
+The reference names the field when a field is the reason
+(`credential requests with a totp field are turned off on this machine`).
+When `credential_fields_enabled` is absent, every optional field is allowed.
 The vault and home pages offer only enabled types.
 
 ### 5.6 Names
@@ -305,6 +323,19 @@ request (bad name, disabled type, invalid TTL, policy), 3 for a vault or
 transport failure. `--ttl` accepts `<n>s`, `<n>m` or `<n>h`.
 
 No command takes a value as an argument or from an environment variable.
+
+The reference adds, beyond this contract:
+
+- `request <name> --type <template>` or `--template <name>` proposes a
+  built-in field set (`api-key`, `username-password`, `aws` and others);
+  `--fields '<JSON list>'` or `--schema <file>` proposes custom fields. The
+  owner can edit proposed fields on the page before storing. A bare name that
+  matches a multi-field template proposes it only when credentials are
+  enabled.
+- `list` prints names only, one per line, for scripts; `list --long` adds
+  type, created and updated (ISO 8601, UTC), tab-separated.
+- `get <name> --field F` is required for every non-secret item, not just
+  credentials.
 
 ## 7. UX contract
 
@@ -612,8 +643,8 @@ black-box, against the command interface (section 6) and HTTP, so they apply
 to any language. Most need a fake vault and a stub transport, so that a test
 never touches a real store or a real network.
 
-The reference implementation's suites (`tests/keydrop-test` and
-`tests/keydrop-home-test`) cover most of these checks today, but they are
+The reference implementation's suites (`tests/keydrop-test`,
+`tests/keydrop-home-test` and `tests/keydrop-management-test`) cover most of these checks today, but they are
 white-box Python: they import `keydrop` and call its functions. Turning them
 into a reusable suite means running them against a command and a port
 instead. Until then, they are the worked example for each check, listed in the
@@ -656,8 +687,8 @@ last column.
 | C-19 | Every state in 7.2 renders the exact copy and status | 7 | partly, in the suites' body checks |
 | C-20 | Names outside `^[a-z0-9._-]{1,64}$` are refused before reaching the vault | 5.6 | `test_units`, `test_vault_render_units` |
 | C-21 | TTL parses `s`, `m`, `h`, and refuses zero, over an hour, and junk | I2 | `test_units` |
-| C-22 | A disabled type or field is refused at `request` with exit 2 and no route opened | I12 | none yet |
-| C-23 | A credential stores and reads back every requested field, and `get` without `--field` refuses | 5.3 | none yet |
+| C-22 | A disabled type or field is refused at `request` with exit 2 and no route opened | I12 | `test_spec_credential`, `test_field_policy_refuses_with_exit_2_before_transport`, `test_types_disabled_refuses_with_exit_2` |
+| C-23 | A credential stores and reads back every requested field, and `get` without `--field` refuses | 5.3 | `test_spec_credential`, `test_typed_local`, `test_cli_schema_and_get` |
 | C-24 | Vault page: every POST needs a form token, cross-site Fetch Metadata and foreign Origin are refused, GET changes nothing, delete confirms | 7.4 | `test_vault_local`, `test_csrf`, `test_fetch_metadata` |
 | C-25 | Vault and home delete reach only the namespace | 8.1 | `test_vault_render_units`, `test_writes` |
 | C-26 | Home: strikes need the owner's identity and same-origin Fetch Metadata; the lockout and rate limit persist across restarts | I10 | `test_strangers_cant_lock`, `test_lockout`, `test_rate_limit`, `test_peer_flood`, `test_flood` |
@@ -768,13 +799,20 @@ Things to watch:
 The reference keeps working as it is. These are the differences between it
 and the spec, for whoever brings it into line:
 
-- **No item types.** It has one field, `value`. There is no `--type`,
-  `--fields` or `get --field`, and no policy keys. Adding them means a JSON
-  envelope for non-secret types (5.4) and the credential form (7.3).
-- **No adapter seam.** The keychain calls (`keychain_*`) and the Tailscale
-  calls (`ts()`, `serve_*`, `route_ours`) are called directly. Splitting them
-  behind the interfaces in 8.1 and 9.1 would let a second adapter share the
-  page and handler code.
+- **Item types.** `secret` and `credential` follow 5.2 and 5.3, plus the
+  templates and custom fields in section 6. Form inputs are named `f_<id>`,
+  not `<id>` as in 7.3, and the page carries the schema in a hidden `schema`
+  field that the server re-validates. `select` is an extra field kind.
+- **Partial adapter seam.** The pages and commands reach the keychain only
+  through `STORE`, a `KeychainVault` with the 8.1 methods plus `fits()`;
+  `store` takes the encoded string, not `{type, fields}`. The Tailscale calls
+  (`ts()`, `serve_*`, `route_ours`) are still called directly, so a second
+  transport would need the 9.1 split first.
+- **Vault and home copy.** The pages were redesigned as a key-management view
+  (search, rotation dates, activity), and their copy no longer matches the
+  7.4 table: the empty list reads `No matching keys. Add your first credential
+  below.`, the add section is `Add a credential`, and items have `Rotate` and
+  `Delete…` actions. 7.4 should be rewritten against the new pages.
 - **States.** It has no S-EXPIRED, S-CANCELLED or S-USED screens, and no
   `Link ends HH:MM.` line on the request form. Once a page is done it is
   S-GONE, which this spec allows.
@@ -785,8 +823,10 @@ and the spec, for whoever brings it into line:
   is the same everywhere. The home stop message says "on the Mac".
 - **Labels.** The request form's input has no label (the heading names the
   item). That stays as the `secret` layout.
-- **Exit codes.** Its exit statuses don't follow section 6 exactly.
-- **Tests.** The suites are white-box (10, intro). C-22 and C-23 don't exist.
+- **Exit codes.** Refusals (bad type or fields, disabled type or field)
+  exit 2. Everything else that fails exits 1, including vault and transport
+  failures that section 6 puts at 3.
+- **Tests.** The suites are white-box (10, intro).
 
 ## 13. Open questions
 
