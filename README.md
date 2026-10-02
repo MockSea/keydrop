@@ -11,6 +11,15 @@ reads the value back with `keydrop get <name>`.
 It is one Python file with no dependencies beyond the standard library, the
 `security` CLI that ships with macOS, and `tailscale`.
 
+This repo holds two things. `SPEC.md` describes what any keydrop must do:
+the flow, the item types, the page and its wording, the invariants, the
+vault and transport adapter interfaces, and the conformance checks. It is
+written so that keydrop can be rebuilt on Linux or Windows, with 1Password,
+Bitwarden, pass, KeePassXC or another store, and with or without Tailscale.
+The `keydrop` script is the reference implementation of that spec, for macOS,
+the login keychain and `tailscale serve`. Section 12 of the spec lists where
+it doesn't match the spec yet.
+
 ## Requirements
 
 - macOS. The vault is the login keychain, driven through `/usr/bin/security`.
@@ -139,8 +148,9 @@ stops working.
 
 ## Threat model
 
-The full design, and the reasoning behind each check, is in
-`skills/keydrop-setup/SKILL.md` and the docstring at the top of `keydrop`.
+The invariants every implementation keeps are in `SPEC.md` section 4. The
+reasoning behind each check in this implementation is in the docstring at the
+top of `keydrop`.
 
 What it defends against:
 
@@ -207,8 +217,18 @@ do one request by hand.
 
 ## Agent skill
 
-`skills/keydrop-setup/SKILL.md` teaches a coding agent to install and
-configure keydrop and to ask for secrets through it instead of in chat.
+`skills/keydrop-setup/SKILL.md` is written for any coding agent, in any
+harness. It walks the agent through taking stock of the machine, choosing a
+vault and transport (the reference implementation where it fits, adapters
+built to `SPEC.md` where it doesn't), proving conformance, and then asking
+for secrets through a link instead of in chat.
+
+## Contributing
+
+We'd love feedback and new use cases, from a vault we haven't covered to a
+harness that wants credentials. Open an issue describing what you're trying
+to do. `CONTRIBUTING.md` has the steps for contributing an adapter or item
+type and says how contributions are reviewed.
 
 ## License
 

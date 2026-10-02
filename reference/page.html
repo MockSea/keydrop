@@ -1,0 +1,153 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>keydrop screens</title>
+<!--
+  Reference screens for SPEC.md section 7. Each <section> is the {body} of
+  one screen; a real page holds exactly one of them inside the shell below,
+  with no <section>, no screen label and no <hr>. The labels (.screen) exist
+  only on this sheet. Values in braces are placeholders: {name} = the item
+  name, {path} = the link path, {csrf} = the form token.
+  Open this file in a browser to see every state at once.
+-->
+<style>
+body{font:17px -apple-system,system-ui,sans-serif;margin:0;padding:24px;max-width:480px}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:17px;margin:28px 0 8px} p{color:#555;margin:0 0 20px}
+label{display:block;font-size:14px;color:#555;margin:0 0 4px}
+input,button{font:inherit;width:100%;box-sizing:border-box;padding:14px;border-radius:10px}
+input{border:1px solid #bbb;margin-bottom:12px} button{border:0;background:#111;color:#fff}
+.err{color:#b00} .ok{color:#070} .meta{color:#777;font-size:14px;margin:2px 0 0}
+.item{border-top:1px solid #ddd;padding:12px 0} .item b{word-break:break-all}
+summary{color:#06c;margin-top:6px} details form{margin-top:10px}
+button.del{background:#b00} button.quiet{background:#eee;color:#111;margin-top:28px}
+.meta+form{margin-top:16px} .meta+.err{margin-top:12px}
+/* sheet only */
+.screen{font:12px ui-monospace,monospace;color:#999;margin:0 0 8px}
+hr{border:0;border-top:2px dashed #ccc;margin:36px 0}
+</style></head><body>
+
+<section id="S-FORM-secret">
+<p class="screen">S-FORM, type secret (200)</p>
+<h1>openai-api-key</h1>
+<p>for the summariser</p>
+<p class="meta">Link ends 14:32.</p>
+<form method="post" action="{path}" autocomplete="off">
+<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required>
+<button type="submit">Store</button></form>
+</section>
+<hr>
+
+<section id="S-FORM-credential">
+<p class="screen">S-FORM, type credential, --fields totp,url,notes (200)</p>
+<h1>staging-admin</h1>
+<p>login for the staging dashboard</p>
+<p class="meta">Link ends 14:32.</p>
+<form method="post" action="{path}" autocomplete="off">
+<label for="username">Username</label>
+<input id="username" name="username" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required>
+<label for="totp">One-time code secret (optional)</label>
+<input id="totp" name="totp" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+<label for="url">Website (optional)</label>
+<input id="url" name="url" type="url" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+<label for="notes">Notes (optional)</label>
+<input id="notes" name="notes" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+<button type="submit">Store</button></form>
+</section>
+<hr>
+
+<section id="S-EMPTY">
+<p class="screen">S-EMPTY (400, link not used up)</p>
+<h1>openai-api-key</h1>
+<p>for the summariser</p>
+<p class="meta">Link ends 14:32.</p>
+<p class="err">Nothing was entered.</p>
+<form method="post" action="{path}" autocomplete="off">
+<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required>
+<button type="submit">Store</button></form>
+</section>
+<hr>
+
+<section id="S-INVALID">
+<p class="screen">S-INVALID (400, link not used up; form re-rendered as above)</p>
+<p class="err">One-time code secret doesn't look right.</p>
+</section>
+<hr>
+
+<section id="S-STORED"><p class="screen">S-STORED (200)</p>
+<h1>Stored. You can close this.</h1></section>
+<hr>
+<section id="S-BAD-FORM"><p class="screen">S-BAD-FORM (400)</p>
+<h1>That didn't look like the form.</h1></section>
+<hr>
+<section id="S-STORE-FAILED"><p class="screen">S-STORE-FAILED (500)</p>
+<h1>Couldn't store it. Tell whoever sent you the link.</h1></section>
+<hr>
+<section id="S-STALE"><p class="screen">S-STALE (403, vault and home only)</p>
+<h1>That form is stale. Reload the page.</h1></section>
+<hr>
+<section id="S-EXPIRED"><p class="screen">S-EXPIRED (410, only while a listener is still up)</p>
+<h1>This link has expired. Ask for a new one.</h1></section>
+<hr>
+<section id="S-CANCELLED"><p class="screen">S-CANCELLED (410, only while a listener is still up)</p>
+<h1>This link was cancelled. Nothing was stored.</h1></section>
+<hr>
+<section id="S-USED"><p class="screen">S-USED (410, only while a listener is still up)</p>
+<h1>This link has already been used.</h1></section>
+<hr>
+<section id="S-REFUSED"><p class="screen">S-REFUSED (404, empty body). Wrong user, wrong token, wrong Host, route not ours.</p></section>
+<hr>
+<section id="S-GONE"><p class="screen">S-GONE. No response from keydrop: connection refused, or the transport's own error.</p></section>
+<hr>
+
+<section id="V-LIST">
+<p class="screen">Vault session (200). Home is the same with title "keydrop", the home lifetime line and "Stop this page".</p>
+<h1>keydrop vault</h1>
+<p class="meta">Link ends 14:32. Values are write-only here.</p>
+<p class="ok">Stored openai-api-key.</p>
+<div class="item"><b>openai-api-key</b>
+<p class="meta">for the summariser</p>
+<p class="meta">added Oct 1 14:05 · updated Oct 1 14:17</p>
+<details><summary>Replace or delete</summary>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="replace"><input type="hidden" name="name" value="openai-api-key"><input type="password" name="value" placeholder="new value" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required><input type="text" name="note" placeholder="note (blank keeps it)" maxlength="200"><button type="submit">Replace</button></form>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="delete"><input type="hidden" name="name" value="openai-api-key"><button type="submit" class="del">Delete…</button></form>
+</details></div>
+<div class="item"><b>staging-admin</b>
+<p class="meta">credential · added Oct 1 14:20 · updated Oct 1 14:20</p></div>
+<h2>Add</h2>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="add"><input type="text" name="name" placeholder="name (a-z 0-9 . _ -)" required maxlength="64" pattern="[a-z0-9._\-]{1,64}" autocapitalize="off" autocorrect="off" spellcheck="false"><input type="text" name="note" placeholder="note (optional)" maxlength="200"><input type="password" name="value" placeholder="value" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required><button type="submit">Store</button></form>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="done"><button type="submit" class="quiet">Done, close this link</button></form>
+</section>
+<hr>
+
+<section id="V-EMPTY"><p class="screen">Vault, nothing stored</p>
+<h1>keydrop vault</h1>
+<p class="meta">Link ends 14:32. Values are write-only here.</p>
+<p class="meta">Nothing stored yet.</p></section>
+<hr>
+
+<section id="V-CONFIRM">
+<p class="screen">Vault, confirm delete (200)</p>
+<h1>Delete openai-api-key?</h1><p>It goes from the vault for good.</p>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="delete-confirm"><input type="hidden" name="name" value="openai-api-key"><button type="submit" class="del">Delete openai-api-key</button></form>
+<form method="post" action="{path}" autocomplete="off"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="back"><button type="submit" class="quiet">Keep it</button></form>
+</section>
+<hr>
+
+<section id="V-ERRORS"><p class="screen">Vault errors, shown as &lt;p class="err"&gt; on the list page</p>
+<p class="err">openai-api-key already exists. Use Replace on it instead.</p>
+<p class="err">There's no openai-api-key.</p>
+<p class="err">Too many changes in the last hour. Try again later.</p>
+<p class="err">Couldn't read the vault.</p>
+<p class="err">Couldn't store openai-api-key.</p>
+<p class="err">Couldn't delete openai-api-key.</p></section>
+<hr>
+
+<section id="V-END"><p class="screen">Vault closed / home stopped (200)</p>
+<h1>Closed. The link is dead now.</h1>
+<h1>Stopped. It stays down until keydrop home --unlock is run on this machine.</h1></section>
+
+</body></html>
