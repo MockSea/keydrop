@@ -32,14 +32,14 @@
     <h1>Written so keydrop can be rebuilt anywhere.</h1>
     <p class="lead"><code>SPEC.md</code> fixes what any keydrop must do: the flow, the item types, the page and its exact wording, the invariants, the vault and transport adapter interfaces, and the conformance checks. It's written so keydrop can be rebuilt on Linux or Windows, with 1Password, Bitwarden, pass, KeePassXC or another store, and with or without Tailscale. The Python script is the reference implementation, for macOS, the login keychain and <code>tailscale serve</code>.</p>
     <div class="cta">
-      <a class="btn solid" href="https://github.com/MockSea/keydrop/blob/pages-site/SPEC.md">Read SPEC.md <span class="arr">→</span></a>
+      <a class="btn solid" href="https://github.com/MockSea/keydrop/blob/main/SPEC.md">Read SPEC.md <span class="arr">→</span></a>
     </div>
     <nav class="page-nav" aria-label="On this page">
       <a href="#invariants">Invariants</a>
       <a href="#adapters">Adapters</a>
       <a href="#conformance">Conformance</a>
       <a href="#behind">Behind the spec</a>
-      <a href="#next">What's coming</a>
+      <a href="#next">What's new</a>
     </nav>
   </div>
 </div>
@@ -117,13 +117,13 @@ ledger</code></pre>
       <p>Section 12 of the spec keeps this list. As of now:</p>
     </div>
     <ul class="plain">
-      <li>No item types. It has one field, <code>value</code>, with no <code>--type</code>, <code>--fields</code>, <code>get --field</code> or policy keys.</li>
-      <li>No adapter seam. The keychain and Tailscale calls are made directly, not behind the interfaces above.</li>
+      <li>The vault seam is in (<code>STORE</code>, 8.1) but the Tailscale calls are still made directly, so a second transport needs the 9.1 split first.</li>
+      <li>The vault and home pages were redesigned as a key-management view, and their copy no longer matches the 7.4 table.</li>
       <li>No expired, cancelled or used screens, and no "Link ends HH:MM." line on the request form. A finished page is simply gone, which the spec allows.</li>
       <li>A blank submit answers "Nothing was entered." as a message page instead of re-rendering the form.</li>
       <li>Has an opt-in <code>--http</code> for tailnets without HTTPS certificates, which I11 and spec 9.4 rule out.</li>
       <li>Some copy says "keychain" and "on the Mac" where the spec says "vault" and "on this machine".</li>
-      <li>Exit codes don't follow section 6 exactly, and the test suites are white-box Python rather than the black-box checks.</li>
+      <li>Exit codes don't follow section 6 exactly (refusals exit 2, other failures 1), and the test suites are white-box Python rather than the black-box checks.</li>
     </ul>
   </div>
 </section>
@@ -131,14 +131,15 @@ ledger</code></pre>
 <section id="next">
   <div class="wrap">
     <div class="sec-head">
-      <span class="tag">Not shipped · in progress</span>
-      <h2>What's coming.</h2>
-      <p>A redesign is under way separately from the reference script. None of it is in the released code; what the rest of this site describes is what runs today.</p>
+      <span class="tag">Shipped</span>
+      <h2>What's new.</h2>
+      <p>The redesign is in the reference script now.</p>
     </div>
     <ul class="plain">
-      <li><b>Typed, multi-field credentials.</b> The spec already defines a <code>credential</code> type: username, password, and optional one-time code secret, website and notes, with the optional fields chosen per request. The reference has one field and no <code>--type</code>.</li>
-      <li><b>Fields that fit the service.</b> A request for a given service showing the fields that service actually needs, rather than one generic form.</li>
-      <li><b>A proper key-management page,</b> in place of the write-only list the vault page has today.</li>
+      <li><b>Typed, multi-field credentials.</b> A <code>credential</code> type: username, password, and optional one-time code secret, website and notes, chosen per request with <code>--type credential --fields totp,url</code>. Read one field back with <code>get --field</code>.</li>
+      <li><b>Fields that fit the service.</b> Built-in templates, or an agent proposes the fields it needs with <code>--fields</code> JSON or <code>--schema</code>. The owner can edit them on the page before storing, and the server validates whatever is posted.</li>
+      <li><b>A key-management page.</b> Search, rotate-by dates with overdue flags, activity, and delete with confirmation. Values stay write-only.</li>
+      <li><b>A size guard.</b> A value too long for the keychain tool's line limit is refused before anything is written, instead of being stored truncated.</li>
     </ul>
   </div>
 </section>
