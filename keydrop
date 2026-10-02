@@ -473,8 +473,9 @@ def check_policy(schema):
     if typ not in policy["types_enabled"]:
         raise PolicyError(f"{typ} requests are turned off on this machine")
     for f in (schema or {}).get("fields", []):
-        if f["name"] in CREDENTIAL_OPTIONAL and f["name"] not in policy["credential_fields_enabled"]:
-            raise PolicyError(f"credential requests with a {f['name']} field are turned off on this machine")
+        name = "totp" if f.get("check") == "totp" else f["name"]
+        if name in CREDENTIAL_OPTIONAL and name not in policy["credential_fields_enabled"]:
+            raise PolicyError(f"credential requests with a {name} field are turned off on this machine")
 
 
 def credentials_enabled():
@@ -642,7 +643,7 @@ def store_command(name, value, typed=False):
         raise KeydropError("bad name or config")
     line = (f"add-generic-password -U -a {ACCOUNT} -s {service(name)} "
             f"-l {service(name) + ('.credential-v1' if typed else '')} -X {value.encode('utf-8').hex()}")
-    if len(line) > SECURITY_LINE_MAX:
+    if len(line) >= SECURITY_LINE_MAX:
         raise KeydropError("too long for the keychain")
     return line + "\n"
 
