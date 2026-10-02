@@ -47,7 +47,7 @@
       <h2>Three things, nothing else.</h2>
     </div>
     <ul class="plain">
-      <li><b>macOS.</b> The vault is the login keychain, driven through <code>/usr/bin/security</code>.</li>
+      <li><b>A vault.</b> keydrop is platform agnostic: the spec defines a small vault adapter interface. The reference adapter is the macOS login keychain, driven through <code>/usr/bin/security</code>. Other systems need an adapter for their own store.</li>
       <li><b>Tailscale,</b> with <code>tailscale serve</code> available to your user and HTTPS certificates enabled for the tailnet. Without certificates every page refuses to start unless you pass <code>--http</code>, and the home page doesn't run at all.</li>
       <li><b>python3,</b> 3.9 or later. No other dependencies.</li>
     </ul>

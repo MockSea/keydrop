@@ -44,7 +44,7 @@
     <div class="sec-head">
       <span class="num">01 · How it works</span>
       <h2>One path for the value, checked on every request.</h2>
-      <p>Four parties on your Mac and one browser. The teal line is the only route the value ever takes.</p>
+      <p>Four parties on your machine and one browser. The teal line is the only route the value ever takes.</p>
     </div>
 
     <div class="diagram">
@@ -63,7 +63,7 @@
         <!-- nodes -->
         <rect class="node" x="40" y="66" width="190" height="72" rx="10"/>
         <text class="lbl" x="135" y="98" text-anchor="middle">your tool or agent</text>
-        <text class="sub" x="135" y="118" text-anchor="middle">runs on the Mac</text>
+        <text class="sub" x="135" y="118" text-anchor="middle">runs on this machine</text>
 
         <rect class="node kd" x="300" y="66" width="190" height="72" rx="10"/>
         <text class="lbl" x="395" y="98" text-anchor="middle">keydrop</text>
@@ -78,7 +78,7 @@
         <text class="sub" x="915" y="118" text-anchor="middle">any device on your tailnet</text>
 
         <rect class="node kc" x="300" y="300" width="190" height="72" rx="10"/>
-        <text class="lbl" x="395" y="332" text-anchor="middle">login keychain</text>
+        <text class="lbl" x="395" y="332" text-anchor="middle">vault</text>
         <text class="sub" x="395" y="352" text-anchor="middle">service keydrop.&lt;name&gt;</text>
 
         <!-- serve annotation -->
@@ -133,14 +133,14 @@
         <!-- nodes -->
         <rect class="node" x="12" y="16" width="160" height="64" rx="10"/>
         <text class="lbl" x="92" y="45" text-anchor="middle">your tool or agent</text>
-        <text class="sub" x="92" y="64" text-anchor="middle">runs on the Mac</text>
+        <text class="sub" x="92" y="64" text-anchor="middle">runs on this machine</text>
 
         <rect class="node kd" x="12" y="164" width="160" height="64" rx="10"/>
         <text class="lbl" x="92" y="193" text-anchor="middle">keydrop</text>
         <text class="sub" x="92" y="212" text-anchor="middle">listens on 127.0.0.1</text>
 
         <rect class="node kc" x="216" y="164" width="120" height="64" rx="10"/>
-        <text class="lbl" x="276" y="193" text-anchor="middle">login keychain</text>
+        <text class="lbl" x="276" y="193" text-anchor="middle">vault</text>
         <text class="sub" x="276" y="212" text-anchor="middle">keydrop.&lt;name&gt;</text>
 
         <rect class="node" x="12" y="312" width="160" height="64" rx="10"/>
@@ -210,7 +210,7 @@
           <li><b>The value reaching a chat, a log or argv.</b> It goes from the browser to keydrop, then to <code>security -i</code> on stdin as hex. Logs hold only name, time and outcome. Every write is read back before the page says Stored.</li>
           <li><b>Other people on your tailnet.</b> Every request needs the owner's <code>Tailscale-User-Login</code>, which <code>tailscale serve</code> sets from the connection and peers can't forge. Lookalike spellings of that header are refused.</li>
           <li><b>Guessing the link.</b> The token is 256 bits, compared in constant time. On a one-shot or vault link, five bad requests end it early. On the home page only a wrong token sent with your login counts, and five in 24 hours lock it until <code>keydrop home --unlock</code>.</li>
-          <li><b>Browsers on the Mac.</b> An exact Host allowlist stops DNS rebinding. Form tokens and Fetch Metadata stop cross-site posts, and a cross-site request can't run up strikes on the home page.</li>
+          <li><b>Browsers on this machine.</b> An exact Host allowlist stops DNS rebinding. Form tokens and Fetch Metadata stop cross-site posts, and a cross-site request can't run up strikes on the home page.</li>
           <li><b>A loopback port left open to the tailnet.</b> Under userspace networking, tailscaled forwards tailnet traffic to <code>127.0.0.1</code> on the same port when serve doesn't claim it. keydrop uses the same port on both sides, listens only after the route exists, and checks on every request that the route is still its own, exiting if not.</li>
           <li><b>Leftover routes.</b> Teardown on every exit path and a reap for killed processes. keydrop keeps a ledger of every serve route it creates and only sweeps ledger entries no live record owns, and only while the route still points where keydrop pointed it. A route keydrop didn't create is never removed.</li>
           <li><b>Funnel.</b> If Funnel gets turned on for a page's port, the page treats its route as gone: it answers a bare 404 and exits.</li>
@@ -220,7 +220,7 @@
       <div>
         <h3><i class="no" aria-hidden="true"></i>Doesn't defend against</h3>
         <ul class="plain">
-          <li><b>Anything running as you on the Mac.</b> It can run <code>keydrop get</code> or <code>security</code> itself. keydrop protects the way into the keychain, not the keychain.</li>
+          <li><b>Anything running as you on this machine.</b> It can run <code>keydrop get</code> or <code>security</code> itself. keydrop protects the way into the keychain, not the keychain.</li>
           <li><b>Local processes connecting to 127.0.0.1.</b> They can send any header. They still need the token.</li>
           <li><b>A compromised device signed in as you,</b> or anyone holding the link. Treat a link like a short-lived password.</li>
           <li><b>A compromised tailscaled, or a tailnet admin.</b></li>

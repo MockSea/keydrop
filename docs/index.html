@@ -30,7 +30,7 @@
   <div class="wrap">
     <div class="hero-grid">
       <div>
-        <span class="eyebrow">macOS <span class="dim">· Tailscale · one Python file · MIT</span></span>
+        <span class="eyebrow">Any OS <span class="dim">· Tailscale · one Python file · MIT</span></span>
         <h1>Give an agent a secret without pasting it into the chat.</h1>
         <p class="lead">A local tool asks for a key by name. keydrop prints a one-shot link on your tailnet. You open it on a device signed in to your tailnet, paste the value, and it goes straight into the login keychain. The page shuts itself down, and the tool reads the value back by name.</p>
         <div class="cta">
@@ -40,7 +40,7 @@
       </div>
       <div class="stage">
         <figure class="term">
-          <div class="bar" aria-hidden="true"><i></i><i></i><i></i><span>your Mac</span></div>
+          <div class="bar" aria-hidden="true"><i></i><i></i><i></i><span>your machine</span></div>
 <pre><code><span class="p">$ </span>keydrop request openai-api-key --note "for the summariser"
 <span class="u">https://your-mac.example.ts.net:61234/3vQx...</span>
 
@@ -73,7 +73,7 @@
     <div class="flow">
       <div class="hop"><span class="n">1</span><div><b>Ask</b><p>Your tool runs <code>keydrop request &lt;name&gt;</code>. keydrop opens a <code>tailscale serve</code> route and prints a link once.</p></div></div>
       <div class="hop val"><span class="n">2</span><div><b>Open</b><p>You open it on a device signed in to your tailnet. The route, the Host, your tailnet login and the token are checked, in that order.</p></div></div>
-      <div class="hop val"><span class="n">3</span><div><b>Store</b><p>The value goes to <code>security -i</code> on stdin as hex, is read back, and the digests are compared.</p></div></div>
+      <div class="hop val"><span class="n">3</span><div><b>Store</b><p>The value goes to your vault, is read back, and the digests are compared. The reference vault is the macOS keychain.</p></div></div>
       <div class="hop"><span class="n">4</span><div><b>Gone</b><p>The page says Stored, the route is closed and confirmed closed. Your tool reads the value back with <code>keydrop get</code>.</p></div></div>
     </div>
     <a class="more" href="security.html#how">The full flow, with the diagram and every check →</a>
@@ -154,7 +154,7 @@
   <div class="wrap">
     <span class="num">Install</span>
     <h2>Read the file. Then install it.</h2>
-    <p>One Python file, no dependencies. The install is a fetch, a diff you read, and an install of the commit you read, never the working tree. Needs macOS, Tailscale with serve and HTTPS certificates, and python3.</p>
+    <p>One Python file, no dependencies. The install is a fetch, a diff you read, and an install of the commit you read, never the working tree. Needs Tailscale with serve and HTTPS certificates, python3, and a vault adapter. The reference adapter is the macOS keychain; the spec defines the interface for others.</p>
     <div class="cta">
       <a class="btn solid" href="install.html">Install guide <span class="arr">→</span></a>
       <a class="btn ghost" href="https://github.com/MockSea/keydrop">Source on GitHub</a>
