@@ -949,6 +949,75 @@ def test_serve_routes():
     test_orphan_sweep(before)
 
 
+def test_typed_local(watch):
+    KD.ensure_state()
+    with open(KD.POLICY_FILE, "w") as f:
+        json.dump({"types_enabled": ["secret", "credential"]}, f)
+    name, value = test_name("typed"), secret_value()
+    watch.needles += [value, value.encode().hex()]
+    schema = KD.template_schema("username-password")
+    schema_path = os.path.join(STUB_DIR, "credential-schema.json")
+    with open(schema_path, "w") as f:
+        json.dump(schema, f)
+    try:
+        url = page(name, "--schema", schema_path)
+        code, body = http("GET", url, headers=LOGIN)
+        check(code == 200 and 'name="f_password"' in body, "typed request renders proposed fields")
+        values = {"schema": json.dumps(schema), "f_username": "account", "f_password": value}
+        code, body = vpost(url, dict(values, f_password=""))
+        check(code == 400 and KD.keychain_get(name) is None, "typed request rejects missing required value")
+        code, body = vpost(url, values)
+        check(code == 200 and value not in body and wait_gone(name), "typed request stores and tears down without echo")
+        check(KD.item_value(name, KD.keychain_get(name), "password") == value, "typed request reads one field")
+        check(run("get", name).returncode != 0, "typed get requires --field")
+        url = vault_page("--ttl", "1m")
+        csrf = csrf_of(http("GET", url, headers=LOGIN)[1])
+        code, body = vpost(url, {"csrf": csrf, "action": "rotate-form", "name": name})
+        check(code == 200 and 'name="f_password"' in body and value not in body, "rotation form has schema and no stored values")
+        value2 = secret_value()
+        watch.needles += [value2, value2.encode().hex()]
+        code, body = vpost(url, dict(values, csrf=csrf, action="rotate", name=name,
+                                    f_password=value2, rotate_by="2000-01-01"))
+        check(code == 200 and "Overdue" in body and KD.item_value(name, KD.keychain_get(name), "password") == value2,
+              "typed vault rotation verifies the complete replacement and schedule")
+        code, body = vpost(url, {"csrf": csrf, "action": "search", "query": name, "status": "overdue"})
+        check(code == 200 and name in body and value2 not in body, "typed vault search returns public metadata only")
+        vpost(url, {"csrf": csrf, "action": "done"})
+        check(wait_gone(KD.VAULT), "typed vault tears down")
+    finally:
+        os.unlink(KD.POLICY_FILE)
+
+def test_spec_credential(watch):
+    """SPEC 5.3 / 6: --type credential --fields picks the optional fields; a field the policy
+    forbids is refused with exit 2 before any route is published (C-22)."""
+    KD.ensure_state()
+    with open(KD.POLICY_FILE, "w") as f:
+        json.dump({"types_enabled": ["secret", "credential"], "credential_fields_enabled": ["url"]}, f)
+    try:
+        name, value = test_name("cred"), secret_value()
+        watch.needles += [value, value.encode().hex()]
+        r = run("request", name, "--type", "credential", "--fields", "totp,url")
+        check(r.returncode == 2 and name not in json.dumps(KD.read_pending()),
+              "forbidden credential field refused with exit 2, nothing published")
+        url = page(name, "--type", "credential", "--fields", "url")
+        code, body = http("GET", url, headers=LOGIN)
+        check(code == 200 and 'name="f_url"' in body and 'name="f_totp"' not in body,
+              "--fields renders exactly the asked optional fields")
+        schema = KD.credential_schema(name, ("url",))
+        code, body = vpost(url, {"schema": json.dumps(schema), "f_username": "me",
+                                 "f_password": value, "f_url": "https://example.com"})
+        check(code == 200 and value not in body and wait_gone(name), "spec credential stores")
+        r = run("get", name, "--field", "password")
+        check(r.returncode == 0 and r.stdout.rstrip("\n") == value, "get --field reads one field")
+        r = run("list", "--long")
+        check(any(line.split("\t")[:2] == [name, "credential"] for line in r.stdout.splitlines()),
+              "list --long shows the type")
+    finally:
+        os.unlink(KD.POLICY_FILE)
+    r = run("request", test_name("off"), "--type", "credential")
+    check(r.returncode == 2, "credential type off by default: exit 2 (C-23)")
+
+
 def cleanup():
     for name in MADE:
         subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT,
@@ -980,6 +1049,8 @@ def main():
         test_vault_local(watch)
         test_vault_lockout_and_cancel()
         test_vault_expiry()
+        test_typed_local(watch)
+        test_spec_credential(watch)
         test_serve_routes()
         mode = oct(os.stat(STATE).st_mode & 0o777)
         check(mode == "0o700", f"state dir is 0700 ({mode})")

@@ -13,13 +13,18 @@ JSON file under base and speaks just enough of the real CLI for keydrop:
 Exit codes follow the real tool where keydrop reads them: a missing item is
 44 (errSecItemNotFound, -25300), a duplicate without -U is 45 (-25299). Under
 -i the status is the low 8 bits of the last failing command's OSStatus, as
-with the real one.
+with the real one, and a line longer than 4096 characters is split into two
+commands, as the real one does (measured on macOS 26).
+
+The label is printed by attribute number (0x00000007), the way the real
+dump-keychain prints it, and `-U` rewrites the label it's given.
 """
 import os
 
 FAKE_SECURITY_SRC = r'''#!/usr/bin/env python3
 import fcntl, json, os, shlex, sys, time
 DB = %r
+LINE_MAX = 4096
 NOT_FOUND = "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."
 
 
@@ -84,7 +89,8 @@ def add(args):
                   "The specified item already exists in the keychain.", file=sys.stderr)
             return 45
         if it:
-            it.update(data=data, mdat=stamp())
+            # -U rewrites the attributes it was given as well as the data.
+            it.update(data=data, mdat=stamp(), **({"labl": o["-l"]} if "-l" in o else {}))
             return 0
         now = stamp()
         items.append({"acct": o.get("-a", ""), "svce": o.get("-s", ""), "labl": o.get("-l", o.get("-s", "")),
@@ -167,14 +173,21 @@ def run(argv):
 
 
 def interactive():
+    """Like the real one, reads at most LINE_MAX characters per line and runs
+    whatever is left over as the next command."""
     rc = 0
     for line in sys.stdin:
-        words = shlex.split(line)
-        if not words:
-            continue
-        code = run(words)
-        if code:
-            rc = code & 0xFF
+        line = line.rstrip("\n")
+        for start in range(0, max(len(line), 1), LINE_MAX):
+            try:
+                words = shlex.split(line[start:start + LINE_MAX])
+            except ValueError:
+                words = ["unparseable"]
+            if not words:
+                continue
+            code = run(words)
+            if code:
+                rc = code & 0xFF
     return rc
 
 

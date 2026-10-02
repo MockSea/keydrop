@@ -35,8 +35,9 @@ before writing anything public.
    - a conformance report in the shape of section 10.4;
    - the side effects of the vault or transport tool you found (history,
      sync, caches, prompts);
-   - for changes to the reference implementation, both test suites passing:
-     `tests/keydrop-test` and `tests/keydrop-home-test`.
+   - for changes to the reference implementation, all three test suites passing:
+     `tests/keydrop-test`, `tests/keydrop-home-test` and
+     `tests/keydrop-management-test`.
 
 Small fixes (typos, broken links, clearer wording) can skip the issue.
 

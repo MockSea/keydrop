@@ -135,7 +135,8 @@ Before the user relies on it:
 
 1. **Fakes first.** Build a fake vault and a stub transport (spec 10.1) and
    run every check in spec 10.2 that applies. For the reference, that is
-   `tests/keydrop-test` and `tests/keydrop-home-test`. Never point a test, or
+   `tests/keydrop-test`, `tests/keydrop-home-test` and
+   `tests/keydrop-management-test`. Never point a test, or
    any experiment of yours, at the real vault or the real transport.
 2. **One real round trip** with a throwaway name (spec 10.3): `keydrop
    request keydrop-smoke-test --note "test, paste anything"`, have the user
@@ -208,7 +209,8 @@ When a task needs a secret you don't have:
 
    Don't `echo` it, don't `cat` a file containing it, and don't put it in a
    file in the repo. If a command would print it, redirect that output. To
-   check it exists, test the exit status of `keydrop get name >/dev/null`.
+   check it exists, look for the name in `keydrop list` (`get` on a credential
+   without `--field` fails even when the item is there).
 
 If the user pastes a secret into the chat anyway, don't repeat it. Tell them
 it is now in the transcript and suggest they rotate it, then offer a link for
