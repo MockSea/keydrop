@@ -128,11 +128,15 @@ is given so you can judge an equivalent on another platform.
     the serve route on submit, TTL, lockout, signals and exceptions. Keep a
     record per pending page, so a later command can find routes whose
     process died. A teardown only counts once `serve status` shows the port
-    gone; until then keep the record and retry. Sweep routes that look
-    exactly like keydrop's and that no record owns, and leave every other
-    route alone.
+    gone; until then keep the record and retry. For routes whose record was
+    lost too, keep a ledger of every route you create (written before
+    `serve` runs, cleared once the route is confirmed gone) and sweep only
+    ledger entries with no live record whose route still points where you
+    pointed it. Never sweep by shape: another tool's `serve` route can look
+    exactly like yours, and removing it takes their service down.
 12. **Never `tailscale funnel`.** The page must not be reachable from the
-    internet.
+    internet. The per-request route check also treats Funnel being on for
+    the page's port as the route being gone.
 
 ## Steps only the human can do
 
@@ -141,8 +145,10 @@ Say so plainly and wait. Don't try to work around any of these.
 - **Confirm the owner's tailnet login.** Ask the user which login should be
   allowed to submit values (for example `you@example.com` or
   `someone@github`). Don't guess it from git config, an email address or
-  `tailscale status` output. A wrong login either locks them out or, worse,
-  lets someone else in. Show them what you are about to set and get a yes.
+  `tailscale status` output. Those (and the admin console) are fine places to
+  show the user where to look, but the user decides which login it is. A
+  wrong login either locks them out or, worse, lets someone else in. Show
+  them what you are about to set and get a yes.
 - **Enable Serve and HTTPS certificates** for the tailnet in the Tailscale
   admin console. The first `tailscale serve` on a tailnet may print a URL to
   approve; the user has to open it.
@@ -153,6 +159,11 @@ Say so plainly and wait. Don't try to work around any of these.
   secret-intake surface that stays up, so the user should load it
   themselves. Hand them the rendered plist and the `launchctl bootstrap`
   line.
+- **Refusing to save the value in the browser.** If the browser or a
+  password manager offers to save what they typed into a keydrop page, tell
+  them to choose "Never" for that site. The field asks it not to
+  (`autocomplete="new-password"` plus the managers' opt-out attributes), but
+  browsers don't always listen.
 - **Bookmarking the home link.** `keydrop home --new-link` prints the link
   once. Have the user run it in their own terminal, or relay it to them over
   a channel they trust, and tell them to bookmark it. Don't store it
@@ -161,8 +172,9 @@ Say so plainly and wait. Don't try to work around any of these.
 ## Installing the reference implementation
 
 1. Clone the repo, for example to `~/src/keydrop`.
-2. Install a copy from `origin/main` (not the working tree) with the line in
-   the README, into `~/.local/bin/keydrop`. Check that `~/.local/bin` is on
+2. Install with the README's steps, into `~/.local/bin/keydrop`: fetch,
+   show the user the `git log -p` review (or the whole file on a first
+   install), and install only the commit they read, never the working tree. Check that `~/.local/bin` is on
    PATH.
 3. Write `~/.config/keydrop/config.json` with at least
    `{"owner_login": "<the login the user confirmed>"}`. `config.example.json`
@@ -212,10 +224,12 @@ for the new one.
 
 ## Gotchas from the original
 
-- **`ps` sees argv and, with `-E`, the environment.** Passing a value as
-  `--key=VALUE`, or exporting it into a long-lived process's environment,
-  exposes it to every local user and process for as long as that process
-  runs. The reference tests poll `ps -axwwE` during real writes to prove
+- **`ps` sees argv, and with `-E` your own processes' environment.** A
+  value passed as `--key=VALUE` is visible to every local user and process
+  for as long as that process runs. On macOS `ps -E` shows the environment
+  only for processes you own, so an exported value is exposed to anything
+  running as you rather than to everyone, which is still the agent and every
+  tool it starts. The reference tests poll `ps -axwwE` during real writes to prove
   the value never shows up.
 - **`find-generic-password -g` has two output formats on stderr:**
   `password: "text"` for printable ASCII, and `password: 0xHEX  "..."` for
@@ -232,3 +246,10 @@ for the new one.
 - **The fakes in `tests/fakes.py` reproduce today's `security` output.** If
   macOS changes its format, the tests still pass and real reads break.
   After an OS or Tailscale upgrade, do one manual round trip.
+- **A kill switch has to check the port, not just its own records.** The
+  launchd job reads only the config file. A `home --stop` run with
+  `KEYDROP_*` variables pointing at another state dir finds no record and
+  no flag to honour there, so it must still look at `serve status` on the
+  home port and only report success once nothing there points at the page.
+  Run home's `--stop`, `--new-link` and `--unlock` with those variables
+  unset.

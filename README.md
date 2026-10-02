@@ -22,15 +22,25 @@ It is one Python file with no dependencies beyond the standard library, the
 
 ## Install
 
-Clone the repo somewhere (these examples use `~/src/keydrop`), then install a
-copy from `origin/main`:
+Clone the repo somewhere (these examples use `~/src/keydrop`). Installing
+and upgrading are the same three steps: fetch, read what changed, then
+install exactly the commit you read.
 
     mkdir -p ~/.local/bin
-    t=$(mktemp) && git -C ~/src/keydrop fetch -q origin && git -C ~/src/keydrop show origin/main:keydrop > "$t" && install -m 0755 "$t" ~/.local/bin/keydrop && rm -f "$t"
+    git -C ~/src/keydrop fetch -q origin
+    sha=$(git -C ~/src/keydrop rev-parse origin/main) && echo "$sha"
+    git -C ~/src/keydrop log -p HEAD.."$sha" -- keydrop
+    t=$(mktemp) && git -C ~/src/keydrop show "$sha":keydrop > "$t" && install -m 0755 "$t" ~/.local/bin/keydrop && rm -f "$t"
 
-The line takes the file from `origin/main` by ref, not from the working tree,
-so a checked-out branch or an uncommitted edit can't end up installed. Re-run
-it to upgrade. `~/.local/bin` needs to be on your PATH.
+The `log -p` line is the review: every change to `keydrop` between your
+checkout and `$sha`. On a first install that range is empty, so read the
+file itself instead (`git -C ~/src/keydrop show "$sha":keydrop`). The last
+line installs `$sha`, the commit you read, not whatever `origin/main` points
+at by then, and never the working tree, so a branch, an uncommitted edit or a
+push that lands while you're reading can't end up installed. Afterwards move
+the checkout to `$sha` (`git -C ~/src/keydrop merge --ff-only "$sha"`) so the
+next review starts from what's installed. `~/.local/bin` needs to be on your
+PATH.
 
 ## Configure
 
@@ -106,7 +116,14 @@ python3, because launchd doesn't read your shell's PATH.
 ### Stopping and unlocking
 
 `keydrop home --stop` (or the Stop button on the page) takes the route down
-and leaves a flag that keeps the page down. Five bad requests in 24 hours lock
+and leaves a flag that keeps the page down. It only reports success once
+`serve status` shows no route on the home port still pointing at the page.
+The flag lives in the state dir, and the launchd job reads only the config
+file, so run `--stop`, `--new-link` and `--unlock` without `KEYDROP_*`
+variables set: `--new-link` and `--unlock` refuse while any is set (add
+`--force` if you mean it), and `--stop` warns. A broken `owner_login` or
+`account` setting doesn't block `--stop`; a broken `state_dir` or `home_port`
+does, since it would aim the stop at the wrong page. Five bad requests in 24 hours lock
 it the same way, and a restart doesn't clear the lock. Both exit 0, so launchd
 leaves the job stopped. To bring it back:
 
@@ -134,7 +151,11 @@ What it defends against:
   `Tailscale-User-Login`, which `tailscale serve` sets and peers can't forge.
   Lookalike spellings of that header are refused.
 - **Guessing the link.** The token is 256 bits, compared in constant time.
-  Wrong guesses lock the page.
+  On a one-shot request or vault link, 5 bad requests (a wrong token, or no
+  owner login) end the link early. On the home page only a wrong token sent
+  with the owner's login and same-origin or direct-navigation Fetch Metadata
+  counts; 5 of those in 24 hours lock it until `keydrop home --unlock`.
+  Anything else gets a bare 404 and isn't counted.
 - **Browsers on the Mac.** An exact Host allowlist stops DNS rebinding. Form
   tokens and Fetch Metadata stop cross-site posts, and a cross-site request
   can't run up strikes on the home page.
@@ -143,8 +164,14 @@ What it defends against:
   doesn't claim it. keydrop uses the same port on both sides, listens only
   after the route exists, and checks on every request that the route is
   still its own, exiting if not.
-- **Leftover routes.** Teardown on every exit path, a reap for killed
-  processes, and a narrow sweep for orphaned keydrop routes.
+- **Leftover routes.** Teardown on every exit path and a reap for killed
+  processes. keydrop keeps a ledger of every serve route it creates
+  (`routes.json` in the state dir) and only ever sweeps ledger entries no
+  live record owns, and only while the route still points where keydrop
+  pointed it. A route keydrop didn't create is never removed, whatever it
+  looks like.
+- **Funnel.** If Funnel gets turned on for a page's port, the page treats its
+  route as gone: it answers a bare 404 and exits.
 - **Reading values through the page.** The vault and home pages are
   write-only.
 
