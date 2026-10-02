@@ -44,8 +44,8 @@ software already running as the owner on that machine.
 ## 2. Terms
 
 - **Owner.** The one person allowed to submit values. Identified by a login
-  the transport can prove (for example a tailnet login), or by being at the
-  machine for a localhost transport.
+  the transport can prove (for example a tailnet login). Being at the
+  machine is not an identity (see Q1).
 - **Requester.** The tool or agent that asks for an item and later reads it.
   It runs on the same machine as the vault.
 - **Item.** What gets stored under one name. It has a type (section 5) and one
@@ -187,8 +187,11 @@ confirm that, it answers a bare 404 and the page exits.
 
 **I10. Strikes only from the owner.** On any surface that persists a lockout,
 a bad request only counts as a strike when it carries the owner's proven
-identity and same-origin or absent `Sec-Fetch-Site`. A stranger or a
-cross-site page cannot lock the owner out.
+identity and exactly one `Sec-Fetch-Site` header whose value is `same-origin`
+or `none`. A request with that header absent, empty or repeated gets a bare
+404 and no strike, so a non-browser client, or a page that sends no Fetch
+Metadata, cannot spend the owner's strikes. A stranger or a cross-site page
+cannot lock the owner out.
 
 **I11. No public, unauthenticated exposure.** The page is never reachable
 from the public internet without the transport authenticating the owner.
@@ -277,8 +280,10 @@ reads it back after every store.
 An adapter whose write channel has a size limit reports it as `max_bytes`
 (8.1) and refuses a larger item before calling the store, leaving any existing
 item untouched. The keychain adapter's limit is about 1.9 KB per item, encoded:
-`security -i` reads at most 4096 characters per line, and the value goes on
-the line as hex.
+`security -i` reads each command with `fgets` into a 4096-byte buffer, so a
+line holds at most 4095 characters and the rest would run as a second command.
+The value goes on the line as hex, and the reference refuses any command line
+of 4096 characters or more before calling `security`.
 
 ### 5.5 Policy
 
@@ -535,14 +540,12 @@ the store by one of:
    misread it (the reference sends hex through `security -i`);
 2. an inherited file descriptor or a pipe the CLI reads as a file;
 3. a library or OS API called in-process (for example `CredWriteW` on
-   Windows, the Secret Service D-Bus API on Linux);
-4. a temporary file only when the file is created `0600` in a directory only
-   the user can read, is written and read in one step, and is overwritten
-   and removed before the page answers. This option is a last resort and the
-   adapter's `capabilities()` MUST report it.
+   Windows, the Secret Service D-Bus API on Linux).
 
-A CLI that only accepts the value as an argument (or as part of a JSON or
-base64 blob in an argument) cannot be used that way. Wrap its API, pipe its
+A temporary file is not a route, even a `0600` one: it outlives a crash or a
+SIGKILL, which no `finally` covers (Q10). A CLI that only accepts the value as
+an argument (or as part of a JSON or base64 blob in an argument), or only as
+a file path, cannot be used that way. Wrap its API, pipe its
 template through stdin if it supports that, or choose a different store.
 
 The CLI's own side effects count too: if it keeps a history, writes an
@@ -572,7 +575,8 @@ it, and record what was confirmed in the adapter.
 ### 9.1 Interface
 
 ```
-open(port)              -> url | error(reason)     # route exists before this returns
+open(port)              -> url | error(reason)     # route exists before this returns;
+                                                   # refuses a port it already routes
 identity(request)       -> login | none            # only from what the transport proves
 still_ours(port)        -> yes | no | unknown      # unknown counts as no
 close(port)             -> confirmed | error(reason)
@@ -584,8 +588,7 @@ ledger                  # routes this implementation created, for sweeping
 
 A transport adapter MUST:
 
-- **T1.** Make the page reachable only by clients it authenticates, or only
-  from the machine itself.
+- **T1.** Make the page reachable only by clients it authenticates.
 - **T2.** Provide an identity the client cannot forge. Where identity arrives
   as a header, the transport strips any copy the client sends, and keydrop
   refuses a request carrying more than one, or carrying any other header
@@ -597,6 +600,10 @@ A transport adapter MUST:
 - **T6.** Bind the local listener to loopback only, and start accepting
   connections only after the route exists, so there is no window where the
   listener is reachable without the transport's checks in front of it.
+  `open` refuses a port the transport already routes, so a new page never
+  takes over or shares another route. keydrop picks a different free port
+  and tries again, and after a few tries refuses rather than drift onto a
+  port that doesn't match (the reference's `claim_port`).
 - **T7.** Not depend on the page token for identity. The token is a second
   factor on top of T1 and T2.
 
@@ -613,14 +620,9 @@ A transport adapter MUST:
   over a private network that strips and sets the header). keydrop MUST
   verify a signed assertion where one is offered, and treat a bare header
   from a proxy reachable by anyone as unproven.
-- **SSH port forward.** The owner runs `ssh -L` to the machine and opens the
-  link on their own `localhost`. Identity is the SSH login, proven by SSH.
-  keydrop treats the forward as the localhost transport below.
-- **Localhost only.** The page listens on loopback and the owner opens it in
-  a browser on the same machine. Identity is "a person at this machine". This
-  is only acceptable where nothing forwards external traffic to loopback (see
-  the netstack note above), and only when the owner has chosen it in policy.
-  See Q1.
+
+A plain loopback page (opened in a browser on the machine, or through an
+`ssh -L` forward) is not on this list. See Q1 for why.
 
 ### 9.4 Not acceptable
 
@@ -628,6 +630,8 @@ A transport adapter MUST:
   Funnel, an unauthenticated ngrok or cloudflared quick tunnel, or a port
   opened on a router.
 - A listener on `0.0.0.0` or a LAN address, with or without a token.
+- A loopback listener with no transport identity in front of it, including
+  "localhost only" and an SSH port forward (Q1).
 - Plain HTTP across any network.
 - Any identity the client can set, such as a header passed through by a proxy
   that doesn't strip it, a query parameter or a cookie keydrop issued.
@@ -691,8 +695,9 @@ last column.
 | C-23 | A credential stores and reads back every requested field, and `get` without `--field` refuses | 5.3 | `test_spec_credential`, `test_typed_local`, `test_cli_schema_and_get` |
 | C-24 | Vault page: every POST needs a form token, cross-site Fetch Metadata and foreign Origin are refused, GET changes nothing, delete confirms | 7.4 | `test_vault_local`, `test_csrf`, `test_fetch_metadata` |
 | C-25 | Vault and home delete reach only the namespace | 8.1 | `test_vault_render_units`, `test_writes` |
-| C-26 | Home: strikes need the owner's identity and same-origin Fetch Metadata; the lockout and rate limit persist across restarts | I10 | `test_strangers_cant_lock`, `test_lockout`, `test_rate_limit`, `test_peer_flood`, `test_flood` |
+| C-26 | Home: a strike needs the owner's identity and exactly one `Sec-Fetch-Site` of `same-origin` or `none`; absent, empty or doubled gets a bare 404 and no strike; the lockout and rate limit persist across restarts | I10 | `test_strangers_cant_lock`, `test_fetch_metadata`, `test_lockout`, `test_rate_limit`, `test_peer_flood`, `test_flood` |
 | C-27 | Home: stop takes the route down and keeps it down until unlock, including mid start-up | I7 | `test_stop`, `test_stop_race`, `test_stop_guards`, `test_stop_flag_ends_loop` |
+| C-28 | A port the transport already routes is never reused for a new page: keydrop skips it, and refuses after a bounded number of tries, closing every listener it bound | T6 | `test_same_port_units` |
 
 ### 10.3 Manual round trip
 
@@ -778,8 +783,8 @@ Requirements:
 - Implements 9.1 and meets T1 to T7.
 - Belongs to a class in 9.3, or makes the case for a new class in its pull
   request. Nothing in 9.4 is accepted.
-- Passes C-06 to C-17 against a stub of the transport, plus a manual round
-  trip.
+- Passes C-06 to C-17 and C-28 against a stub of the transport, plus a
+  manual round trip.
 
 Things to watch:
 
@@ -799,8 +804,11 @@ Things to watch:
 The reference keeps working as it is. These are the differences between it
 and the spec, for whoever brings it into line:
 
-- **Item types.** `secret` and `credential` follow 5.2 and 5.3, plus the
-  templates and custom fields in section 6. Form inputs are named `f_<id>`,
+- **Item types.** The reference has typed items. `secret` and `credential`
+  follow 5.2 and 5.3, with `request --type`, `--fields` and `--schema`,
+  `get --field`, `list --long`, `policy.json` (5.5) and `items.json` (field
+  definitions and rotate-by dates, never values), plus the templates and
+  custom fields in section 6. Form inputs are named `f_<id>`,
   not `<id>` as in 7.3, and the page carries the schema in a hidden `schema`
   field that the server re-validates. `select` is an extra field kind.
 - **Partial adapter seam.** The pages and commands reach the keychain only
@@ -823,6 +831,8 @@ and the spec, for whoever brings it into line:
   is the same everywhere. The home stop message says "on the Mac".
 - **Labels.** The request form's input has no label (the heading names the
   item). That stays as the `secret` layout.
+- **Size limit.** The keychain adapter refuses an item whose `security -i`
+  line would reach 4096 characters (5.4), before anything is written.
 - **Exit codes.** Refusals (bad type or fields, disabled type or field)
   exit 2. Everything else that fails exits 1, including vault and transport
   failures that section 6 puts at 3.
@@ -834,10 +844,17 @@ These are decisions for the project owner. The spec marks where each one
 applies.
 
 - **Q1. Is a weaker transport ever allowed?** Localhost-only, an SSH forward,
-  or a LAN link with only the token. The reference refuses `--local`
-  entirely because of the netstack forwarding problem. 9.3 currently allows
-  localhost-only by policy where nothing forwards to loopback; that could
-  equally be removed.
+  or a LAN link with only the token. The spec currently refuses all three
+  (9.4), and the reference refuses `--local`. A loopback listener is not
+  private to the machine: under userspace networking, tailscaled forwards
+  unclaimed tailnet ports to loopback, so any tailnet peer can reach it, and
+  so can any local process. Nothing on the connection says who is on the
+  other end, so keydrop can't attribute a request to the owner (I3, T7) and
+  there is no mode that skips the identity check (C-17). An SSH forward ends
+  on the same loopback port and inherits the same problem; the SSH login
+  proves who opened the tunnel, not who sent the request. Allowing either
+  would need a transport-level proof of identity on each request, which
+  would make it an authenticated proxy (9.3) rather than localhost.
 - **Q2. Are credentials on by default?** The spec makes `secret` the only
   default type. Some harnesses will want credentials on out of the box.
 - **Q3. Do TOTP seeds belong in the same item as the password?** Keeping them
@@ -861,9 +878,14 @@ applies.
   anyway could show S-USED or S-EXPIRED for recent one-shot tokens (stored as
   hashes) to the owner. That would replace most S-GONE cases with a clear
   message, at the cost of more state.
-- **Q10. CLIs that only take values on argv.** If a popular vault has no
-  stdin, file-descriptor or API route, the spec currently rules it out. The
-  temporary-file route in 8.2 is the only fallback; it may be too weak.
+- **Q10. CLIs that only take values on argv or a file path.** If a popular
+  vault has no stdin, file-descriptor or API route, the spec rules it out.
+  A temporary-file route was considered and dropped: a value on disk survives
+  a crash or SIGKILL. Bringing it back would mean a `"tempfile"`
+  `write_channel` in 8.1, temp files added to I5's list, and an adapter that
+  unlinks in a `finally` and reaps strays on its next start. `/dev/fd/N`
+  paths (a pipe passed as a file name) are already route 2 where the CLI
+  accepts them.
 - **Q11. TTL bounds.** 15 minutes default and an hour maximum come from the
   reference. Slow channels (email) may need longer.
 - **Q12. How is conformance proven for other languages?** Either the
