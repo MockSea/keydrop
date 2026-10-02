@@ -4,7 +4,8 @@ keydrop gets a secret, such as an API key, from you into the macOS login
 keychain without anyone pasting it into a chat, a terminal history or a
 config file. A local tool or an agent asks for a key by name. keydrop
 prints a one-shot link on your tailnet, and the page behind it is a single
-password field. You open the link on a device signed in to your tailnet,
+password field (or, for a typed item such as a credential, the fields that
+type needs). You open the link on a device signed in to your tailnet,
 paste the value and submit, and the page shuts itself down. The tool then
 reads the value back with `keydrop get <name>`.
 
@@ -131,8 +132,10 @@ optional rotate-by date are kept in `items.json` in the state dir (mode
 rotations and show recent activity.
 
 The keychain marks a typed item in its label, so the type survives losing the
-state dir. One keychain item holds about 1.9 KB once encoded; a bigger item is
-refused before anything is written, and an existing value stays as it was.
+state dir. One keychain item holds about 1.9 KB once encoded, because
+`security -i` reads at most 4095 characters per command line and the value
+goes on it as hex. A bigger item is refused before anything is written, and
+an existing value stays as it was.
 
 ### The home page under launchd
 

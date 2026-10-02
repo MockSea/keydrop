@@ -48,8 +48,6 @@ Check for:
 - **Transport candidates.**
   - `tailscale` with `tailscale serve` available and HTTPS certificates on.
   - An identity-aware proxy the user already runs in front of this machine.
-  - SSH access from the user's other devices to this one.
-  - Whether the user will only ever submit from this machine (localhost).
 - **Runtimes.** Which languages are installed, so an implementation doesn't
   need new ones.
 
@@ -69,22 +67,28 @@ Use `SPEC.md` sections 8 and 9.
 2. the OS store (login keychain, Secret Service, Credential Manager);
 3. `pass` or KeePassXC, if the user already uses them.
 
-Rule a store out if the only way to write it is a value on a command line.
-Check each CLI's actual behaviour on the installed version. Don't rely on
-memory for which flags read stdin; read `--help` and test with a throwaway
-value against a throwaway entry.
+Rule a store out if the only way to write it is a value on a command line
+or a temporary file. Check each CLI's actual behaviour on the installed
+version. Don't rely on memory for which flags read stdin: read `--help`, and
+test with a throwaway value against a scratch store, never the user's real
+vault. A scratch store is a temporary `PASSWORD_STORE_DIR` for `pass`, a
+throwaway keychain (`security create-keychain` on a temp path, deleted
+after) or a new KeePassXC database. Where the store can't be scratched (a
+signed-in 1Password or Bitwarden account), ask the user before touching it,
+and say exactly what you'll create and delete. This is the same rule as
+step 4.1.
 
 **Transport.** Prefer:
 
 1. a tailnet with an identity header (`tailscale serve`, Funnel off);
-2. another authenticated proxy that injects a verified identity;
-3. an SSH forward;
-4. localhost only, and only if the owner chooses it (spec Q1) and nothing
-   forwards outside traffic to loopback.
+2. another authenticated proxy that injects a verified identity.
 
 Never use anything in spec 9.4: no public unauthenticated URL, no Funnel, no
 ngrok or cloudflared quick tunnel without authentication, no listener on
-`0.0.0.0` or a LAN address, no plain HTTP across a network. If nothing on the
+`0.0.0.0` or a LAN address, no plain HTTP across a network, and no
+"localhost only" page or SSH port forward. A loopback listener can be
+reached by tailnet peers under userspace networking and by any local
+process, and nothing proves who sent a request (spec Q1). If nothing on the
 machine qualifies, say so and stop. Don't improvise a weaker one.
 
 **Policy.** Ask the user which item types to turn on. `secret` is the

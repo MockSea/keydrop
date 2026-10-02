@@ -81,8 +81,9 @@ Turnaround: TODO, to be set by the maintainer.
 ## Security reports
 
 Please don't open a public issue for a vulnerability. Report it privately
-through: TODO, a private channel to be set by the maintainer. Include what
-you found, how to reproduce it, and which invariant it breaks.
+with GitHub's private vulnerability reporting: on the repository, open the
+Security tab and choose "Report a vulnerability". Include what you found, how
+to reproduce it, and which invariant it breaks.
 
 ## License
 
