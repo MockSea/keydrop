@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="keydrop hands a secret to a tool or agent on your Mac through a one-shot link on your tailnet, straight into the login keychain. Nothing is pasted into a chat, a terminal or a config file.">
+<title>keydrop: give an agent a secret without pasting it into the chat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2315130f'/%3E%3Ccircle cx='16' cy='16' r='5' fill='%23e0b05a'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f5f2eb;
+  --bg-2: #ebe6db;
+  --surface: #fffdf8;
+  --ink: #15130f;
+  --ink-2: #3f3a32;
+  --muted: #645d52;
+  --line: #d6cfc1;
+  --line-2: #bfb6a4;
+  --accent: #7a4f12;
+  --accent-ink: #5d3b0b;
+  --accent-soft: #f3e5c8;
+  --ok: #2b6a3f;
+  --no: #8b2e2e;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, Helvetica, Arial, sans-serif;
+  --radius: 10px;
+  --gutter: 20px;
+  --measure: 62ch;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f0e0c;
+    --bg-2: #171512;
+    --surface: #1b1916;
+    --ink: #efeae0;
+    --ink-2: #cfc8bb;
+    --muted: #a49c8e;
+    --line: #2d2a25;
+    --line-2: #46413a;
+    --accent: #e0b05a;
+    --accent-ink: #f0c76e;
+    --accent-soft: #2b2314;
+    --ok: #7fcf9a;
+    --no: #e08a8a;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 17px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+a { color: inherit; text-decoration-color: var(--line-2); text-underline-offset: 0.18em; }
+a:hover { text-decoration-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+code, pre, kbd { font-family: var(--mono); font-size: 0.92em; }
+p code, li code, dd code, dt code, h3 code {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.05em 0.35em;
+  overflow-wrap: anywhere;
+}
+pre {
+  margin: 0;
+  padding: 16px 18px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow-x: auto;
+  line-height: 1.5;
+  font-size: 0.86rem;
+  color: var(--ink);
+  tab-size: 4;
+}
+pre .c { color: var(--muted); }
+pre .p { color: var(--accent); user-select: none; }
+pre .u { color: var(--accent-ink); }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 var(--gutter); }
+.skip {
+  position: absolute; left: -999px; top: 8px;
+  background: var(--ink); color: var(--bg); padding: 8px 12px; border-radius: 6px; z-index: 10;
+}
+.skip:focus { left: 12px; }
+
+/* header */
+.top {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 18px 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+.mark {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-family: var(--mono); font-weight: 600; font-size: 1.05rem; letter-spacing: -0.01em;
+  text-decoration: none;
+}
+.mark i {
+  width: 11px; height: 11px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.top nav { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.92rem; }
+.top nav a { text-decoration: none; color: var(--ink-2); }
+.top nav a:hover { color: var(--ink); text-decoration: underline; }
+
+/* hero */
+.hero { padding: 56px 0 44px; }
+.eyebrow {
+  margin: 0 0 18px;
+  font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted);
+}
+.eyebrow b { color: var(--accent); font-weight: 600; }
+h1 {
+  margin: 0 0 22px;
+  font-size: clamp(2.35rem, 8.2vw, 4.6rem);
+  line-height: 1.02; letter-spacing: -0.035em; font-weight: 700;
+  max-width: 17ch;
+  text-wrap: balance;
+}
+.lead {
+  margin: 0; max-width: var(--measure);
+  font-size: clamp(1.05rem, 2.2vw, 1.25rem); line-height: 1.5; color: var(--ink-2);
+}
+.cta { display: flex; flex-wrap: wrap; gap: 10px; margin: 28px 0 0; }
+.btn {
+  display: inline-block; padding: 11px 16px; border-radius: 8px;
+  font-weight: 600; font-size: 0.95rem; text-decoration: none;
+  border: 1px solid var(--ink);
+}
+.btn.solid { background: var(--ink); color: var(--bg); }
+.btn.solid:hover { background: var(--ink-2); border-color: var(--ink-2); }
+.btn.ghost { color: var(--ink); border-color: var(--line-2); }
+.btn.ghost:hover { border-color: var(--ink); }
+
+.install { margin: 40px 0 0; }
+.install .cap, figcaption, .cap {
+  margin: 0 0 8px; font-size: 0.86rem; color: var(--muted);
+}
+.install .cap b { color: var(--ink); font-weight: 600; }
+.install p.after { margin: 12px 0 0; max-width: var(--measure); font-size: 0.95rem; color: var(--ink-2); }
+
+/* sections */
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+.sec-head { margin: 0 0 28px; max-width: var(--measure); }
+.num {
+  display: block; margin: 0 0 10px;
+  font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent);
+}
+h2 {
+  margin: 0 0 14px;
+  font-size: clamp(1.7rem, 4.6vw, 2.5rem); line-height: 1.1; letter-spacing: -0.025em; font-weight: 700;
+  text-wrap: balance;
+}
+h3 { margin: 0 0 8px; font-size: 1.08rem; letter-spacing: -0.01em; font-weight: 650; }
+.sec-head p { margin: 0; color: var(--ink-2); }
+p, li { max-width: var(--measure); }
+
+/* in-use pair */
+.pair { display: grid; gap: 28px; }
+.pair > div { min-width: 0; }
+.mock {
+  margin: 0; padding: 22px 22px 24px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+  max-width: 420px;
+  box-shadow: 0 1px 0 var(--line);
+}
+.mock .m-h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; word-break: break-all; }
+.mock .m-p { color: var(--muted); margin: 0 0 20px; font-size: 17px; }
+.mock .m-in {
+  height: 50px; border: 1px solid var(--line-2); border-radius: 10px; margin: 0 0 12px;
+  background: var(--bg); display: flex; align-items: center; padding: 0 14px; gap: 5px;
+}
+.mock .m-in i { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-2); }
+.mock .m-btn {
+  height: 50px; border-radius: 10px; background: var(--ink); color: var(--bg);
+  display: flex; align-items: center; justify-content: center; font-size: 17px;
+}
+@media (prefers-color-scheme: dark) {
+  .mock .m-btn { background: var(--ink); color: var(--bg); }
+}
+
+/* diagram */
+.diagram { margin: 0 0 26px; }
+.diagram svg { display: block; width: 100%; height: auto; }
+.diagram .d-wide { display: none; }
+.diagram .d-tall { display: block; max-width: 380px; margin: 0 auto; }
+.diagram .node { fill: var(--surface); stroke: var(--line-2); stroke-width: 1.2; }
+.diagram .node.kd { stroke: var(--ink); stroke-width: 1.6; }
+.diagram .node.kc { stroke: var(--accent); stroke-width: 1.6; }
+.diagram .lbl { fill: var(--ink); font: 600 14px var(--sans); }
+.diagram .sub { fill: var(--muted); font: 12px var(--sans); }
+.diagram .edge { fill: none; stroke: var(--ink-2); stroke-width: 1.5; }
+.diagram .edge.val { stroke: var(--accent); stroke-width: 2; }
+.diagram .edge.dash { stroke-dasharray: 4 4; }
+.diagram .badge { fill: var(--bg); stroke: var(--ink-2); stroke-width: 1.3; }
+.diagram .badge.val { stroke: var(--accent); }
+.diagram .bn { fill: var(--ink); font: 700 11px var(--mono); text-anchor: middle; dominant-baseline: central; }
+.diagram .bn.val { fill: var(--accent-ink); }
+.diagram marker path { fill: var(--ink-2); }
+.diagram marker.mval path { fill: var(--accent); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 0 0 24px; font-size: 0.88rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 8px; }
+.legend i { display: inline-block; width: 26px; height: 0; border-top: 2px solid var(--ink-2); }
+.legend i.val { border-color: var(--accent); }
+.legend i.dash { border-top-style: dashed; }
+
+ol.steps { margin: 0; padding: 0; list-style: none; counter-reset: s; display: grid; gap: 14px; }
+ol.steps li {
+  counter-increment: s; position: relative; padding-left: 40px; max-width: var(--measure);
+  color: var(--ink-2);
+}
+ol.steps li::before {
+  content: counter(s); position: absolute; left: 0; top: 2px;
+  width: 24px; height: 24px; border-radius: 50%;
+  border: 1.3px solid var(--ink-2); color: var(--ink);
+  font: 700 12px/22px var(--mono); text-align: center;
+}
+ol.steps li.val::before { border-color: var(--accent); color: var(--accent-ink); }
+ol.steps li b { color: var(--ink); font-weight: 650; }
+.note { margin: 24px 0 0; padding: 14px 16px; border-left: 3px solid var(--line-2); color: var(--ink-2); font-size: 0.95rem; }
+.note.warn { border-color: var(--accent); }
+
+/* two-up lists */
+.cols { display: grid; gap: 32px; }
+.cols h3 { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.cols h3 i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.cols h3 i.yes { background: var(--ok); }
+.cols h3 i.no { background: var(--no); }
+ul.plain { margin: 0; padding: 0; list-style: none; display: grid; gap: 14px; }
+ul.plain li { padding-left: 18px; position: relative; color: var(--ink-2); }
+ul.plain li::before { content: ""; position: absolute; left: 0; top: 0.72em; width: 8px; height: 1.5px; background: var(--line-2); }
+ul.plain li b { color: var(--ink); font-weight: 650; }
+
+/* cards */
+.cards { display: grid; gap: 14px; }
+.card { min-width: 0; padding: 18px 18px 20px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.card h3 { margin-bottom: 6px; }
+.card p { margin: 0; color: var(--ink-2); font-size: 0.97rem; }
+.card pre { margin-top: 12px; font-size: 0.8rem; }
+.cards.adapters { margin-top: 36px; }
+
+/* invariants */
+.inv { margin: 0; padding: 0; list-style: none; display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+.inv li { background: var(--surface); padding: 12px 14px; display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: baseline; }
+.inv code { color: var(--accent); font-weight: 600; background: none; border: 0; padding: 0; }
+.inv b { font-weight: 650; }
+.inv span { display: block; color: var(--muted); font-size: 0.9rem; }
+
+/* status label */
+.tag {
+  display: inline-block; margin: 0 0 14px; padding: 4px 9px; border-radius: 6px;
+  font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--accent-ink); background: var(--accent-soft); border: 1px solid var(--accent);
+}
+
+/* commands */
+dl.cmds { margin: 0; display: grid; gap: 0; border-top: 1px solid var(--line); }
+dl.cmds div { display: grid; gap: 4px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+dl.cmds dt { font-family: var(--mono); font-size: 0.86rem; color: var(--ink); overflow-wrap: break-word; }
+.nb { white-space: nowrap; }
+dl.cmds dd { margin: 0; color: var(--ink-2); font-size: 0.95rem; }
+
+footer { padding: 36px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.9rem; }
+footer p { margin: 0 0 8px; }
+
+@media (min-width: 760px) {
+  :root { --gutter: 32px; }
+  .hero { padding: 88px 0 64px; }
+  section { padding: 76px 0; }
+  .pair { grid-template-columns: 1.1fr 1fr; align-items: start; gap: 40px; }
+  .cols { grid-template-columns: 1fr 1fr; gap: 48px; }
+  .cards { grid-template-columns: 1fr 1fr; }
+  .inv { grid-template-columns: 1fr 1fr; }
+  dl.cmds div { grid-template-columns: 300px 1fr; gap: 20px; }
+  .diagram .d-wide { display: block; }
+  .diagram .d-tall { display: none; }
+}
+@media (min-width: 1080px) {
+  .hero { padding: 104px 0 72px; }
+  .hero-grid { display: grid; grid-template-columns: 1fr 1.15fr; gap: 56px; align-items: start; margin-top: 8px; }
+  .hero-grid .install { margin: 0; }
+  .cards { grid-template-columns: 1fr 1fr 1fr; }
+  .cards.adapters { grid-template-columns: 1fr 1fr; }
+  .cards.adapters .card.span { grid-column: 1 / -1; }
+  .cards.adapters .card.span p { max-width: 70ch; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<div class="wrap">
+  <header class="top">
+    <a class="mark" href="#" aria-label="keydrop, home"><i aria-hidden="true"></i>keydrop</a>
+    <nav aria-label="Page">
+      <a href="#how">How it works</a>
+      <a href="#threats">Threat model</a>
+      <a href="#spec">Spec</a>
+      <a href="#use">Commands</a>
+      <a href="https://github.com/MockSea/keydrop">GitHub</a>
+    </nav>
+  </header>
+</div>
+
+<main id="main">
+<div class="wrap">
+  <div class="hero">
+    <p class="eyebrow"><b>macOS</b> · Tailscale · one Python file · MIT</p>
+    <h1>Give an agent a secret without pasting it into the chat.</h1>
+    <div class="hero-grid">
+      <div>
+        <p class="lead">A local tool asks for a key by name. keydrop prints a one-shot link on your tailnet. You open it on a device signed in to your tailnet, paste the value, and it goes straight into the login keychain. The page shuts itself down, and the tool reads the value back by name.</p>
+        <div class="cta">
+          <a class="btn solid" href="https://github.com/MockSea/keydrop">Source on GitHub</a>
+          <a class="btn ghost" href="https://github.com/MockSea/keydrop/blob/pages-site/SPEC.md">Read the spec</a>
+        </div>
+      </div>
+      <figure class="install">
+        <figcaption class="cap"><b>Install, or upgrade.</b> The <code>log -p</code> line is the review. The last line installs the commit you read, never the working tree.</figcaption>
+<pre><code>mkdir -p ~/.local/bin
+git clone https://github.com/MockSea/keydrop ~/src/keydrop   <span class="c"># first time</span>
+git -C ~/src/keydrop fetch -q origin
+sha=$(git -C ~/src/keydrop rev-parse origin/main) &amp;&amp; echo "$sha"
+git -C ~/src/keydrop log -p HEAD.."$sha" -- keydrop
+t=$(mktemp) &amp;&amp; git -C ~/src/keydrop show "$sha":keydrop &gt; "$t" \
+  &amp;&amp; install -m 0755 "$t" ~/.local/bin/keydrop &amp;&amp; rm -f "$t"</code></pre>
+        <p class="after">On a first install the log is empty, so read the file itself: <code>git -C ~/src/keydrop show "$sha":keydrop</code>. Then put your Tailscale login in <code>~/.config/keydrop/config.json</code> as <code>owner_login</code>. Without it nothing starts.</p>
+      </figure>
+    </div>
+  </div>
+</div>
+
+<section id="in-use">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">In use</span>
+      <h2>One command on your side. One field on theirs.</h2>
+      <p>The requester never sees the value until it asks for it by name. You never type it anywhere a transcript, a shell history or a config file would keep it.</p>
+    </div>
+    <div class="pair">
+      <div>
+<pre><code><span class="p">$ </span>keydrop request openai-api-key --note "for the summariser"
+<span class="u">https://your-mac.example.ts.net:61234/3vQx...</span>
+
+<span class="c"># Open the link on any device signed in to your tailnet.
+# Paste the key, tap Store. The page answers
+# "Stored. You can close this." and shuts down.</span>
+
+<span class="p">$ </span>keydrop status
+<span class="c"># ... once openai-api-key is no longer pending:</span>
+
+<span class="p">$ </span>OPENAI_API_KEY="$(keydrop get openai-api-key)" some-command</code></pre>
+        <p class="note">The link stops working after one good submit, after the TTL (15 minutes by default, an hour at most), after five bad requests, or on <code>keydrop cancel openai-api-key</code>. <code>keydrop get</code> prints no trailing newline when stdout isn't a terminal, so command substitution is clean.</p>
+      </div>
+      <div>
+        <figure class="mock" role="img" aria-label="The request page: the item name as a heading, the requester's note, one password field, and a Store button.">
+          <div aria-hidden="true">
+            <p class="m-h1">openai-api-key</p>
+            <p class="m-p">for the summariser</p>
+            <div class="m-in"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="m-btn">Store</div>
+          </div>
+        </figure>
+        <p class="cap" style="margin-top:10px">The whole page. No script, no cookies, no stylesheet fetched from anywhere, and the input asks browsers and password managers not to save what you type.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">01 · How it works</span>
+      <h2>One path for the value, checked on every request.</h2>
+      <p>Four parties on your Mac and one browser. The brass line is the only route the value ever takes.</p>
+    </div>
+
+    <div class="diagram">
+      <svg class="d-wide" viewBox="0 0 1040 404" role="img" aria-labelledby="dw-t dw-d">
+        <title id="dw-t">keydrop request flow</title>
+        <desc id="dw-d">Your tool asks keydrop for a name. keydrop opens a tailscale serve route and prints a link. The link reaches your browser over any channel. Your browser submits the value through tailscale serve to keydrop, which stores it in the login keychain and reads it back. The page says Stored and the route closes. Your tool reads the value back with keydrop get. The numbered steps are listed below the diagram.</desc>
+        <defs>
+          <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="awv" class="mval" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+
+        <!-- 3: link over any channel -->
+        <path class="edge dash" d="M135,66 V24 H915 V60" marker-end="url(#aw)"/>
+        <circle class="badge" cx="525" cy="24" r="10"/><text class="bn" x="525" y="24">3</text>
+
+        <!-- nodes -->
+        <rect class="node" x="40" y="66" width="190" height="72" rx="10"/>
+        <text class="lbl" x="135" y="98" text-anchor="middle">your tool or agent</text>
+        <text class="sub" x="135" y="118" text-anchor="middle">runs on the Mac</text>
+
+        <rect class="node kd" x="300" y="66" width="190" height="72" rx="10"/>
+        <text class="lbl" x="395" y="98" text-anchor="middle">keydrop</text>
+        <text class="sub" x="395" y="118" text-anchor="middle">listens on 127.0.0.1</text>
+
+        <rect class="node" x="560" y="66" width="190" height="72" rx="10"/>
+        <text class="lbl" x="655" y="98" text-anchor="middle">tailscale serve</text>
+        <text class="sub" x="655" y="118" text-anchor="middle">HTTPS, same port</text>
+
+        <rect class="node" x="820" y="66" width="190" height="72" rx="10"/>
+        <text class="lbl" x="915" y="98" text-anchor="middle">your browser</text>
+        <text class="sub" x="915" y="118" text-anchor="middle">any device on your tailnet</text>
+
+        <rect class="node kc" x="300" y="300" width="190" height="72" rx="10"/>
+        <text class="lbl" x="395" y="332" text-anchor="middle">login keychain</text>
+        <text class="sub" x="395" y="352" text-anchor="middle">service keydrop.&lt;name&gt;</text>
+
+        <!-- serve annotation -->
+        <text class="sub" x="655" y="162" text-anchor="middle">sets Tailscale-User-Login from the connection,</text>
+        <text class="sub" x="655" y="178" text-anchor="middle">strips any copy the client sent</text>
+
+        <!-- 1: request -->
+        <path class="edge" d="M230,90 H298" marker-end="url(#aw)"/>
+        <circle class="badge" cx="256" cy="90" r="9"/><text class="bn" x="256" y="90">1</text>
+        <!-- 2: link printed -->
+        <path class="edge" d="M300,114 H232" marker-end="url(#aw)"/>
+        <circle class="badge" cx="274" cy="114" r="9"/><text class="bn" x="274" y="114">2</text>
+
+        <!-- 4: value, browser -> serve -> keydrop -->
+        <path class="edge val" d="M820,114 H752" marker-end="url(#awv)"/>
+        <circle class="badge val" cx="794" cy="114" r="9"/><text class="bn val" x="794" y="114">4</text>
+        <path class="edge val" d="M560,114 H492" marker-end="url(#awv)"/>
+
+        <!-- 6: stored, keydrop -> serve -> browser -->
+        <path class="edge" d="M490,90 H558" marker-end="url(#aw)"/>
+        <path class="edge" d="M750,90 H818" marker-end="url(#aw)"/>
+        <circle class="badge" cx="776" cy="90" r="9"/><text class="bn" x="776" y="90">6</text>
+
+        <!-- 5: store and read back -->
+        <path class="edge val" d="M375,138 V298" marker-end="url(#awv)"/>
+        <path class="edge val" d="M415,300 V140" marker-end="url(#awv)"/>
+        <circle class="badge val" cx="395" cy="219" r="9"/><text class="bn val" x="395" y="219">5</text>
+        <text class="sub" x="438" y="214" text-anchor="start">hex on stdin, read back,</text>
+        <text class="sub" x="438" y="230" text-anchor="start">digests compared</text>
+
+        <!-- 7: get -->
+        <path class="edge" d="M135,138 V336 H298" marker-end="url(#aw)"/>
+        <circle class="badge" cx="217" cy="336" r="9"/><text class="bn" x="217" y="336">7</text>
+      </svg>
+
+      <svg class="d-tall" viewBox="0 0 360 560" role="img" aria-labelledby="dt-t dt-d">
+        <title id="dt-t">keydrop request flow</title>
+        <desc id="dt-d">Your tool asks keydrop for a name. keydrop opens a tailscale serve route and prints a link. The link reaches your browser over any channel. Your browser submits the value through tailscale serve to keydrop, which stores it in the login keychain and reads it back. The page says Stored and the route closes. Your tool reads the value back with keydrop get. The numbered steps are listed below the diagram.</desc>
+        <defs>
+          <marker id="awt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="awtv" class="mval" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+
+        <!-- 3: link over any channel -->
+        <path class="edge dash" d="M172,70 H350 V450 H176" marker-end="url(#awt)"/>
+        <circle class="badge" cx="350" cy="330" r="10"/><text class="bn" x="350" y="330">3</text>
+
+        <!-- 7: get -->
+        <path class="edge" d="M172,42 H276 V162" marker-end="url(#awt)"/>
+        <circle class="badge" cx="276" cy="108" r="9"/><text class="bn" x="276" y="108">7</text>
+
+        <!-- nodes -->
+        <rect class="node" x="12" y="16" width="160" height="64" rx="10"/>
+        <text class="lbl" x="92" y="45" text-anchor="middle">your tool or agent</text>
+        <text class="sub" x="92" y="64" text-anchor="middle">runs on the Mac</text>
+
+        <rect class="node kd" x="12" y="164" width="160" height="64" rx="10"/>
+        <text class="lbl" x="92" y="193" text-anchor="middle">keydrop</text>
+        <text class="sub" x="92" y="212" text-anchor="middle">listens on 127.0.0.1</text>
+
+        <rect class="node kc" x="216" y="164" width="120" height="64" rx="10"/>
+        <text class="lbl" x="276" y="193" text-anchor="middle">login keychain</text>
+        <text class="sub" x="276" y="212" text-anchor="middle">keydrop.&lt;name&gt;</text>
+
+        <rect class="node" x="12" y="312" width="160" height="64" rx="10"/>
+        <text class="lbl" x="92" y="341" text-anchor="middle">tailscale serve</text>
+        <text class="sub" x="92" y="360" text-anchor="middle">HTTPS, same port</text>
+        <text class="sub" x="140" y="402">sets your tailnet login,</text>
+        <text class="sub" x="140" y="417">strips any copy sent</text>
+
+        <rect class="node" x="12" y="440" width="160" height="64" rx="10"/>
+        <text class="lbl" x="92" y="469" text-anchor="middle">your browser</text>
+        <text class="sub" x="92" y="488" text-anchor="middle">a device on your tailnet</text>
+
+        <!-- 1 / 2 between tool and keydrop -->
+        <path class="edge" d="M66,80 V162" marker-end="url(#awt)"/>
+        <circle class="badge" cx="66" cy="120" r="9"/><text class="bn" x="66" y="120">1</text>
+        <path class="edge" d="M118,164 V82" marker-end="url(#awt)"/>
+        <circle class="badge" cx="118" cy="124" r="9"/><text class="bn" x="118" y="124">2</text>
+
+        <!-- 6 down / 4 up between keydrop and serve -->
+        <path class="edge" d="M66,228 V310" marker-end="url(#awt)"/>
+        <circle class="badge" cx="66" cy="268" r="9"/><text class="bn" x="66" y="268">6</text>
+        <path class="edge val" d="M118,312 V230" marker-end="url(#awtv)"/>
+
+        <!-- 6 down / 4 up between serve and browser -->
+        <path class="edge" d="M66,376 V438" marker-end="url(#awt)"/>
+        <path class="edge val" d="M118,440 V378" marker-end="url(#awtv)"/>
+        <circle class="badge val" cx="118" cy="408" r="9"/><text class="bn val" x="118" y="408">4</text>
+
+        <!-- 5 keydrop <-> keychain -->
+        <path class="edge val" d="M172,184 H214" marker-end="url(#awtv)"/>
+        <path class="edge val" d="M216,208 H174" marker-end="url(#awtv)"/>
+        <circle class="badge val" cx="194" cy="196" r="9"/><text class="bn val" x="194" y="196">5</text>
+        <text class="sub" x="276" y="252" text-anchor="middle">hex on stdin, read back,</text>
+        <text class="sub" x="276" y="267" text-anchor="middle">digests compared</text>
+      </svg>
+    </div>
+
+    <div class="legend" aria-hidden="true">
+      <span><i class="val"></i> the value</span>
+      <span><i></i> everything else</span>
+      <span><i class="dash"></i> any channel you like</span>
+    </div>
+
+    <ol class="steps">
+      <li><b>Request.</b> Your tool runs <code>keydrop request &lt;name&gt;</code>. keydrop checks the name, binds a listener on 127.0.0.1, asks <code>tailscale serve</code> for an HTTPS route to it on the same port number, confirms the route exists, and only then accepts connections.</li>
+      <li><b>Link.</b> It prints the link once and detaches. The path carries a 256-bit token from a cryptographically secure generator.</li>
+      <li><b>Deliver.</b> The link reaches you over whatever channel the tool already has. A chat message is fine: to anyone the tailnet won't authenticate as you, the link is useless.</li>
+      <li class="val"><b>Submit.</b> You open it on a device signed in to your tailnet and submit the value. Every request is checked in this order: the route is still keydrop's own, the Host is on the allowlist, <code>Tailscale-User-Login</code> is the owner, the token matches in constant time. Anything else gets a bare 404.</li>
+      <li class="val"><b>Store and verify.</b> keydrop hands the value to <code>security -i</code> on stdin as hex, reads it back, and compares digests. Only a match counts as stored.</li>
+      <li><b>Close.</b> The page says "Stored. You can close this." keydrop closes the route, confirms with Tailscale that it's gone, and exits.</li>
+      <li><b>Read back.</b> Your tool runs <code>keydrop get &lt;name&gt;</code> and passes the value on without printing it.</li>
+    </ol>
+    <p class="note">A request also ends on the TTL, after five bad requests, on <code>keydrop cancel</code>, and on any signal or crash. Every one of those paths closes the route. Routes left by a killed process are found and removed later, and only routes keydrop itself created are ever removed.</p>
+  </div>
+</section>
+
+<section id="pages">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">02 · Two more pages</span>
+      <h2>A vault page and a home page. Both write-only.</h2>
+      <p>Same token in the path, same owner check, same route check on every request, same teardown. Neither ever renders a stored value, so a screenshot, a browser cache or someone over your shoulder gets nothing.</p>
+    </div>
+    <div class="cards">
+      <div class="card">
+        <h3><code>keydrop vault</code></h3>
+        <p>A session link, held open for one TTL. The page lists names, notes and times, and lets you add, replace and delete entries under the service prefix. Every post needs the session's form token as well as the path token. Delete asks first. The Done button ends the link.</p>
+      </div>
+      <div class="card">
+        <h3><code>keydrop home</code></h3>
+        <p>The vault page with no TTL, meant to stay up under launchd. In place of the TTL it has a lockout that survives restarts, a write rate limit, an audit log and a stop switch. Only bad requests carrying your login and same-origin Fetch Metadata count as strikes, so a stranger or a cross-site page can't lock you out.</p>
+      </div>
+      <div class="card">
+        <h3>The kill switch</h3>
+        <p><code>keydrop home --stop</code> takes the route down and leaves a flag that keeps it down. It reports success only once <code>serve status</code> shows nothing on the home port still pointing at the page. Five bad requests in 24 hours lock it the same way. <code>keydrop home --unlock</code> brings it back; <code>--new-link</code> replaces the link without a restart.</p>
+      </div>
+    </div>
+    <p class="note">Notes from the vault page are stored in plain text in the state dir, so don't put secrets in them.</p>
+  </div>
+</section>
+
+<section id="threats">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">03 · Threat model</span>
+      <h2>What it defends against, and what it doesn't.</h2>
+      <p>keydrop protects the way into the keychain. It does not protect the keychain from software already running as you. The reasoning behind each check is in the docstring at the top of the script; the invariants every implementation keeps are in section 4 of the spec.</p>
+    </div>
+    <div class="cols">
+      <div>
+        <h3><i class="yes" aria-hidden="true"></i>Defends against</h3>
+        <ul class="plain">
+          <li><b>The value reaching a chat, a log or argv.</b> It goes from the browser to keydrop, then to <code>security -i</code> on stdin as hex. Logs hold only name, time and outcome. Every write is read back before the page says Stored.</li>
+          <li><b>Other people on your tailnet.</b> Every request needs the owner's <code>Tailscale-User-Login</code>, which <code>tailscale serve</code> sets from the connection and peers can't forge. Lookalike spellings of that header are refused.</li>
+          <li><b>Guessing the link.</b> The token is 256 bits, compared in constant time. On a one-shot or vault link, five bad requests end it early. On the home page only a wrong token sent with your login counts, and five in 24 hours lock it until <code>keydrop home --unlock</code>.</li>
+          <li><b>Browsers on the Mac.</b> An exact Host allowlist stops DNS rebinding. Form tokens and Fetch Metadata stop cross-site posts, and a cross-site request can't run up strikes on the home page.</li>
+          <li><b>A loopback port left open to the tailnet.</b> Under userspace networking, tailscaled forwards tailnet traffic to <code>127.0.0.1</code> on the same port when serve doesn't claim it. keydrop uses the same port on both sides, listens only after the route exists, and checks on every request that the route is still its own, exiting if not.</li>
+          <li><b>Leftover routes.</b> Teardown on every exit path and a reap for killed processes. keydrop keeps a ledger of every serve route it creates and only sweeps ledger entries no live record owns, and only while the route still points where keydrop pointed it. A route keydrop didn't create is never removed.</li>
+          <li><b>Funnel.</b> If Funnel gets turned on for a page's port, the page treats its route as gone: it answers a bare 404 and exits.</li>
+          <li><b>Reading values through a page.</b> The vault and home pages are write-only.</li>
+        </ul>
+      </div>
+      <div>
+        <h3><i class="no" aria-hidden="true"></i>Doesn't defend against</h3>
+        <ul class="plain">
+          <li><b>Anything running as you on the Mac.</b> It can run <code>keydrop get</code> or <code>security</code> itself. keydrop protects the way into the keychain, not the keychain.</li>
+          <li><b>Local processes connecting to 127.0.0.1.</b> They can send any header. They still need the token.</li>
+          <li><b>A compromised device signed in as you,</b> or anyone holding the link. Treat a link like a short-lived password.</li>
+          <li><b>A compromised tailscaled, or a tailnet admin.</b></li>
+          <li><b>Untested setups.</b> The port analysis was worked out against tailscaled with userspace networking. A kernel-TUN tailscaled, such as the macOS app, hasn't been analysed.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="spec">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">04 · The spec</span>
+      <h2>Written so keydrop can be rebuilt anywhere.</h2>
+      <p><code>SPEC.md</code> fixes what any keydrop must do: the flow, the item types, the page and its exact wording, the invariants, the vault and transport adapter interfaces, and the conformance checks. It's written so keydrop can be rebuilt on Linux or Windows, with 1Password, Bitwarden, pass, KeePassXC or another store, and with or without Tailscale. The Python script is the reference implementation, for macOS, the login keychain and <code>tailscale serve</code>. The spec is a draft, version 0.1.</p>
+    </div>
+
+    <h3 style="margin-bottom:12px">Twelve invariants. None of them is configurable.</h3>
+    <ol class="inv">
+      <li><code>I1</code><div><b>One-shot link.</b><span>Exactly one successful submission, then nothing.</span></div></li>
+      <li><code>I2</code><div><b>Bounded lifetime.</b><span>15 minutes by default, an hour at most.</span></div></li>
+      <li><code>I3</code><div><b>Only the owner can submit.</b><span>No owner configured, nothing starts.</span></div></li>
+      <li><code>I4</code><div><b>The token is necessary.</b><span>256 bits, constant-time, a few bad requests end the page.</span></div></li>
+      <li><code>I5</code><div><b>The value never leaves browser, page, vault.</b><span>Not argv, env, logs, responses, errors or the requester's output.</span></div></li>
+      <li><code>I6</code><div><b>Verified store.</b><span>Stored means read back and matched, not exit status zero.</span></div></li>
+      <li><code>I7</code><div><b>The page shuts down.</b><span>On store, TTL, lockout, cancel, signal or crash. Confirmed gone.</span></div></li>
+      <li><code>I8</code><div><b>Read-back by name only.</b><span>No page, response or log ever renders a value.</span></div></li>
+      <li><code>I9</code><div><b>The route is checked on every request.</b><span>Still ours, no wider than opened. Else 404 and exit.</span></div></li>
+      <li><code>I10</code><div><b>Strikes only from the owner.</b><span>A stranger or a cross-site page can't lock you out.</span></div></li>
+      <li><code>I11</code><div><b>No public, unauthenticated exposure.</b><span>No Funnel, no open tunnel, no 0.0.0.0, no plain HTTP.</span></div></li>
+      <li><code>I12</code><div><b>Policy is enforced before a link exists.</b><span>A disabled type is refused at the command line.</span></div></li>
+    </ol>
+    <p class="note">An implementation that cannot meet one of these on a given machine must refuse to run there and say which one.</p>
+
+    <div class="cards adapters">
+      <div class="card">
+        <h3>Vault adapter</h3>
+        <p>Store, read, list and delete inside one namespace. A value reaches the store by stdin, an inherited file descriptor or an in-process API. A CLI that only takes the value as an argument can't be used.</p>
+<pre><code>capabilities() -&gt; {native_types, write_channel,
+                   lists_without_unlock, max_bytes}
+store(name, item)  -&gt; ok | error(reason)
+get(name)          -&gt; item | not_found | error
+list()             -&gt; [{name, type, created?, updated?}]
+delete(name)       -&gt; ok | not_found | error</code></pre>
+      </div>
+      <div class="card">
+        <h3>Transport adapter</h3>
+        <p>Makes the page reachable only by clients it authenticates, proves who is connecting, and tears the route down again. Acceptable: a tailnet identity header, an authenticated proxy with a verified identity, an SSH forward, or localhost by policy.</p>
+<pre><code>open(port)          -&gt; url | error(reason)
+identity(request)   -&gt; login | none
+still_ours(port)    -&gt; yes | no | unknown
+close(port)         -&gt; confirmed | error(reason)
+host_allowlist(port) -&gt; [host]
+ledger</code></pre>
+      </div>
+      <div class="card span">
+        <h3>Conformance</h3>
+        <p>27 black-box checks, C-01 to C-27, written against the command interface and HTTP so they apply to any language. They run against a fake vault, a stub transport and a process watcher, never a real store or network. Then one real round trip with a throwaway name, and a report listing every check as pass, fail or not applicable.</p>
+      </div>
+    </div>
+
+    <div class="note" style="margin-top:36px">
+      <h3 style="margin-bottom:8px">Where the reference is behind the spec today</h3>
+      <p style="margin:0 0 8px">Section 12 of the spec keeps this list. As of now:</p>
+      <ul class="plain" style="gap:8px">
+        <li>No item types. It has one field, <code>value</code>, with no <code>--type</code>, <code>--fields</code>, <code>get --field</code> or policy keys.</li>
+        <li>No adapter seam. The keychain and Tailscale calls are made directly, not behind the interfaces above.</li>
+        <li>No expired, cancelled or used screens, and no "Link ends HH:MM." line on the request form. A finished page is simply gone, which the spec allows.</li>
+        <li>A blank submit answers "Nothing was entered." as a message page instead of re-rendering the form.</li>
+        <li>Some copy says "keychain" and "on the Mac" where the spec says "vault" and "on this machine".</li>
+        <li>Exit codes don't follow section 6 exactly, and the test suites are white-box Python rather than the black-box checks.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="agents">
+  <div class="wrap">
+    <div class="pair">
+      <div>
+        <div class="sec-head">
+          <span class="num">05 · For agents</span>
+          <h2>A skill that sets it up and uses it.</h2>
+          <p><code>skills/keydrop-setup/SKILL.md</code> is written for any coding agent in any harness. Its rule: never ask the user to paste a secret into the conversation, and never echo one into it. It walks the agent through taking stock of the machine, choosing a vault and transport, getting a conforming implementation in place (the reference where it fits, adapters built to the spec where it doesn't), proving conformance, and then asking for secrets through a link.</p>
+        </div>
+        <p class="note">Some steps are left to the human on purpose: confirming the owner's login, turning on Serve and HTTPS certificates, answering unlock prompts, choosing policy, and loading an always-on service. The skill says so and waits.</p>
+      </div>
+      <div>
+        <p class="cap">What an agent runs when a task needs a key it doesn't have.</p>
+<pre><code><span class="c"># already there?</span>
+keydrop list
+
+<span class="c"># no: ask for it, send the user the link</span>
+keydrop request openai-api-key --note "for the summariser in ~/proj"
+
+<span class="c"># wait for the name to drop out of</span>
+keydrop status
+
+<span class="c"># use it without printing it</span>
+OPENAI_API_KEY="$(keydrop get openai-api-key)" some-command</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="next">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="tag">Not shipped · in progress</span>
+      <h2>What's coming.</h2>
+      <p>A redesign is under way separately from the reference script. None of it is in the released code; what's described above is what runs today.</p>
+    </div>
+    <ul class="plain">
+      <li><b>Typed, multi-field credentials.</b> The spec already defines a <code>credential</code> type: username, password, and optional one-time code secret, website and notes, with the optional fields chosen per request. The reference has one field and no <code>--type</code>.</li>
+      <li><b>Fields that fit the service.</b> A request for a given service showing the fields that service actually needs, rather than one generic form.</li>
+      <li><b>A proper key-management page,</b> in place of the write-only list the vault page has today.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="use">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">06 · Requirements and commands</span>
+      <h2>Three requirements. Nine commands.</h2>
+    </div>
+    <div class="cols" style="margin-bottom:36px">
+      <div>
+        <h3>Requirements</h3>
+        <ul class="plain">
+          <li><b>macOS.</b> The vault is the login keychain, driven through <code>/usr/bin/security</code>.</li>
+          <li><b>Tailscale,</b> with <code>tailscale serve</code> available to your user and HTTPS certificates enabled for the tailnet. Without certificates every page refuses to start unless you pass <code>--http</code>, and the home page doesn't run at all.</li>
+          <li><b>python3,</b> 3.9 or later. No other dependencies.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Configuration</h3>
+        <p style="color:var(--ink-2);margin:0 0 12px">Read from <code>~/.config/keydrop/config.json</code>, or the file named by <code>KEYDROP_CONFIG</code>. Environment variables override the file. Only one key has no default.</p>
+<pre><code>{
+  "owner_login": "you@example.com"
+}</code></pre>
+        <p style="color:var(--ink-2);margin:12px 0 0;font-size:0.95rem"><code>owner_login</code> is your Tailscale login exactly as <code>tailscale status</code> shows it. keydrop never falls back to accepting any login. <code>keydrop config</code> prints the settings in effect.</p>
+      </div>
+    </div>
+
+    <dl class="cmds">
+      <div><dt>keydrop request &lt;name&gt; [--note "…"] [--ttl 15m]</dt><dd>Prints a one-shot link and returns. The page runs in the background.</dd></div>
+      <div><dt>keydrop get &lt;name&gt;</dt><dd>Prints the stored value, for local tools. No trailing newline when stdout isn't a terminal.</dd></div>
+      <div><dt>keydrop list</dt><dd>Names only. Never values.</dd></div>
+      <div><dt>keydrop status</dt><dd>Pending requests and vault sessions.</dd></div>
+      <div><dt>keydrop cancel &lt;name&gt;</dt><dd>Ends a pending request. <code>cancel vault</code> ends a vault session.</dd></div>
+      <div><dt>keydrop vault [--ttl 15m]</dt><dd>A session link for listing, adding, replacing and deleting entries.</dd></div>
+      <div><dt>keydrop home</dt><dd>The always-on vault page, for launchd. HTTPS only.</dd></div>
+      <div><dt>keydrop home <span class="nb">--new-link</span> | <span class="nb">--stop</span> | <span class="nb">--unlock</span></dt><dd>Mint a new link, take the page down and keep it down, or clear a stop or lockout.</dd></div>
+      <div><dt>keydrop config</dt><dd>The settings in effect. Never a value.</dd></div>
+    </dl>
+    <p class="note">Names are lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, up to 64 characters. A key named <code>openai-api-key</code> is stored as a generic password with service <code>keydrop.openai-api-key</code> and account <code>keydrop</code>.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>MIT licensed. Source, spec, skill and tests at <a href="https://github.com/MockSea/keydrop">github.com/MockSea/keydrop</a>.</p>
+    <p>Feedback and new use cases are welcome as issues: a vault that isn't covered, a harness that wants credentials. Don't put real secrets, links or tailnet names in one. Neither test suite touches a real keychain or a real tailnet.</p>
+  </div>
+</footer>
+</body>
+</html>
