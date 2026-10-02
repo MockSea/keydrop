@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="The keydrop spec: twelve invariants, the vault and transport adapter interfaces, the conformance checks, and where the reference implementation is behind the spec today.">
+<title>Spec · keydrop</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141317'/%3E%3Cpath d='M16 6c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C23 14.5 16 6 16 6z' fill='%23e0461a'/%3E%3Ccircle cx='16' cy='19.5' r='2.2' fill='%23141317'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap top-in">
+    <a class="mark" href="index.html" aria-label="keydrop, home"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="drop" d="M12 2c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C19 10.5 12 2 12 2z"/><circle class="hole" cx="12" cy="15.5" r="2.1"/></svg>keydrop</a>
+    <nav aria-label="Site">
+      <a href="install.html">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html" aria-current="page">Spec</a>
+      <a href="agents.html">Agents</a>
+      <a href="https://github.com/MockSea/keydrop">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="page-head">
+  <div class="wrap">
+    <span class="eyebrow">The spec <span class="dim">· draft, version 0.1</span></span>
+    <h1>Written so keydrop can be rebuilt anywhere.</h1>
+    <p class="lead"><code>SPEC.md</code> fixes what any keydrop must do: the flow, the item types, the page and its exact wording, the invariants, the vault and transport adapter interfaces, and the conformance checks. It's written so keydrop can be rebuilt on Linux or Windows, with 1Password, Bitwarden, pass, KeePassXC or another store, and with or without Tailscale. The Python script is the reference implementation, for macOS, the login keychain and <code>tailscale serve</code>.</p>
+    <div class="cta">
+      <a class="btn solid" href="https://github.com/MockSea/keydrop/blob/pages-site/SPEC.md">Read SPEC.md <span class="arr">→</span></a>
+    </div>
+    <nav class="page-nav" aria-label="On this page">
+      <a href="#invariants">Invariants</a>
+      <a href="#adapters">Adapters</a>
+      <a href="#conformance">Conformance</a>
+      <a href="#behind">Behind the spec</a>
+      <a href="#next">What's coming</a>
+    </nav>
+  </div>
+</div>
+
+<section id="invariants">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">01 · Invariants</span>
+      <h2>Twelve invariants. None of them is configurable.</h2>
+    </div>
+    <ol class="inv">
+      <li><code>I1</code><div><b>One-shot link.</b><span>Exactly one successful submission, then nothing.</span></div></li>
+      <li><code>I2</code><div><b>Bounded lifetime.</b><span>15 minutes by default, an hour at most.</span></div></li>
+      <li><code>I3</code><div><b>Only the owner can submit.</b><span>No owner configured, nothing starts.</span></div></li>
+      <li><code>I4</code><div><b>The token is necessary.</b><span>256 bits, constant-time, a few bad requests end the page.</span></div></li>
+      <li><code>I5</code><div><b>The value never leaves browser, page, vault.</b><span>Not argv, env, logs, responses, errors or the requester's output.</span></div></li>
+      <li><code>I6</code><div><b>Verified store.</b><span>Stored means read back and matched, not exit status zero.</span></div></li>
+      <li><code>I7</code><div><b>The page shuts down.</b><span>On store, TTL, lockout, cancel, signal or crash. Confirmed gone.</span></div></li>
+      <li><code>I8</code><div><b>Read-back by name only.</b><span>No page, response or log ever renders a value.</span></div></li>
+      <li><code>I9</code><div><b>The route is checked on every request.</b><span>Still ours, no wider than opened. Else 404 and exit.</span></div></li>
+      <li><code>I10</code><div><b>Strikes only from the owner.</b><span>A stranger or a cross-site page can't lock you out.</span></div></li>
+      <li><code>I11</code><div><b>No public, unauthenticated exposure.</b><span>No Funnel, no open tunnel, no 0.0.0.0, no plain HTTP.</span></div></li>
+      <li><code>I12</code><div><b>Policy is enforced before a link exists.</b><span>A disabled type is refused at the command line.</span></div></li>
+    </ol>
+    <p class="note">An implementation that cannot meet one of these on a given machine must refuse to run there and say which one.</p>
+  </div>
+</section>
+
+<section id="adapters">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">02 · Adapters</span>
+      <h2>Two seams. A vault and a transport.</h2>
+    </div>
+    <div class="cards adapters" style="margin-top:0">
+      <div class="card">
+        <h3>Vault adapter</h3>
+        <p>Store, read, list and delete inside one namespace. A value reaches the store by stdin, an inherited file descriptor or an in-process API. A CLI that only takes the value as an argument can't be used.</p>
+<pre><code>capabilities() -&gt; {native_types, write_channel,
+                   lists_without_unlock, max_bytes}
+store(name, item)  -&gt; ok | error(reason)
+get(name)          -&gt; item | not_found | error
+list()             -&gt; [{name, type, created?, updated?}]
+delete(name)       -&gt; ok | not_found | error</code></pre>
+      </div>
+      <div class="card">
+        <h3>Transport adapter</h3>
+        <p>Makes the page reachable only by clients it authenticates, proves who is connecting, and tears the route down again. Acceptable: a tailnet identity header, an authenticated proxy with a verified identity, an SSH forward, or localhost by policy.</p>
+<pre><code>open(port)          -&gt; url | error(reason)
+identity(request)   -&gt; login | none
+still_ours(port)    -&gt; yes | no | unknown
+close(port)         -&gt; confirmed | error(reason)
+host_allowlist(port) -&gt; [host]
+ledger</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="conformance">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">03 · Conformance</span>
+      <h2>27 black-box checks.</h2>
+      <p>C-01 to C-27, written against the command interface and HTTP so they apply to any language. They run against a fake vault, a stub transport and a process watcher, never a real store or network. Then one real round trip with a throwaway name, and a report listing every check as pass, fail or not applicable.</p>
+    </div>
+  </div>
+</section>
+
+<section id="behind">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">04 · Behind the spec</span>
+      <h2>Where the reference is behind the spec today.</h2>
+      <p>Section 12 of the spec keeps this list. As of now:</p>
+    </div>
+    <ul class="plain">
+      <li>No item types. It has one field, <code>value</code>, with no <code>--type</code>, <code>--fields</code>, <code>get --field</code> or policy keys.</li>
+      <li>No adapter seam. The keychain and Tailscale calls are made directly, not behind the interfaces above.</li>
+      <li>No expired, cancelled or used screens, and no "Link ends HH:MM." line on the request form. A finished page is simply gone, which the spec allows.</li>
+      <li>A blank submit answers "Nothing was entered." as a message page instead of re-rendering the form.</li>
+      <li>Has an opt-in <code>--http</code> for tailnets without HTTPS certificates, which I11 and spec 9.4 rule out.</li>
+      <li>Some copy says "keychain" and "on the Mac" where the spec says "vault" and "on this machine".</li>
+      <li>Exit codes don't follow section 6 exactly, and the test suites are white-box Python rather than the black-box checks.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="next">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="tag">Not shipped · in progress</span>
+      <h2>What's coming.</h2>
+      <p>A redesign is under way separately from the reference script. None of it is in the released code; what the rest of this site describes is what runs today.</p>
+    </div>
+    <ul class="plain">
+      <li><b>Typed, multi-field credentials.</b> The spec already defines a <code>credential</code> type: username, password, and optional one-time code secret, website and notes, with the optional fields chosen per request. The reference has one field and no <code>--type</code>.</li>
+      <li><b>Fields that fit the service.</b> A request for a given service showing the fields that service actually needs, rather than one generic form.</li>
+      <li><b>A proper key-management page,</b> in place of the write-only list the vault page has today.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <ul class="next">
+      <li><a href="install.html"><span class="k">Next</span><span class="t">Install, configure, commands</span></a></li>
+      <li><a href="security.html"><span class="k">Read</span><span class="t">Every check, and the threat model</span></a></li>
+      <li><a href="agents.html"><span class="k">For agents</span><span class="t">The skill that sets it up and uses it</span></a></li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <nav aria-label="Footer">
+      <a href="index.html">Home</a>
+      <a href="install.html">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html">Spec</a>
+      <a href="agents.html">Agents</a>
+    </nav>
+    <p>MIT licensed. Source, spec, skill and tests at <a href="https://github.com/MockSea/keydrop">github.com/MockSea/keydrop</a>.</p>
+    <p>Feedback and new use cases are welcome as issues: a vault that isn't covered, a harness that wants credentials. Don't put real secrets, links or tailnet names in one. Neither test suite touches a real keychain or a real tailnet.</p>
+  </div>
+</footer>
+</body>
+</html>

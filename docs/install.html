@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Install keydrop on a Mac: requirements, a review-then-install by commit, the one config key, and the nine commands.">
+<title>Install · keydrop</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141317'/%3E%3Cpath d='M16 6c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C23 14.5 16 6 16 6z' fill='%23e0461a'/%3E%3Ccircle cx='16' cy='19.5' r='2.2' fill='%23141317'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap top-in">
+    <a class="mark" href="index.html" aria-label="keydrop, home"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="drop" d="M12 2c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C19 10.5 12 2 12 2z"/><circle class="hole" cx="12" cy="15.5" r="2.1"/></svg>keydrop</a>
+    <nav aria-label="Site">
+      <a href="install.html" aria-current="page">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html">Spec</a>
+      <a href="agents.html">Agents</a>
+      <a href="https://github.com/MockSea/keydrop">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="page-head">
+  <div class="wrap">
+    <span class="eyebrow">Install</span>
+    <h1>Read it, then install it.</h1>
+    <p class="lead">One Python file, no dependencies. The install is a fetch, a diff you read, and an install of the commit you read, never the working tree.</p>
+    <nav class="page-nav" aria-label="On this page">
+      <a href="#req">Requirements</a>
+      <a href="#install">Install or upgrade</a>
+      <a href="#config">Configure</a>
+      <a href="#commands">Commands</a>
+    </nav>
+  </div>
+</div>
+
+<section id="req">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">01 · Requirements</span>
+      <h2>Three things, nothing else.</h2>
+    </div>
+    <ul class="plain">
+      <li><b>macOS.</b> The vault is the login keychain, driven through <code>/usr/bin/security</code>.</li>
+      <li><b>Tailscale,</b> with <code>tailscale serve</code> available to your user and HTTPS certificates enabled for the tailnet. Without certificates every page refuses to start unless you pass <code>--http</code>, and the home page doesn't run at all.</li>
+      <li><b>python3,</b> 3.9 or later. No other dependencies.</li>
+    </ul>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">02 · Install, or upgrade</span>
+      <h2>The <code>diff</code> line is the review.</h2>
+      <p>The last line installs the commit you read, never the working tree. Run the same block to upgrade.</p>
+    </div>
+    <figure class="install" style="margin:0">
+<pre><code>mkdir -p ~/.local/bin
+git clone https://github.com/MockSea/keydrop ~/src/keydrop   <span class="c"># first time</span>
+git -C ~/src/keydrop fetch -q origin
+sha=$(git -C ~/src/keydrop rev-parse origin/main) &amp;&amp; echo "$sha"
+git -C ~/src/keydrop diff HEAD "$sha" -- keydrop
+t=$(mktemp) &amp;&amp; git -C ~/src/keydrop show "$sha":keydrop &gt; "$t" \
+  &amp;&amp; install -m 0755 "$t" ~/.local/bin/keydrop &amp;&amp; rm -f "$t"
+git -C ~/src/keydrop merge --ff-only "$sha"</code></pre>
+      <p class="after">On a first install the diff is empty, so read the file itself: <code>git -C ~/src/keydrop show "$sha":keydrop</code>. Then put your Tailscale login in <code>~/.config/keydrop/config.json</code> as <code>owner_login</code>. Without it nothing starts.</p>
+    </figure>
+  </div>
+</section>
+
+<section id="config">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">03 · Configuration</span>
+      <h2>One key has no default.</h2>
+      <p>Read from <code>~/.config/keydrop/config.json</code>, or the file named by <code>KEYDROP_CONFIG</code>. Environment variables override the file.</p>
+    </div>
+    <div class="pair">
+      <div>
+<pre><code>{
+  "owner_login": "you@example.com"
+}</code></pre>
+      </div>
+      <div>
+        <p style="margin:0;color:var(--ink-2)"><code>owner_login</code> is your Tailscale login exactly as <code>tailscale status</code> shows it. keydrop never falls back to accepting any login. <code>keydrop config</code> prints the settings in effect.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="commands">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="num">04 · Commands</span>
+      <h2>Nine commands.</h2>
+    </div>
+    <dl class="cmds">
+      <div><dt>keydrop request &lt;name&gt; [--note "…"] [--ttl 15m]</dt><dd>Prints a one-shot link and returns. The page runs in the background.</dd></div>
+      <div><dt>keydrop get &lt;name&gt;</dt><dd>Prints the stored value, for local tools. No trailing newline when stdout isn't a terminal.</dd></div>
+      <div><dt>keydrop list</dt><dd>Names only. Never values.</dd></div>
+      <div><dt>keydrop status</dt><dd>Pending requests and vault sessions.</dd></div>
+      <div><dt>keydrop cancel &lt;name&gt;</dt><dd>Ends a pending request. <code>cancel vault</code> ends a vault session.</dd></div>
+      <div><dt>keydrop vault [--ttl 15m]</dt><dd>A session link for listing, adding, replacing and deleting entries.</dd></div>
+      <div><dt>keydrop home</dt><dd>The always-on vault page, for launchd. HTTPS only.</dd></div>
+      <div><dt>keydrop home <span class="nb">--new-link</span> | <span class="nb">--stop</span> | <span class="nb">--unlock</span></dt><dd>Mint a new link, take the page down and keep it down, or clear a stop or lockout.</dd></div>
+      <div><dt>keydrop config</dt><dd>The settings in effect. Never a value.</dd></div>
+    </dl>
+    <p class="note">Names are lowercase letters, digits, <code>.</code>, <code>_</code> and <code>-</code>, up to 64 characters. A key named <code>openai-api-key</code> is stored as a generic password with service <code>keydrop.openai-api-key</code> and account <code>keydrop</code>.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <ul class="next">
+      <li><a href="security.html"><span class="k">Next</span><span class="t">Every check, and the threat model</span></a></li>
+      <li><a href="spec.html"><span class="k">Read</span><span class="t">The spec and its twelve invariants</span></a></li>
+      <li><a href="agents.html"><span class="k">For agents</span><span class="t">The skill that sets it up and uses it</span></a></li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <nav aria-label="Footer">
+      <a href="index.html">Home</a>
+      <a href="install.html">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html">Spec</a>
+      <a href="agents.html">Agents</a>
+    </nav>
+    <p>MIT licensed. Source, spec, skill and tests at <a href="https://github.com/MockSea/keydrop">github.com/MockSea/keydrop</a>.</p>
+    <p>Feedback and new use cases are welcome as issues: a vault that isn't covered, a harness that wants credentials. Don't put real secrets, links or tailnet names in one. Neither test suite touches a real keychain or a real tailnet.</p>
+  </div>
+</footer>
+</body>
+</html>

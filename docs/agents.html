@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="A skill for any coding agent in any harness: never ask the user to paste a secret into the conversation, set keydrop up, and ask for secrets through a link.">
+<title>For agents · keydrop</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141317'/%3E%3Cpath d='M16 6c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C23 14.5 16 6 16 6z' fill='%23e0461a'/%3E%3Ccircle cx='16' cy='19.5' r='2.2' fill='%23141317'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap top-in">
+    <a class="mark" href="index.html" aria-label="keydrop, home"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="drop" d="M12 2c0 0-7 8.5-7 13.5a7 7 0 0 0 14 0C19 10.5 12 2 12 2z"/><circle class="hole" cx="12" cy="15.5" r="2.1"/></svg>keydrop</a>
+    <nav aria-label="Site">
+      <a href="install.html">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html">Spec</a>
+      <a href="agents.html" aria-current="page">Agents</a>
+      <a href="https://github.com/MockSea/keydrop">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="page-head">
+  <div class="wrap">
+    <span class="eyebrow">For agents</span>
+    <h1>A skill that sets it up and uses it.</h1>
+    <p class="lead"><code>skills/keydrop-setup/SKILL.md</code> is written for any coding agent in any harness. Its rule: never ask the user to paste a secret into the conversation, and never echo one into it.</p>
+    <div class="cta">
+      <a class="btn solid" href="https://github.com/MockSea/keydrop/blob/pages-site/skills/keydrop-setup/SKILL.md">Read SKILL.md <span class="arr">→</span></a>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <div class="pair">
+      <div>
+        <div class="sec-head">
+          <span class="num">01 · What the skill does</span>
+          <h2>Take stock, choose, prove, then ask.</h2>
+          <p>It walks the agent through taking stock of the machine, choosing a vault and transport, getting a conforming implementation in place (the reference where it fits, adapters built to the spec where it doesn't), proving conformance, and then asking for secrets through a link.</p>
+        </div>
+        <p class="note">Some steps are left to the human on purpose: confirming the owner's login, turning on Serve and HTTPS certificates, answering unlock prompts, choosing policy, and loading an always-on service. The skill says so and waits.</p>
+      </div>
+      <div>
+        <p class="cap">What an agent runs when a task needs a key it doesn't have.</p>
+<pre><code><span class="c"># already there?</span>
+keydrop list
+
+<span class="c"># no: ask for it, send the user the link</span>
+keydrop request openai-api-key --note "for the summariser in ~/proj"
+
+<span class="c"># wait for the name to drop out of</span>
+keydrop status
+
+<span class="c"># use it without printing it</span>
+OPENAI_API_KEY="$(keydrop get openai-api-key)" some-command</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <ul class="next">
+      <li><a href="install.html"><span class="k">Next</span><span class="t">Install, configure, commands</span></a></li>
+      <li><a href="security.html"><span class="k">Read</span><span class="t">Every check, and the threat model</span></a></li>
+      <li><a href="spec.html"><span class="k">Read</span><span class="t">The spec and its twelve invariants</span></a></li>
+    </ul>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <nav aria-label="Footer">
+      <a href="index.html">Home</a>
+      <a href="install.html">Install</a>
+      <a href="security.html">Security</a>
+      <a href="spec.html">Spec</a>
+      <a href="agents.html">Agents</a>
+    </nav>
+    <p>MIT licensed. Source, spec, skill and tests at <a href="https://github.com/MockSea/keydrop">github.com/MockSea/keydrop</a>.</p>
+    <p>Feedback and new use cases are welcome as issues: a vault that isn't covered, a harness that wants credentials. Don't put real secrets, links or tailnet names in one. Neither test suite touches a real keychain or a real tailnet.</p>
+  </div>
+</footer>
+</body>
+</html>
