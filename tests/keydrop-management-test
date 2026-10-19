@@ -401,7 +401,8 @@ class Put(unittest.TestCase):
                                     stdin="form-password\n")
         self.assertEqual((code, out), (0, "stored put-cred (username agent@example.com)\n"))
         self.assertEqual(KD.keychain_get("put-cred"), form_raw)
-        self.assertEqual(KD.read_items()["put-cred"], form_meta)
+        self.assertNotIn("origin", form_meta)
+        self.assertEqual(KD.read_items()["put-cred"], dict(form_meta, origin="put"))
         self.assertEqual(KD.keychain_entries()["put-cred"]["type"], form_type)
         self.assertEqual(json.loads(form_raw), {"keydrop": 1, "type": "credential",
                                                 "fields": {"username": "agent@example.com",
@@ -419,7 +420,7 @@ class Put(unittest.TestCase):
 
     def test_refuses_to_overwrite_without_replace(self):
         self.assertEqual(self.run_put("put-twice", "--stdin", stdin="first")[0], 0)
-        KD.write_item_meta("put-twice", None, "2099-01-01")
+        KD.write_item_meta("put-twice", None, "2099-01-01", origin="put")
         code, out, err = self.run_put("put-twice", "--stdin", stdin="second")
         self.assertEqual((code, out), (2, ""))
         self.assertIn("--replace", err)
@@ -428,6 +429,74 @@ class Put(unittest.TestCase):
         self.assertEqual((code, out), (0, "stored put-twice\n"))
         self.assertEqual(KD.keychain_get("put-twice"), "second")
         self.assertEqual(KD.read_items()["put-twice"]["rotate_by"], "2099-01-01")
+
+    def audit_events(self, name):
+        if not os.path.exists(KD.AUDIT_FILE):
+            return []
+        lines = Path(KD.AUDIT_FILE).read_text().splitlines()
+        return [l.split("\t")[2] for l in lines if l.split("\t")[1] == name]
+
+    def page_store(self, act, name, value):
+        h = object.__new__(KD.VaultHandler)
+        h.server = types.SimpleNamespace(write_allowed=lambda: True, audit=lambda *x: None,
+                                         issue_csrf=lambda: "csrf")
+        responses = []
+        h._page = lambda path, code=200, error="", **kw: responses.append((code, error))
+        h._done = lambda path, msg: responses.append((303, msg))
+        h._rate_limited = lambda *a: False
+        h._store("/token", act, name, {"value": [value]})
+        self.assertEqual(responses[-1][0], 303, responses)
+
+    def assert_replace_refused(self, name, kept):
+        code, out, err = self.run_put(name, "--stdin", "--replace", stdin="from-put")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("not stored by put", err)
+        self.assertNotIn(kept, err)
+        self.assertNotIn("from-put", err)
+        self.assertEqual(KD.keychain_get(name), kept)
+        self.assertEqual(self.audit_events(name)[-1], "put refused")
+
+    def test_replace_refused_on_a_page_stored_item(self):
+        self.page_store("add", "put-page", "page-value")
+        self.assert_replace_refused("put-page", "page-value")
+        # Without --replace too: the origin answer comes first.
+        self.assertIn("not stored by put", self.run_put("put-page", "--generate")[2])
+        # A put-made item stops being put's once a human changes it on the page.
+        self.assertEqual(self.run_put("put-then-page", "--stdin", stdin="first")[0], 0)
+        self.page_store("replace", "put-then-page", "human-value")
+        self.assertNotIn("origin", KD.read_items()["put-then-page"])
+        self.assert_replace_refused("put-then-page", "human-value")
+
+    def test_replace_refused_on_an_item_with_no_origin(self):
+        KD.keychain_store("put-legacy", "legacy-value")
+        KD.write_item_meta("put-legacy", None, "")
+        self.assert_replace_refused("put-legacy", "legacy-value")
+        KD.keychain_store("put-no-meta", "unlisted-value")       # no items.json entry at all
+        self.assertNotIn("put-no-meta", KD.read_items())
+        self.assert_replace_refused("put-no-meta", "unlisted-value")
+        # A hand-edited origin other than exactly "put" doesn't count.
+        KD.keychain_store("put-odd", "odd-value")
+        data = json.loads(Path(KD.ITEMS_FILE).read_text())
+        data["put-odd"] = {"schema": None, "rotate_by": "", "origin": "PUT"}
+        Path(KD.ITEMS_FILE).write_text(json.dumps(data))
+        self.assert_replace_refused("put-odd", "odd-value")
+
+    def test_replace_allowed_on_a_put_made_item_and_audited(self):
+        code, _, _ = self.run_put("put-own", "--stdin", stdin="own-first")
+        self.assertEqual(code, 0)
+        self.assertEqual(KD.read_items()["put-own"]["origin"], "put")
+        code, out, _ = self.run_put("put-own", "--stdin", "--replace", stdin="own-second")
+        self.assertEqual((code, out), (0, "stored put-own\n"))
+        self.assertEqual(KD.keychain_get("put-own"), "own-second")
+        self.assertEqual(KD.read_items()["put-own"]["origin"], "put")
+        self.assertEqual(self.audit_events("put-own"), ["put stored", "put replaced"])
+        audit = Path(KD.AUDIT_FILE).read_text()
+        for value in ("own-first", "own-second"):
+            self.assertNotIn(value, audit)
+        self.assertEqual(oct(os.stat(KD.AUDIT_FILE).st_mode & 0o777), "0o600")
+        with patch.object(KD, "keychain_get", return_value=None):
+            self.assertEqual(self.run_put("put-own", "--stdin", "--replace", stdin="own-third")[0], 1)
+        self.assertEqual(self.audit_events("put-own")[-1], "put failed")
 
     def test_stdin(self):
         code, out, _ = self.run_put("put-token", "--stdin", stdin="tok-from-a-pipe\n")

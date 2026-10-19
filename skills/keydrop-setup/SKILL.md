@@ -216,6 +216,19 @@ When a task needs a secret you don't have:
    check it exists, look for the name in `keydrop list` (`get` on a credential
    without `--field` fails even when the item is there).
 
+When the value starts on this machine instead (a password for an account
+you are signing up for, a token another local tool prints), store it with
+`put` (spec 6.1). No link, no page, and the value never touches argv or
+stdout:
+
+    keydrop put example-site --generate --username agent@example.com
+    some-tool --print-token | keydrop put example-token --stdin
+
+`put` is only for values you own. It can replace an item only if `put` made
+it and you pass `--replace`; anything the user stored or changed through a
+page is out of its reach. If a site rejects the generated password, try a
+different `--length`, and ask the user before falling back to `request`.
+
 If the user pastes a secret into the chat anyway, don't repeat it. Tell them
 it is now in the transcript and suggest they rotate it, then offer a link for
 the new one.

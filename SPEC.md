@@ -361,8 +361,16 @@ this machine (section 1).
   same policy check (5.5, I12), the same item encoding (with `--username`, a
   `credential` envelope per 5.4 and the same field definitions), the same
   size limit and the same verified store (I6).
-- It refuses a name that already exists unless given `--replace`, and a name
-  with a pending request. A replace keeps the item's rotate-by date.
+- It records `"origin": "put"` in the item's `items.json` entry. Any other
+  write (a page store, a rotation, the vault) rewrites the entry without it.
+- It refuses a name with a pending request. It refuses a name that already
+  exists unless given `--replace`, and refuses even with `--replace` unless
+  the entry says `origin: put`: a value a human stored, or one from before
+  origins were recorded, is never replaceable from `put`. A replace keeps the
+  item's rotate-by date.
+- Every `put` (stored, replaced, refused for origin, failed) is a line in
+  `home-audit.log` as well as the request log, in the same
+  time/name/event shape and never with a value.
 - Exit status as above: 2 for a refusal, including an existing name.
 
 ## 7. UX contract

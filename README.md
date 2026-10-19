@@ -125,8 +125,10 @@ digits and `-_.!@#%+=`, with at least one of each. `--stdin` reads the value
 from a pipe, or prompts without echo at a terminal. Neither ever takes the
 value as an argument, and `put` never prints it: read it back with `get`.
 `--username` stores a credential exactly as the form would, so policy has to
-allow credentials. `put` refuses a name that already exists unless given
-`--replace`, and refuses a name with a request pending.
+allow credentials. `put` refuses a name with a request pending, and a name
+that already exists unless given `--replace`. `--replace` only works on items
+`put` made: anything stored or changed through a page stays out of its reach,
+whatever the flags. Every `put` is written to `home-audit.log`.
 
 ### Credentials and other typed items
 

@@ -504,18 +504,28 @@ def read_items():
             schema = validate_schema(item["schema"]) if item.get("schema") else None
             date = rotation_date(item.get("rotate_by", ""))
             result[name] = {"schema": schema, "rotate_by": date}
+            if item.get("origin") == PUT_ORIGIN:
+                result[name]["origin"] = PUT_ORIGIN
         return result
     except (OSError, ValueError, KeydropError, TypeError):
         return {}
 
 
-def write_item_meta(name, schema, rotate_by):
+PUT_ORIGIN = "put"
+
+
+def write_item_meta(name, schema, rotate_by, origin=None):
+    """Every value write rewrites the entry. Only put passes an origin, so any
+    other write (the page, the vault) leaves the item with none: a human has
+    touched it and put may no longer replace it (SPEC 6.1)."""
     with meta_lock():
         data = read_items()
         if schema is None and rotate_by is None:
             data.pop(name, None)
         else:
             data[name] = {"schema": schema, "rotate_by": rotate_by or ""}
+            if origin == PUT_ORIGIN:
+                data[name]["origin"] = PUT_ORIGIN
         fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump(data, f)
@@ -2086,20 +2096,34 @@ def put(name, value, username=None, note="", replace=False):
            and (not isinstance(r.get("pid"), int) or alive(r["pid"])) for r in read_pending()):
         raise RefusedError(f"a request for {name} is pending (keydrop cancel {name} first)")
     exists = STORE.exists(name)
+    previous = read_items().get(name, {})
+    if exists and previous.get("origin") != PUT_ORIGIN:
+        # Stored through the page, or before origins were recorded: a human's
+        # value. No flag reaches it from here.
+        put_audit(name, "put refused")
+        raise RefusedError(f"{name} was not stored by put, so put can't replace it "
+                           "(change it from the page)")
     if exists and not replace:
         raise RefusedError(f"{name} already exists (--replace to overwrite it)")
     try:
         STORE.store(name, item, typed=bool(schema))
-        # A replace keeps the rotate-by date the owner set, as the page does.
-        write_item_meta(name, schema, read_items().get(name, {}).get("rotate_by", "") if exists else "")
+        # A replace keeps the rotate-by date, as the page does.
+        write_item_meta(name, schema, previous.get("rotate_by", "") if exists else "",
+                        origin=PUT_ORIGIN)
     except (KeydropError, OSError, subprocess.TimeoutExpired):
-        log(name, "put failed")
+        put_audit(name, "put failed")
         raise
     finally:
         item = None
     if note or not exists:
         write_note(name, note or None)
-    log(name, "put " + ("replaced" if exists else "stored"))
+    put_audit(name, "put " + ("replaced" if exists else "stored"))
+
+
+def put_audit(name, event):
+    """Both logs, as the home page audits its writes: name and event, never a value."""
+    log(name, event)
+    audit_line(name, event)
 
 
 def put_cli(rest):
