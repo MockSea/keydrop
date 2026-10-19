@@ -128,7 +128,9 @@ value as an argument, and `put` never prints it: read it back with `get`.
 allow credentials. `put` refuses a name with a request pending, and a name
 that already exists unless given `--replace`. `--replace` only works on items
 `put` made: anything stored or changed through a page stays out of its reach,
-whatever the flags. Every `put` is written to `home-audit.log`.
+whatever the flags, as long as the agent can only run `keydrop put` and `get`
+(one that can edit keydrop's state folder or run `security` itself can get
+around it). Every `put` is written to `home-audit.log`.
 
 ### Credentials and other typed items
 

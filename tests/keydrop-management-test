@@ -436,7 +436,7 @@ class Put(unittest.TestCase):
         lines = Path(KD.AUDIT_FILE).read_text().splitlines()
         return [l.split("\t")[2] for l in lines if l.split("\t")[1] == name]
 
-    def page_store(self, act, name, value):
+    def page_store(self, act, name, value, expect=303):
         h = object.__new__(KD.VaultHandler)
         h.server = types.SimpleNamespace(write_allowed=lambda: True, audit=lambda *x: None,
                                          issue_csrf=lambda: "csrf")
@@ -445,7 +445,119 @@ class Put(unittest.TestCase):
         h._done = lambda path, msg: responses.append((303, msg))
         h._rate_limited = lambda *a: False
         h._store("/token", act, name, {"value": [value]})
-        self.assertEqual(responses[-1][0], 303, responses)
+        self.assertEqual(responses[-1][0], expect, responses)
+
+    def oneshot_store(self, name, value):
+        h = object.__new__(KD.Handler)
+        h.server = types.SimpleNamespace(name=name, note="", schema=None, outcome=None)
+        h._authorised = lambda: "/token"
+        h._read_form = lambda n: {"value": [value]}
+        h._send = lambda *a: None
+        h.do_POST()
+        return h.server.outcome
+
+    def test_failed_page_store_leaves_no_put_origin(self):
+        """The store writes the value before its verification can fail, so a
+        page write that fails partway may still have replaced put's value with
+        the human's. The origin must already be gone by then."""
+        def entries_fail():
+            raise KD.KeydropError("Couldn't read the keychain.")
+        cases = (("vault verify", "keychain_entries", entries_fail, lambda n, v: self.page_store("replace", n, v, 500)),
+                 ("vault meta", "write_item_meta", OSError, lambda n, v: self.page_store("replace", n, v, 500)),
+                 ("one-shot verify", "keychain_entries", entries_fail, lambda n, v: self.assertEqual(self.oneshot_store(n, v), "store-failed")),
+                 ("one-shot meta", "write_item_meta", OSError, lambda n, v: self.assertEqual(self.oneshot_store(n, v), "store-failed")))
+        for i, (label, target, effect, store) in enumerate(cases):
+            with self.subTest(label):
+                name = f"put-half-{i}"
+                self.assertEqual(self.run_put(name, "--stdin", stdin="agent-value")[0], 0)
+                KD.write_item_meta(name, None, "2099-01-01", origin="put")
+                with patch.object(KD, target, side_effect=effect):
+                    store(name, "human-value")
+                self.assertEqual(KD.keychain_get(name), "human-value")   # it did land
+                self.assertEqual(KD.read_items()[name], {"schema": None, "rotate_by": "2099-01-01"})
+                self.assert_replace_refused(name, "human-value")
+
+    def assert_store_lock_held(self, run):
+        """Every step from the existence check to the meta write runs with
+        store.lock held: a second flock on it, as another process would take,
+        is refused at each one."""
+        seen = []
+
+        def probe(step, real):
+            def wrapped(*a, **kw):
+                fd = os.open(os.path.join(KD.STATE_DIR, "store.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    KD.fcntl.flock(fd, KD.fcntl.LOCK_EX | KD.fcntl.LOCK_NB)
+                    seen.append((step, "free"))
+                except BlockingIOError:
+                    seen.append((step, "held"))
+                finally:
+                    os.close(fd)
+                return real(*a, **kw)
+            return wrapped
+        with patch.object(KD.STORE, "exists", probe("exists", KD.STORE.exists)), \
+                patch.object(KD, "read_items", probe("read_items", KD.read_items)), \
+                patch.object(KD.STORE, "store", probe("store", KD.STORE.store)), \
+                patch.object(KD, "write_item_meta", probe("meta", KD.write_item_meta)):
+            run()
+        return seen
+
+    def test_put_holds_the_store_lock_from_check_to_meta(self):
+        self.assertEqual(self.run_put("put-locked", "--stdin", stdin="first")[0], 0)
+        seen = self.assert_store_lock_held(
+            lambda: self.assertEqual(self.run_put("put-locked", "--stdin", "--replace", stdin="second")[0], 0))
+        steps = [step for step, _ in seen]
+        for step in ("exists", "read_items", "store", "meta"):
+            self.assertIn(step, steps)
+        self.assertEqual({state for _, state in seen}, {"held"}, seen)
+
+    def test_pages_hold_the_store_lock_across_the_write(self):
+        self.page_store("add", "put-page-locked", "v1")
+        seen = self.assert_store_lock_held(lambda: self.page_store("replace", "put-page-locked", "v2"))
+        held = [step for step, state in seen if state == "held"]
+        self.assertIn("store", held)
+        self.assertIn("meta", held)
+        self.assertNotIn(("store", "free"), seen)
+        self.assertNotIn(("meta", "free"), seen)
+        seen = self.assert_store_lock_held(lambda: self.assertEqual(self.oneshot_store("put-oneshot-locked", "v"), "stored"))
+        self.assertIn(("store", "held"), seen)
+        self.assertIn(("meta", "held"), seen)
+        self.assertNotIn(("store", "free"), seen)
+        self.assertNotIn(("meta", "free"), seen)
+
+    def test_put_waits_for_a_page_store_in_flight(self):
+        """The race itself: a page store holds the lock, and put must not
+        decide anything until it lets go. Deterministic: put runs in a thread
+        and its first lock-guarded step signals; the test checks it hasn't
+        happened while the lock is held, then releases."""
+        import threading
+        self.assertEqual(self.run_put("put-race", "--stdin", stdin="agent-value")[0], 0)
+        started, result = threading.Event(), {}
+        real_exists = KD.STORE.exists
+
+        def exists(name):
+            started.set()
+            return real_exists(name)
+        with patch.object(KD.STORE, "exists", exists):
+            with KD.store_lock():
+                t = threading.Thread(target=lambda: result.update(code=self.run_put_quiet("put-race", "--stdin", "--replace", stdin="agent-second")))
+                t.start()
+                # Bounded wait only to fail fast if put ignores the lock.
+                self.assertFalse(started.wait(0.5), "put checked the item while a page store held the lock")
+                # The page's write, under the lock put is waiting on.
+                KD.clear_put_origin("put-race")
+                KD.keychain_store("put-race", "human-value")
+                KD.write_item_meta("put-race", None, "")
+            t.join(30)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["code"], 2)
+        self.assertEqual(KD.keychain_get("put-race"), "human-value")
+
+    def run_put_quiet(self, *args, stdin=""):
+        # redirect_stdout is process-wide; a thread uses main directly with patched streams.
+        with patch.object(sys, "stdin", io.StringIO(stdin)), \
+                patch.object(sys, "stdout", io.StringIO()), patch.object(sys, "stderr", io.StringIO()):
+            return KD.main(["put", *args])
 
     def assert_replace_refused(self, name, kept):
         code, out, err = self.run_put(name, "--stdin", "--replace", stdin="from-put")

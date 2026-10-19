@@ -362,12 +362,21 @@ this machine (section 1).
   `credential` envelope per 5.4 and the same field definitions), the same
   size limit and the same verified store (I6).
 - It records `"origin": "put"` in the item's `items.json` entry. Any other
-  write (a page store, a rotation, the vault) rewrites the entry without it.
+  write (a page store, a rotation, the vault) rewrites the entry without it,
+  and drops the origin before it touches the store, so a write that fails
+  partway leaves the item unreplaceable rather than still marked as `put`'s.
 - It refuses a name with a pending request. It refuses a name that already
   exists unless given `--replace`, and refuses even with `--replace` unless
   the entry says `origin: put`: a value a human stored, or one from before
   origins were recorded, is never replaceable from `put`. A replace keeps the
-  item's rotate-by date.
+  item's rotate-by date. `put` holds one lock (a `flock` in the state
+  directory, which the pages also take around their writes) from these
+  checks to its metadata write, so a page store can't land between the
+  origin check and the store. This guarantee holds only if the agent's
+  unprompted permissions are limited to `keydrop put` and `keydrop get`: the
+  origin is an unauthenticated field in a 0600 file owned by the same user,
+  so an agent with write access to the state directory, or a free shell
+  (`security add-generic-password -U`), can get around it.
 - Every `put` (stored, replaced, refused for origin, failed) is a line in
   `home-audit.log` as well as the request log, in the same
   time/name/event shape and never with a value.

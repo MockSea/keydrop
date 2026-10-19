@@ -526,10 +526,27 @@ def write_item_meta(name, schema, rotate_by, origin=None):
             data[name] = {"schema": schema, "rotate_by": rotate_by or ""}
             if origin == PUT_ORIGIN:
                 data[name]["origin"] = PUT_ORIGIN
-        fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(ITEMS_FILE + ".tmp", ITEMS_FILE)
+        _write_items(data)
+
+
+def clear_put_origin(name):
+    """A page write calls this before it touches the store, keeping the
+    schema and rotate-by date. If the store or its verification then fails
+    partway, the value may already be the human's, and it must not still say
+    put made it (SPEC 6.1): the failure leaves the item unreplaceable."""
+    with meta_lock():
+        data = read_items()
+        if data.get(name, {}).get("origin") == PUT_ORIGIN:
+            data[name] = {k: v for k, v in data[name].items() if k != "origin"}
+            _write_items(data)
+
+
+def _write_items(data):
+    """Callers hold meta_lock."""
+    fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(ITEMS_FILE + ".tmp", ITEMS_FILE)
 
 
 def rotation_date(value):
@@ -993,6 +1010,15 @@ class meta_lock(serve_lock):
 
 class ledger_lock(serve_lock):
     FILE = "routes.lock"
+
+
+class store_lock(serve_lock):
+    """Held across a value write's whole check-store-meta sequence, by put and
+    by both pages, so put's origin check and its write see the same item: a
+    page store can't land between them (SPEC 6.1). A flock, so it holds
+    across processes. Taken before meta_lock and never while holding it;
+    flock on a second fd blocks even in the same process, so it never nests."""
+    FILE = "store.lock"
 
 
 def read_ledger():
@@ -1536,10 +1562,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(400, render_form(self.server.name, self.server.note, path, message, proposal, getattr(self.server, "expires", None)).encode())
             return
         try:
-            STORE.store(self.server.name, value, typed=bool(schema))
-            # A one-shot store keeps whatever rotate-by date the owner set.
-            write_item_meta(self.server.name, schema,
-                            read_items().get(self.server.name, {}).get("rotate_by", ""))
+            with store_lock():
+                clear_put_origin(self.server.name)
+                STORE.store(self.server.name, value, typed=bool(schema))
+                # A one-shot store keeps whatever rotate-by date the owner set.
+                write_item_meta(self.server.name, schema,
+                                read_items().get(self.server.name, {}).get("rotate_by", ""))
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.outcome = "store-failed"
             self._send(500, render_message("Couldn't store it. Tell whoever sent you the link.").encode())
@@ -1734,8 +1762,10 @@ class VaultHandler(Handler):
         if self._rate_limited(path, name, act):
             return
         try:
-            STORE.store(name, value, typed=bool(schema))
-            write_item_meta(name, schema, rotate_by)
+            with store_lock():
+                clear_put_origin(name)
+                STORE.store(name, value, typed=bool(schema))
+                write_item_meta(name, schema, rotate_by)
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.audit(name, f"{act} failed")
             self._page(path, 500, f"Couldn't store {name}.")
@@ -2090,14 +2120,36 @@ def put(name, value, username=None, note="", replace=False):
     if not STORE.fits(name, item, bool(schema)):
         raise RefusedError(TOO_LONG)
     ensure_state()
+    try:
+        # One lock from the checks to the meta write, shared with the pages:
+        # a page store can't land between the origin check and the store.
+        with store_lock():
+            exists = put_check(name, replace)
+            previous = read_items().get(name, {})
+            try:
+                STORE.store(name, item, typed=bool(schema))
+                # A replace keeps the rotate-by date, as the page does.
+                write_item_meta(name, schema, previous.get("rotate_by", "") if exists else "",
+                                origin=PUT_ORIGIN)
+            except (KeydropError, OSError, subprocess.TimeoutExpired):
+                put_audit(name, "put failed")
+                raise
+    finally:
+        item = None
+    if note or not exists:
+        write_note(name, note or None)
+    put_audit(name, "put " + ("replaced" if exists else "stored"))
+
+
+def put_check(name, replace):
+    """Whether put may write name, and whether it exists. Called under store_lock."""
     # A live request page for this name would race the write. A record with no
     # pid yet counts as live; put never reaps, so it never touches the transport.
     if any(r.get("name") == name and not r.get("teardown_failed")
            and (not isinstance(r.get("pid"), int) or alive(r["pid"])) for r in read_pending()):
         raise RefusedError(f"a request for {name} is pending (keydrop cancel {name} first)")
     exists = STORE.exists(name)
-    previous = read_items().get(name, {})
-    if exists and previous.get("origin") != PUT_ORIGIN:
+    if exists and read_items().get(name, {}).get("origin") != PUT_ORIGIN:
         # Stored through the page, or before origins were recorded: a human's
         # value. No flag reaches it from here.
         put_audit(name, "put refused")
@@ -2105,19 +2157,7 @@ def put(name, value, username=None, note="", replace=False):
                            "(change it from the page)")
     if exists and not replace:
         raise RefusedError(f"{name} already exists (--replace to overwrite it)")
-    try:
-        STORE.store(name, item, typed=bool(schema))
-        # A replace keeps the rotate-by date, as the page does.
-        write_item_meta(name, schema, previous.get("rotate_by", "") if exists else "",
-                        origin=PUT_ORIGIN)
-    except (KeydropError, OSError, subprocess.TimeoutExpired):
-        put_audit(name, "put failed")
-        raise
-    finally:
-        item = None
-    if note or not exists:
-        write_note(name, note or None)
-    put_audit(name, "put " + ("replaced" if exists else "stored"))
+    return exists
 
 
 def put_audit(name, event):
