@@ -322,6 +322,7 @@ are part of the contract so that one skill can drive any implementation.
 | `config` | prints settings in effect, including policy and chosen adapters |
 | `vault [--ttl D]` | OPTIONAL. opens a vault session |
 | `home [--new-link \| --stop \| --unlock]` | OPTIONAL. the always-on page |
+| `put <name> (--generate \| --stdin) [--username U] [--replace]` | OPTIONAL. the local write path (6.1) |
 
 Exit status: 0 on success, 1 when the item doesn't exist, 2 for a refused
 request (bad name, disabled type, invalid TTL, policy), 3 for a vault or
@@ -341,6 +342,45 @@ The reference adds, beyond this contract:
   type, created and updated (ISO 8601, UTC), tab-separated.
 - `get <name> --field F` is required for every non-secret item, not just
   credentials.
+
+### 6.1 `put`, the local write path
+
+`request`, `vault` and `home` bring a value in from a person through a page.
+`put` is for a value that starts on the machine: a password the agent
+generates for an account it owns, or a token another local tool prints. It
+opens no page and no route, so I1 to I4 and I9 to I11 have nothing to apply
+to; like `get`, it trusts whoever can already run commands as the owner on
+this machine (section 1).
+
+- The value never touches argv or stdout. `--generate` makes it inside
+  keydrop from a CSPRNG; `--stdin` reads it from stdin (a no-echo prompt at a
+  terminal). Any other argument is refused without being echoed. On success
+  `put` prints `stored <name>`, plus the username when one was given, and
+  nothing else. I5 holds as for a form submit.
+- It is the form's write, not a second one: the same name check (5.6), the
+  same policy check (5.5, I12), the same item encoding (with `--username`, a
+  `credential` envelope per 5.4 and the same field definitions), the same
+  size limit and the same verified store (I6).
+- It records `"origin": "put"` in the item's `items.json` entry. Any other
+  write (a page store, a rotation, the vault) rewrites the entry without it,
+  and drops the origin before it touches the store, so a write that fails
+  partway leaves the item unreplaceable rather than still marked as `put`'s.
+- It refuses a name with a pending request. It refuses a name that already
+  exists unless given `--replace`, and refuses even with `--replace` unless
+  the entry says `origin: put`: a value a human stored, or one from before
+  origins were recorded, is never replaceable from `put`. A replace keeps the
+  item's rotate-by date. `put` holds one lock (a `flock` in the state
+  directory, which the pages also take around their writes) from these
+  checks to its metadata write, so a page store can't land between the
+  origin check and the store. This guarantee holds only if the agent's
+  unprompted permissions are limited to `keydrop put` and `keydrop get`: the
+  origin is an unauthenticated field in a 0600 file owned by the same user,
+  so an agent with write access to the state directory, or a free shell
+  (`security add-generic-password -U`), can get around it.
+- Every `put` (stored, replaced, refused for origin, failed) is a line in
+  `home-audit.log` as well as the request log, in the same
+  time/name/event shape and never with a value.
+- Exit status as above: 2 for a refusal, including an existing name.
 
 ## 7. UX contract
 

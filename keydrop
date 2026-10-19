@@ -9,6 +9,11 @@ instead of pasting it into a chat.
                               and deleting entries under the service prefix
     keydrop get <name> [--field F]
                               print the stored value, or one credential field
+    keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
+    keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
+                              local write, no page: a generated password or a
+                              value piped in; prints `stored <name>`, never the
+                              value. --username stores a credential
     keydrop list [--long]     names only; --long adds type, created, updated
     keydrop status            pending requests and vault sessions
     keydrop cancel <name>     stop a pending request (`cancel vault` ends a session)
@@ -499,22 +504,49 @@ def read_items():
             schema = validate_schema(item["schema"]) if item.get("schema") else None
             date = rotation_date(item.get("rotate_by", ""))
             result[name] = {"schema": schema, "rotate_by": date}
+            if item.get("origin") == PUT_ORIGIN:
+                result[name]["origin"] = PUT_ORIGIN
         return result
     except (OSError, ValueError, KeydropError, TypeError):
         return {}
 
 
-def write_item_meta(name, schema, rotate_by):
+PUT_ORIGIN = "put"
+
+
+def write_item_meta(name, schema, rotate_by, origin=None):
+    """Every value write rewrites the entry. Only put passes an origin, so any
+    other write (the page, the vault) leaves the item with none: a human has
+    touched it and put may no longer replace it (SPEC 6.1)."""
     with meta_lock():
         data = read_items()
         if schema is None and rotate_by is None:
             data.pop(name, None)
         else:
             data[name] = {"schema": schema, "rotate_by": rotate_by or ""}
-        fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(ITEMS_FILE + ".tmp", ITEMS_FILE)
+            if origin == PUT_ORIGIN:
+                data[name]["origin"] = PUT_ORIGIN
+        _write_items(data)
+
+
+def clear_put_origin(name):
+    """A page write calls this before it touches the store, keeping the
+    schema and rotate-by date. If the store or its verification then fails
+    partway, the value may already be the human's, and it must not still say
+    put made it (SPEC 6.1): the failure leaves the item unreplaceable."""
+    with meta_lock():
+        data = read_items()
+        if data.get(name, {}).get("origin") == PUT_ORIGIN:
+            data[name] = {k: v for k, v in data[name].items() if k != "origin"}
+            _write_items(data)
+
+
+def _write_items(data):
+    """Callers hold meta_lock."""
+    fd = os.open(ITEMS_FILE + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(ITEMS_FILE + ".tmp", ITEMS_FILE)
 
 
 def rotation_date(value):
@@ -684,7 +716,7 @@ def keychain_get(name):
     that happens to be hex. `-g` marks the two forms apart on stderr:
     `password: "text"` or `password: 0xHEX  "escaped"`."""
     r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT,
-                        "-s", service(name), "-g"], capture_output=True, text=True)
+                        "-s", service(name), "-g"], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         return None
     line = next((l for l in r.stderr.splitlines() if l.startswith("password: ")), None)
@@ -978,6 +1010,15 @@ class meta_lock(serve_lock):
 
 class ledger_lock(serve_lock):
     FILE = "routes.lock"
+
+
+class store_lock(serve_lock):
+    """Held across a value write's whole check-store-meta sequence, by put and
+    by both pages, so put's origin check and its write see the same item: a
+    page store can't land between them (SPEC 6.1). A flock, so it holds
+    across processes. Taken before meta_lock and never while holding it;
+    flock on a second fd blocks even in the same process, so it never nests."""
+    FILE = "store.lock"
 
 
 def read_ledger():
@@ -1521,10 +1562,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(400, render_form(self.server.name, self.server.note, path, message, proposal, getattr(self.server, "expires", None)).encode())
             return
         try:
-            STORE.store(self.server.name, value, typed=bool(schema))
-            # A one-shot store keeps whatever rotate-by date the owner set.
-            write_item_meta(self.server.name, schema,
-                            read_items().get(self.server.name, {}).get("rotate_by", ""))
+            with store_lock():
+                clear_put_origin(self.server.name)
+                STORE.store(self.server.name, value, typed=bool(schema))
+                # A one-shot store keeps whatever rotate-by date the owner set.
+                write_item_meta(self.server.name, schema,
+                                read_items().get(self.server.name, {}).get("rotate_by", ""))
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.outcome = "store-failed"
             self._send(500, render_message("Couldn't store it. Tell whoever sent you the link.").encode())
@@ -1719,8 +1762,10 @@ class VaultHandler(Handler):
         if self._rate_limited(path, name, act):
             return
         try:
-            STORE.store(name, value, typed=bool(schema))
-            write_item_meta(name, schema, rotate_by)
+            with store_lock():
+                clear_put_origin(name)
+                STORE.store(name, value, typed=bool(schema))
+                write_item_meta(name, schema, rotate_by)
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.audit(name, f"{act} failed")
             self._page(path, 500, f"Couldn't store {name}.")
@@ -2024,6 +2069,146 @@ def request(name, note, ttl, plain_http=False, schema=None):
     srv = claim_port(lambda: OneShot(token, name, note, True, schema=schema), serve_ports_in_use())
     srv.expires = time.time() + ttl
     return launch(srv, token, {"name": name, "note": note}, ttl, host, plain_http)
+
+
+PUT_LENGTH = 24
+PUT_LENGTH_MIN, PUT_LENGTH_MAX = 12, 128
+PUT_CLASSES = ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789",
+               "-_.!@#%+=")   # no quotes, backslash, space, $ or `: nothing a shell or form mangles
+
+
+def generate_password(length=PUT_LENGTH):
+    """Uniform over the alphabet, redrawn until every class is present, so the
+    class rule adds no bias toward any position."""
+    if not PUT_LENGTH_MIN <= length <= PUT_LENGTH_MAX:
+        raise RefusedError(f"--length must be between {PUT_LENGTH_MIN} and {PUT_LENGTH_MAX}")
+    alphabet = "".join(PUT_CLASSES)
+    while True:
+        value = "".join(secrets.choice(alphabet) for _ in range(length))
+        if all(any(c in cls for c in value) for cls in PUT_CLASSES):
+            return value
+
+
+def read_stdin_value():
+    """The value for `put --stdin`. A terminal gets a no-echo prompt; a pipe is
+    read to EOF, capped, and one trailing newline dropped (echo adds one)."""
+    if sys.stdin is None:
+        raise RefusedError("--stdin needs a value on stdin")
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("value: ")
+    raw = sys.stdin.read(8193)
+    if len(raw.encode("utf-8", "surrogatepass")) > 8192:
+        raise RefusedError("Value is too long.")
+    return raw[:-2] if raw.endswith("\r\n") else raw[:-1] if raw.endswith("\n") else raw
+
+
+def put(name, value, username=None, note="", replace=False):
+    """The local write path (SPEC 6.1): the same validation, policy, verified
+    store and metadata as a form submit, with no page. The item is built by
+    submitted_item from form-shaped fields, so a credential's envelope and
+    items.json schema are exactly the form's."""
+    if not valid_name(name):
+        raise RefusedError("name must be [a-z0-9._-], 1-64 chars")
+    note = clean_note(note)
+    if username is None:
+        fields, schema = {"value": [value]}, None
+    else:
+        fields, schema = {"f_username": [username], "f_password": [value]}, credential_schema(name)
+    item, schema = submitted_item(fields, schema)   # check_policy runs in here
+    value = fields = None
+    if not STORE.fits(name, item, bool(schema)):
+        raise RefusedError(TOO_LONG)
+    ensure_state()
+    try:
+        # One lock from the checks to the meta write, shared with the pages:
+        # a page store can't land between the origin check and the store.
+        with store_lock():
+            try:
+                exists = put_check(name, replace)
+            except (OSError, subprocess.TimeoutExpired):
+                put_audit(name, "put failed")
+                raise KeydropError("couldn't check the keychain") from None
+            previous = read_items().get(name, {})
+            try:
+                STORE.store(name, item, typed=bool(schema))
+                # A replace keeps the rotate-by date, as the page does.
+                write_item_meta(name, schema, previous.get("rotate_by", "") if exists else "",
+                                origin=PUT_ORIGIN)
+            except (KeydropError, OSError, subprocess.TimeoutExpired):
+                put_audit(name, "put failed")
+                raise
+    finally:
+        item = None
+    if note or not exists:
+        write_note(name, note or None)
+    put_audit(name, "put " + ("replaced" if exists else "stored"))
+
+
+def put_check(name, replace):
+    """Whether put may write name, and whether it exists. Called under store_lock."""
+    # A live request page for this name would race the write. A record with no
+    # pid yet counts as live; put never reaps, so it never touches the transport.
+    if any(r.get("name") == name and not r.get("teardown_failed")
+           and (not isinstance(r.get("pid"), int) or alive(r["pid"])) for r in read_pending()):
+        raise RefusedError(f"a request for {name} is pending (keydrop cancel {name} first)")
+    exists = STORE.exists(name)
+    if exists and read_items().get(name, {}).get("origin") != PUT_ORIGIN:
+        # Stored through the page, or before origins were recorded: a human's
+        # value. No flag reaches it from here.
+        put_audit(name, "put refused")
+        raise RefusedError(f"{name} was not stored by put, so put can't replace it "
+                           "(change it from the page)")
+    if exists and not replace:
+        raise RefusedError(f"{name} already exists (--replace to overwrite it)")
+    return exists
+
+
+def put_audit(name, event):
+    """Both logs, as the home page audits its writes: name and event, never a value."""
+    log(name, event)
+    audit_line(name, event)
+
+
+def put_cli(rest):
+    name, username, note, length = None, None, "", None
+    generate = from_stdin = replace = False
+    it = iter(rest)
+    for a in it:
+        if a == "--generate":
+            generate = True
+        elif a == "--stdin":
+            from_stdin = True
+        elif a == "--replace":
+            replace = True
+        elif a == "--length":
+            try:
+                length = int(next(it, ""))
+            except ValueError:
+                raise RefusedError("--length takes a number")
+        elif a == "--username":
+            username = next(it, None)
+            if username is None:
+                raise RefusedError("--username takes a value")
+        elif a == "--note":
+            note = next(it, "")
+        elif name is None and not a.startswith("-"):
+            name = a
+        else:
+            # Never echo the argument: it may be a value someone tried to pass.
+            raise RefusedError("put takes no value on the command line: use --generate, "
+                               "or pipe it in with --stdin")
+    if name is None:
+        raise RefusedError("put needs a name")
+    if generate == from_stdin:
+        raise RefusedError("put needs exactly one of --generate and --stdin")
+    if length is not None and not generate:
+        raise RefusedError("--length goes with --generate")
+    value = generate_password(length or PUT_LENGTH) if generate else read_stdin_value()
+    put(name, value, username, note, replace)
+    value = None
+    print(f"stored {name}" + (f" (username {username})" if username is not None else ""))
+    return 0
 
 
 def vault(ttl, plain_http=False):
@@ -2618,6 +2803,9 @@ def main(argv):
             return 0
         if cmd == "home":
             return home_cli(rest)
+        if cmd == "put":
+            # Gated like get: config only. No page opens, so there is no owner login to pin.
+            return put_cli(rest)
         if cmd == "get" and (len(rest) == 1 or len(rest) == 3 and rest[1] == "--field"):
             if not valid_name(rest[0]):
                 raise KeydropError("bad name")
