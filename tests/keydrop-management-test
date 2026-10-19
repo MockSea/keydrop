@@ -4,7 +4,7 @@
 The vault handler is built without a server (object.__new__ plus a namespace
 standing in for it), and the keychain is the fake in tests/fakes.py, so this
 runs on any machine with python3. Covers SPEC 5 (schemas, credential fields,
-policy), 6 (request --type/--fields, get --field, list --long) and the keychain
+policy), 6 (request --type/--fields, get --field, list --long), 6.1 (put) and the keychain
 adapter's limits.
 
     tests/keydrop-management-test
@@ -335,6 +335,155 @@ class Management(unittest.TestCase):
             KD.main(["list"])
         self.assertIn("listed\n", out.getvalue())
         self.assertNotIn("\t", out.getvalue())
+
+
+class Put(unittest.TestCase):
+    """SPEC 6.1: `put`, the local write path. Same validation, policy and
+    verified store as the form; the value never on argv or stdout."""
+
+    def setUp(self):
+        KD.ensure_state()
+        Path(KD.POLICY_FILE).write_text(json.dumps({"types_enabled": ["secret", "credential"]}))
+
+    def run_put(self, *args, stdin=""):
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(sys, "stdin", io.StringIO(stdin)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = KD.main(["put", *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def state_text(self):
+        return "".join(p.read_text() for p in Path(KD.STATE_DIR).rglob("*") if p.is_file())
+
+    def test_generate_stores_and_prints_no_value(self):
+        run = KD.subprocess.run
+        with patch.object(KD.subprocess, "run", wraps=run) as spy:
+            code, out, err = self.run_put("put-gen", "--generate", "--note", "a new account")
+        self.assertEqual((code, out, err), (0, "stored put-gen\n", ""))
+        value = KD.keychain_get("put-gen")
+        self.assertEqual(len(value), KD.PUT_LENGTH)
+        for cls in KD.PUT_CLASSES:
+            self.assertTrue(any(c in cls for c in value), cls)
+        for call in spy.call_args_list:
+            self.assertNotIn(value, repr(call.args))
+            self.assertNotIn(value.encode().hex(), repr(call.args))
+        self.assertNotIn(value, self.state_text())
+        self.assertEqual(KD.read_notes()["put-gen"], "a new account")
+        self.assertEqual(KD.keychain_entries()["put-gen"]["type"], "secret")
+        self.assertIn("put-gen\tput stored", Path(KD.LOG_FILE).read_text())
+        # At the minimum length about 1 draw in 5 misses a class, so 200 draws
+        # catch a generator that skips the class rule.
+        for _ in range(200):
+            drawn = KD.generate_password(KD.PUT_LENGTH_MIN)
+            self.assertTrue(all(any(c in cls for c in drawn) for cls in KD.PUT_CLASSES), drawn)
+        code, _, _ = self.run_put("put-len", "--generate", "--length", "40")
+        self.assertEqual((code, len(KD.keychain_get("put-len"))), (0, 40))
+        for bad in ("11", "129", "x"):
+            with self.subTest(length=bad):
+                self.assertEqual(self.run_put("put-badlen", "--generate", "--length", bad)[0], 2)
+        self.assertIsNone(KD.keychain_get("put-badlen"))
+
+    def test_credential_envelope_matches_the_form(self):
+        h = object.__new__(KD.Handler)
+        h.server = types.SimpleNamespace(name="put-cred", note="", schema=KD.request_schema("put-cred", "credential"),
+                                         outcome=None)
+        h._authorised = lambda: "/token"
+        h._read_form = lambda n: {"f_username": ["agent@example.com"], "f_password": ["form-password"]}
+        h._send = lambda *a: None
+        h.do_POST()
+        self.assertEqual(h.server.outcome, "stored")
+        form_raw, form_meta = KD.keychain_get("put-cred"), KD.read_items()["put-cred"]
+        form_type = KD.keychain_entries()["put-cred"]["type"]
+        KD.keychain_delete("put-cred")
+        KD.write_item_meta("put-cred", None, None)
+
+        code, out, _ = self.run_put("put-cred", "--stdin", "--username", "agent@example.com",
+                                    stdin="form-password\n")
+        self.assertEqual((code, out), (0, "stored put-cred (username agent@example.com)\n"))
+        self.assertEqual(KD.keychain_get("put-cred"), form_raw)
+        self.assertEqual(KD.read_items()["put-cred"], form_meta)
+        self.assertEqual(KD.keychain_entries()["put-cred"]["type"], form_type)
+        self.assertEqual(json.loads(form_raw), {"keydrop": 1, "type": "credential",
+                                                "fields": {"username": "agent@example.com",
+                                                           "password": "form-password"}})
+        got = io.StringIO()
+        with contextlib.redirect_stdout(got):
+            self.assertEqual(KD.main(["get", "put-cred", "--field", "password"]), 0)
+        self.assertEqual(got.getvalue(), "form-password")
+
+        code, out, _ = self.run_put("put-cred-gen", "--generate", "--username", "agent@example.com")
+        self.assertEqual(code, 0)
+        password = KD.item_value("put-cred-gen", KD.keychain_get("put-cred-gen"), "password")
+        self.assertNotIn(password, out)
+        self.assertEqual(KD.read_items()["put-cred-gen"]["schema"], KD.credential_schema("put-cred-gen"))
+
+    def test_refuses_to_overwrite_without_replace(self):
+        self.assertEqual(self.run_put("put-twice", "--stdin", stdin="first")[0], 0)
+        KD.write_item_meta("put-twice", None, "2099-01-01")
+        code, out, err = self.run_put("put-twice", "--stdin", stdin="second")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("--replace", err)
+        self.assertEqual(KD.keychain_get("put-twice"), "first")
+        code, out, _ = self.run_put("put-twice", "--stdin", "--replace", stdin="second")
+        self.assertEqual((code, out), (0, "stored put-twice\n"))
+        self.assertEqual(KD.keychain_get("put-twice"), "second")
+        self.assertEqual(KD.read_items()["put-twice"]["rotate_by"], "2099-01-01")
+
+    def test_stdin(self):
+        code, out, _ = self.run_put("put-token", "--stdin", stdin="tok-from-a-pipe\n")
+        self.assertEqual((code, out), (0, "stored put-token\n"))
+        self.assertEqual(KD.keychain_get("put-token"), "tok-from-a-pipe")
+        self.assertNotIn("tok-from-a-pipe", self.state_text())
+        self.assertEqual(self.run_put("put-empty", "--stdin", stdin="\n")[0], 1)
+        self.assertEqual(self.run_put("put-huge", "--stdin", stdin="x" * 8193)[0], 2)
+        for name in ("put-empty", "put-huge"):
+            self.assertIsNone(KD.keychain_get(name))
+        self.assertEqual(self.run_put("put-both", "--stdin", "--generate")[0], 2)
+        self.assertEqual(self.run_put("put-neither")[0], 2)
+        self.assertEqual(self.run_put("put-len-stdin", "--stdin", "--length", "30", stdin="v")[0], 2)
+
+    def test_value_on_argv_is_rejected(self):
+        for args in (["put-argv", "value-on-argv"], ["put-argv", "--stdin", "value-on-argv"],
+                     ["put-argv", "--value", "value-on-argv"], ["put-argv", "--password=value-on-argv"]):
+            with self.subTest(args=args):
+                code, out, err = self.run_put(*args, stdin="from-stdin")
+                self.assertEqual(code, 2)
+                self.assertNotIn("value-on-argv", out + err)
+        self.assertIsNone(KD.keychain_get("put-argv"))
+
+    def test_invalid_name(self):
+        for name in ("Upper", "../escape", "a b", "x" * 65, "line\nbreak"):
+            with self.subTest(name=name):
+                code, _, err = self.run_put(name, "--stdin", stdin="v")
+                self.assertEqual(code, 2)
+                self.assertIn("name must be", err)
+        self.assertEqual(KD.keychain_entries().keys() & {"upper", "escape"}, set())
+
+    def test_credentials_disabled_by_policy_refuses(self):
+        Path(KD.POLICY_FILE).unlink()
+        code, out, err = self.run_put("put-off", "--generate", "--username", "agent@example.com")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("credential", err)
+        self.assertIsNone(KD.keychain_get("put-off"))
+        self.assertNotIn("put-off", KD.read_items())
+        Path(KD.POLICY_FILE).write_text(json.dumps({"types_enabled": ["credential"]}))
+        self.assertEqual(self.run_put("put-off", "--stdin", stdin="v")[0], 2)
+        self.assertIsNone(KD.keychain_get("put-off"))
+
+    def test_pending_request_for_the_name_refuses(self):
+        KD.write_pending({"id": "put-pending", "name": "put-pending", "pid": os.getpid()})
+        try:
+            with patch.object(KD, "alive", return_value=True):
+                self.assertEqual(self.run_put("put-pending", "--stdin", stdin="v")[0], 2)
+        finally:
+            os.unlink(os.path.join(KD.PENDING_DIR, "put-pending.json"))
+        self.assertIsNone(KD.keychain_get("put-pending"))
+
+    def test_failed_verification_reports_failure(self):
+        with patch.object(KD, "keychain_get", return_value=None):
+            code, out, err = self.run_put("put-mismatch", "--stdin", stdin="v")
+        self.assertEqual((code, out), (1, ""))
+        self.assertNotIn("put-mismatch", KD.read_items())
 
 
 if __name__ == "__main__":

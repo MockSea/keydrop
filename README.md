@@ -79,6 +79,8 @@ in effect.
                     [--type secret|credential|<template>] [--fields totp,url,notes]
     keydrop vault [--ttl 15m] [--http]
     keydrop get <name> [--field F]
+    keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
+    keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
     keydrop list [--long]
     keydrop status
     keydrop cancel <name>          (cancel vault ends a vault session)
@@ -106,6 +108,25 @@ stdout isn't a terminal, so `KEY=$(keydrop get openai-api-key)` works.
 `keydrop vault` prints a session link to a page that lists names, notes and
 times and lets you add, replace and delete entries under the service prefix.
 It never shows a stored value.
+
+### Storing a value from this machine
+
+`request` is for a value a person has. When the tool or agent on the Mac makes
+the value itself (say, the password for an account it is signing up for),
+`put` stores it directly, with no link and no page:
+
+    $ keydrop put example-site --generate --username agent@example.com
+    stored example-site (username agent@example.com)
+    $ some-tool --print-token | keydrop put example-token --stdin
+    stored example-token
+
+`--generate` makes a 24-character password (`--length` 12 to 128) of letters,
+digits and `-_.!@#%+=`, with at least one of each. `--stdin` reads the value
+from a pipe, or prompts without echo at a terminal. Neither ever takes the
+value as an argument, and `put` never prints it: read it back with `get`.
+`--username` stores a credential exactly as the form would, so policy has to
+allow credentials. `put` refuses a name that already exists unless given
+`--replace`, and refuses a name with a request pending.
 
 ### Credentials and other typed items
 
