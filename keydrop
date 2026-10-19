@@ -716,7 +716,7 @@ def keychain_get(name):
     that happens to be hex. `-g` marks the two forms apart on stderr:
     `password: "text"` or `password: 0xHEX  "escaped"`."""
     r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT,
-                        "-s", service(name), "-g"], capture_output=True, text=True)
+                        "-s", service(name), "-g"], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         return None
     line = next((l for l in r.stderr.splitlines() if l.startswith("password: ")), None)
@@ -2124,7 +2124,11 @@ def put(name, value, username=None, note="", replace=False):
         # One lock from the checks to the meta write, shared with the pages:
         # a page store can't land between the origin check and the store.
         with store_lock():
-            exists = put_check(name, replace)
+            try:
+                exists = put_check(name, replace)
+            except (OSError, subprocess.TimeoutExpired):
+                put_audit(name, "put failed")
+                raise KeydropError("couldn't check the keychain") from None
             previous = read_items().get(name, {})
             try:
                 STORE.store(name, item, typed=bool(schema))

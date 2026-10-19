@@ -610,6 +610,16 @@ class Put(unittest.TestCase):
             self.assertEqual(self.run_put("put-own", "--stdin", "--replace", stdin="own-third")[0], 1)
         self.assertEqual(self.audit_events("put-own")[-1], "put failed")
 
+    def test_a_keychain_timeout_in_the_check_is_audited_and_stores_nothing(self):
+        timeout = KD.subprocess.TimeoutExpired(["security"], 30)
+        with patch.object(KD.STORE, "exists", side_effect=timeout):
+            code, out, err = self.run_put("put-slow", "--stdin", stdin="slow-value")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("couldn't check the keychain", err)
+        self.assertNotIn("slow-value", err)
+        self.assertEqual(self.audit_events("put-slow"), ["put failed"])
+        self.assertIsNone(KD.keychain_get("put-slow"))
+
     def test_stdin(self):
         code, out, _ = self.run_put("put-token", "--stdin", stdin="tok-from-a-pipe\n")
         self.assertEqual((code, out), (0, "stored put-token\n"))
