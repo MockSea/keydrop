@@ -1166,6 +1166,15 @@ def test_upload_units():
         sel_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(sel)).split("<details>")[0]
         check('name="file_region"' not in sel_html and 'name="file_token"' in sel_html,
               "a select field gets no file input")
+        web = {"service": "svc", "fields": [
+            {"name": "token", "label": "Token", "kind": "secret", "required": True},
+            {"name": "site", "label": "Site", "kind": "url", "required": True}]}
+        check(refused(si, {"schema": [json.dumps(web)], "f_token": ["t"], "f_site": [""],
+                           "file_site": [b"https://example.com"]}) == "That didn't look like the form.",
+              "typed: a url field takes no file (SPEC 5.1)")
+        web_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(web)).split("<details>")[0]
+        check('name="file_site"' not in web_html and 'name="f_site"' in web_html,
+              "a url field gets no file input")
         entry = KD.render_entry("/tok", "csrf", "svc", schema, "rotate")
         check('enctype="multipart/form-data"' in entry and 'name="file_private_key"' in entry,
               "vault rotate form for a typed item is multipart with file inputs")

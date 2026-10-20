@@ -360,6 +360,7 @@ CREDENTIAL_FIELDS = [
     schema_field("notes", "secret", False, "Notes", 2000),
 ]
 CREDENTIAL_OPTIONAL = ("totp", "url", "notes")
+FILE_KINDS = ("secret", "text")   # SPEC 5.1 / I13: url and select fields take no file
 
 
 def credential_schema(name, optional=()):
@@ -594,7 +595,7 @@ def submitted_item(fields, fallback=None):
     schema = validate_schema(schema)
     allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"}
     for f in schema["fields"]:
-        allowed |= {"f_" + f["name"]} | (set() if f["kind"] == "select" else {"file_" + f["name"]})
+        allowed |= {"f_" + f["name"]} | ({"file_" + f["name"]} if f["kind"] in FILE_KINDS else set())
     if set(fields) - allowed:
         raise KeydropError("That didn't look like the form.")
     values = {}
@@ -1367,6 +1368,9 @@ def credential_inputs(schema, focus=False):
         kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
         attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
         typed = f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{auto}>'
+        if f["kind"] not in FILE_KINDS:
+            out += typed
+            continue
         picker = file_input("file_" + f["name"], f["label"], upload_limit(f["max"]), f.get("input") == "file")
         if f.get("input") == "file":
             out += picker + f'<p class="meta">up to {upload_limit(f["max"])} bytes, or paste it</p>' + typed
