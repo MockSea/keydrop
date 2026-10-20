@@ -201,6 +201,24 @@ Section 9 lists what this rules out.
 transport that policy disables is refused at the command line. No link is
 printed and no route is opened.
 
+**I13. A file is a value, nothing more.** Every input that takes a value of
+kind `secret` or `text` also takes an uploaded text file in its place
+(7.3). The upload is held to every rule a typed value is: I5 and I8 cover its
+contents, the field's `max` and the vault's `max_bytes` (8.1) apply to it,
+and the whole-item limit is checked after every file on the form has been
+read. In addition:
+
+- the request body's size is checked against a fixed cap before any of it is
+  read, and a larger body is refused unread;
+- the file's name and the part's own content type are never read, logged,
+  stored or rendered;
+- a file part with no bytes means no file was chosen (browsers, iOS Safari
+  included, send one for an empty file input);
+- a field gets a typed value or a file, never both: both is refused, and
+  neither counts as blank;
+- a file is stored exactly as sent, trailing newline included. It MUST be
+  UTF-8 text with no NUL bytes and not only whitespace, or it is refused.
+
 ## 5. Item types
 
 The requester declares the type when it asks. The page renders the fields for
@@ -218,15 +236,23 @@ Every field has:
 | `required` | whether the submit is refused without it |
 | `max` | maximum length in bytes after UTF-8 encoding |
 | `check` | optional validation, applied server-side |
+| `input` | optional, `text` (the default) or `file`; see below |
 
 Fields of kind `secret` are covered by I5 and I8. They use a password input
 with the no-save attributes in 7.3. Fields of kind `text` and `url` are also
 never logged, and never rendered back, but they use visible inputs so the
 owner can check what they typed.
 
+`input` only changes how the page leads. Every `secret` and `text` field
+accepts a typed value or a file either way (I13). A field marked
+`"input": "file"`, such as a private key that arrives as a `.p8` or `.pem`
+file, shows its file picker first and the typed input second. `file` is
+allowed only on `secret` and `text` fields; `url` and `select` fields take no
+file.
+
 The reference implementation's schema JSON spells `id` as `name`, and accepts
-one `check`, `"totp"`, on a `secret` field. Any other key in a field is
-refused.
+one `check`, `"totp"`, on a `secret` field, and `input` as above. Any other
+key in a field is refused.
 
 ### 5.2 `secret`
 
@@ -283,7 +309,9 @@ item untouched. The keychain adapter's limit is about 1.9 KB per item, encoded:
 `security -i` reads each command with `fgets` into a 4096-byte buffer, so a
 line holds at most 4095 characters and the rest would run as a second command.
 The value goes on the line as hex, and the reference refuses any command line
-of 4096 characters or more before calling `security`.
+of 4096 characters or more before calling `security`. Its `max_bytes` is
+exact: the largest encoded item whose command line stays under 4096
+characters for the longest allowed name.
 
 ### 5.5 Policy
 
@@ -432,9 +460,11 @@ All dynamic text (item name, note, error) is HTML-escaped.
 |---|---|---|---|
 | S-FORM | owner, valid token, page open | 200 | the form for the type (7.3) |
 | S-STORED | submit stored and verified | 200 | `<h1>Stored. You can close this.</h1>` |
-| S-EMPTY | a required field was blank | 400 | the form again, with `<p class="err">Nothing was entered.</p>`; the link is not used up |
-| S-INVALID | a field failed its check | 400 | the form again, with `<p class="err">{Label} doesn't look right.</p>`; the link is not used up |
-| S-BAD-FORM | body malformed, too large, or wrong fields | 400 | `<h1>That didn't look like the form.</h1>`; counts as a bad request |
+| S-EMPTY | a required field was blank: no typed value and no file | 400 | the form again, with `<p class="err">Nothing was entered.</p>`; the link is not used up |
+| S-INVALID | a field failed its check, got both a typed value and a file, or got a file that isn't text (I13) | 400 | the form again, with `<p class="err">{Label} doesn't look right.</p>`, or for an upload `Paste a value or choose a file, not both.` or the file's own reason; the link is not used up |
+| S-TOO-LONG | a field or the encoded item is over its limit, after every file is read | 400 | the form again, with `<p class="err">That's too long to store in this vault.</p>`; the link is not used up |
+| S-BAD-FORM | body malformed or wrong fields | 400 | `<h1>That didn't look like the form.</h1>`; counts as a bad request |
+| S-TOO-BIG | body over the fixed cap (I13), refused before it is read | 413 | `<h1>That's too long to store in this vault.</h1>`; counts as a bad request |
 | S-STORE-FAILED | vault write failed or didn't verify | 500 | `<h1>Couldn't store it. Tell whoever sent you the link.</h1>` |
 | S-STALE | vault or home form token aged out | 403 | `<h1>That form is stale. Reload the page.</h1>` |
 | S-EXPIRED | TTL passed, listener still up | 410 | `<h1>This link has expired. Ask for a new one.</h1>` |
@@ -473,8 +503,17 @@ spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-t
 ```
 
 Inputs for `text` and `url` fields carry `autocomplete="off" autocapitalize="off"
-autocorrect="off" spellcheck="false"`. Every form is
-`<form method="post" action="{link path}" autocomplete="off">`.
+autocorrect="off" spellcheck="false"`. Every form that carries a value is
+`<form method="post" action="{link path}" enctype="multipart/form-data" autocomplete="off">`.
+
+Each `secret` and `text` input is followed by a file input for the same field
+(I13), `<input type="file" name="{id}.file" aria-label="{Label} as a file">`,
+with a short line giving the limit in bytes. For a field marked
+`"input": "file"` (5.1) the file input comes first. An input that has a file
+alternative MUST NOT carry `required`, because the browser would refuse a
+form whose value came as a file; the server answers S-EMPTY instead. A
+`select` keeps `required`. The file input carries no `accept` attribute: text
+files have no reliable type, and the server checks the bytes.
 
 **`secret`:**
 
@@ -483,8 +522,10 @@ autocorrect="off" spellcheck="false"`. Every form is
 <p>{note}</p>                                  <!-- only if a note was given -->
 <p class="meta">Link ends {HH:MM}.</p>
 <p class="err">{error}</p>                     <!-- only on S-EMPTY / S-INVALID -->
-<form method="post" action="{path}" autocomplete="off">
-<input name="value" {secret attributes} autofocus required>
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input name="value" {secret attributes} autofocus>
+<p class="meta">or a text file, up to {limit} bytes</p>
+<input type="file" name="value.file" aria-label="Value as a file">
 <button type="submit">Store</button></form>
 ```
 
@@ -494,11 +535,13 @@ autocorrect="off" spellcheck="false"`. Every form is
 <h1>{name}</h1>
 <p>{note}</p>
 <p class="meta">Link ends {HH:MM}.</p>
-<form method="post" action="{path}" autocomplete="off">
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
 <label for="username">Username</label>
-<input id="username" name="username" type="text" {text attributes} autofocus required>
+<input id="username" name="username" type="text" {text attributes} autofocus>
+<input type="file" name="username.file" aria-label="Username as a file">
 <label for="password">Password</label>
-<input id="password" name="password" {secret attributes} required>
+<input id="password" name="password" {secret attributes}>
+<input type="file" name="password.file" aria-label="Password as a file">
 <label for="totp">One-time code secret (optional)</label>
 <input id="totp" name="totp" {secret attributes}>
 <label for="url">Website (optional)</label>
@@ -508,8 +551,11 @@ autocorrect="off" spellcheck="false"`. Every form is
 <button type="submit">Store</button></form>
 ```
 
+(The optional `secret` and `text` fields get a file input too; the limit
+lines are left out above.)
+
 A new type renders the same way: heading, note, deadline, one labelled input
-per field in declared order, one `Store` button.
+per field in declared order, each with its file input, one `Store` button.
 
 ### 7.4 Vault and home pages
 
@@ -558,6 +604,9 @@ list()             -> [{name, type, created?, updated?}] | error(reason)
 delete(name)       -> ok | not_found | error(reason)
 ```
 
+- `max_bytes` is the largest encoded item `store` accepts, exactly, not an
+  estimate. The page shows it as the limit next to each file input, so an
+  owner never picks a file the vault will refuse for size.
 - `item` is `{type, fields}`. For adapters without native types it is
   encoded per 5.4 before it reaches the store.
 - `store` is followed by `get` and a digest comparison (I6). The adapter
@@ -738,6 +787,7 @@ last column.
 | C-26 | Home: a strike needs the owner's identity and exactly one `Sec-Fetch-Site` of `same-origin` or `none`; absent, empty or doubled gets a bare 404 and no strike; the lockout and rate limit persist across restarts | I10 | `test_strangers_cant_lock`, `test_fetch_metadata`, `test_lockout`, `test_rate_limit`, `test_peer_flood`, `test_flood` |
 | C-27 | Home: stop takes the route down and keeps it down until unlock, including mid start-up | I7 | `test_stop`, `test_stop_race`, `test_stop_guards`, `test_stop_flag_ends_loop` |
 | C-28 | A port the transport already routes is never reused for a new page: keydrop skips it, and refuses after a bounded number of tries, closing every listener it bound | T6 | `test_same_port_units` |
+| C-29 | Every `secret` and `text` input takes a text file in its place: the body cap is checked unread (413), an empty file part is no file, both a value and a file is refused, a file is stored byte for byte and read back exactly, the item limit is checked after the file is read, a `select` takes no file, and no file name reaches a log, state file or page | I13, 7.3 | `test_upload_units`, `test_upload_local`, `test_upload_home` |
 
 ### 10.3 Manual round trip
 
@@ -781,12 +831,13 @@ Requirements:
 
 Things to watch:
 
-- Multi-line values (certificates, SSH keys) need a `<textarea>`. That is a
-  new input element, so it needs the same no-save attributes and a spec
-  change, in that order.
-- File uploads change the body size limits and the parser, which is where
-  request-handling bugs live. Treat a file type as a new transport-facing
-  feature and get it reviewed as one.
+- Multi-line values (certificates, SSH keys) can already come in as a file
+  (I13); mark the field `"input": "file"`. Typing one would need a
+  `<textarea>`, which is a new input element, so it needs the same no-save
+  attributes and a spec change, in that order.
+- File uploads put a multipart parser in front of every value, which is where
+  request-handling bugs live. Any change to the parser or the body caps is a
+  transport-facing change; get it reviewed as one.
 - Every extra field is more for the owner to fill in on a phone. Prefer
   separate items over a type with many optional fields.
 
@@ -869,6 +920,11 @@ and the spec, for whoever brings it into line:
 - **Copy.** The vault confirm text says "keychain" (`It goes from the keychain
   for good.`, `Couldn't read the keychain.`). The spec says "vault" so the copy
   is the same everywhere. The home stop message says "on the Mac".
+- **Uploads.** File inputs are named `file` on the `secret` request form and
+  `file_<id>` for typed fields, not `{id}.file` as in 7.3. A `secret`
+  request's typed value is trimmed and a file is not. S-TOO-BIG (413) is a
+  message page. The vault and home pages answer upload errors as message
+  pages; the request form re-renders with the error.
 - **Labels.** The request form's input has no label (the heading names the
   item). That stays as the `secret` layout.
 - **Size limit.** The keychain adapter refuses an item whose `security -i`

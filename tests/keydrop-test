@@ -43,7 +43,7 @@ points at a file that doesn't exist).
 
     tests/keydrop-test
 """
-import importlib.machinery, importlib.util, json, os, re, secrets, shlex, signal
+import html, importlib.machinery, importlib.util, json, os, re, secrets, shlex, signal
 import subprocess, sys, tempfile, threading, time, urllib.error, urllib.parse, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1018,6 +1018,294 @@ def test_spec_credential(watch):
     check(r.returncode == 2, "credential type off by default: exit 2 (C-23)")
 
 
+# ---------- text-file uploads (SPEC 7.3, C-29) ----------
+
+def multipart(fields, files=None, filename="upload.txt"):
+    """(body, content type) for a browser-shaped multipart/form-data POST.
+    files maps a part name to bytes; b"" is what a browser sends for a file
+    input left empty (an empty part with filename="")."""
+    boundary = "----kdtestBoundary" + secrets.token_hex(8)
+    parts = []
+    for k, v in fields.items():
+        parts.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode() + v.encode())
+    for k, data in (files or {}).items():
+        fn = filename if data else ""
+        parts.append(f'Content-Disposition: form-data; name="{k}"; filename="{fn}"\r\n'
+                     f'Content-Type: application/octet-stream\r\n\r\n'.encode() + data)
+    delim = b"--" + boundary.encode()
+    body = delim + b"\r\n" + (b"\r\n" + delim + b"\r\n").join(parts) + b"\r\n" + delim + b"--\r\n"
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def mpost(url, fields, files=None, filename="upload.txt"):
+    body, ctype = multipart(fields, files, filename)
+    return http("POST", url, data=body, headers=dict(LOGIN, **{"Content-Type": ctype}))
+
+
+def pem_value(lines=4):
+    """A PEM-shaped text value: several lines, newlines that must survive."""
+    body = "\n".join(secrets.token_urlsafe(48)[:64] for _ in range(lines))
+    return f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\n"
+
+
+def upload_schema(service):
+    return {"service": service, "fields": [
+        {"name": "private_key", "label": "Private key", "kind": "secret", "required": True,
+         "max": 4096, "input": "file"},
+        {"name": "key_id", "label": "Key ID", "kind": "text", "required": True, "max": 64},
+        {"name": "team_id", "label": "Team ID", "kind": "text", "required": True, "max": 64},
+    ]}
+
+
+def refused(fn, *args):
+    try:
+        fn(*args)
+        return None
+    except KD.KeydropError as e:
+        return str(e)
+
+
+def test_upload_units():
+    pm = KD.parse_multipart
+    body, ctype = multipart({"csrf": "c", "value": "ünï"}, {"file": b"a\r\nb\n", "file_key": b""}, "../../x.pem")
+    got = pm(ctype, body, 10)
+    check(got == {"csrf": ["c"], "value": ["ünï"], "file": [b"a\r\nb\n"], "file_key": [b""]},
+          "parse_multipart: text parts are str, file parts stay raw bytes")
+    check("../../x.pem" not in repr(got), "parse_multipart: the filename is never returned")
+    check(refused(pm, ctype, body, 3) is not None, "parse_multipart: more parts than max_fields refused")
+    dup, dctype = multipart({"value": "a"}, {"file": b"x"})
+    dup = dup.replace(b'name="file"', b'name="value"')
+    check(refused(pm, dctype, dup, 10) is not None, "parse_multipart: a name given twice refused")
+    for label, bad_type in (("no boundary", "multipart/form-data"),
+                            ("wrong type", ctype.replace("form-data", "mixed")),
+                            ("boundary twice", ctype + "; boundary=x"),
+                            ("bad boundary chars", "multipart/form-data; boundary=\"a\x01b\"")):
+        check(refused(pm, bad_type, body, 10) is not None, f"parse_multipart: {label} refused")
+    check(refused(pm, ctype, body + b"junk", 10) is not None, "parse_multipart: data after the close delimiter refused")
+    check(refused(pm, ctype, body[:-8], 10) is not None, "parse_multipart: no close delimiter refused")
+    star, sctype = multipart({"value": "a"})
+    star = star.replace(b'name="value"', b"name*=utf-8''value")
+    check(refused(pm, sctype, star, 10) is not None, "parse_multipart: RFC 2231 name* refused")
+    nodisp, nctype = multipart({"value": "a"})
+    nodisp = nodisp.replace(b"Content-Disposition", b"Content-Thing")
+    check(refused(pm, nctype, nodisp, 10) is not None, "parse_multipart: a part without a form-data name refused")
+    bad_utf, uctype = multipart({"value": "a"})
+    check(refused(pm, uctype, bad_utf.replace(b"\r\n\r\na", b"\r\n\r\n\xff"), 10) is not None,
+          "parse_multipart: a non-UTF-8 text part refused")
+
+    si = KD.submitted_item
+    pem = pem_value()
+    check(si({"file": [pem.encode()]}) == (pem, None), "secret by file: stored byte for byte, newlines kept")
+    check(si({"value": ["  pasted  "], "file": [b""]}) == ("pasted", None),
+          "secret: an empty file part (nothing picked) is no file")
+    check(refused(si, {"value": ["x"], "file": [b"y"]}) == KD.BOTH, "secret: value and file together refused")
+    check(refused(si, {"value": [""], "file": [b""]}) == "Nothing was entered.", "secret: neither is S-EMPTY")
+    check("NUL" in (refused(si, {"file": [b"a\x00b"]}) or ""), "secret: a file with NUL bytes refused")
+    check("UTF-8" in (refused(si, {"file": [b"\xff\xfe"]}) or ""), "secret: a non-UTF-8 file refused")
+    check(refused(si, {"file": [b" \n\t\n"]}) == "That file is empty.", "secret: a whitespace-only file refused")
+    check(refused(si, {"file": [b"x" * 8193]}) is not None, "secret: a file over the field max refused")
+    check(refused(si, {"value": ["v"], "file": ["text, not an upload"]}) is None
+          and si({"value": ["v"], "file": ["text"]}) == ("v", None),
+          "secret: a urlencoded `file` field is text, not an upload, and is ignored")
+
+    KD.ensure_state()
+    with open(KD.POLICY_FILE, "w") as f:
+        json.dump({"types_enabled": ["secret", "credential"]}, f)
+    try:
+        schema = KD.validate_schema(upload_schema("svc"))
+        check(schema["fields"][0].get("input") == "file" and "input" not in schema["fields"][1],
+              "schema: input=file kept on the field that asks for it, absent elsewhere")
+        check(KD.template_schema("api-key") == KD.validate_schema(KD.template_schema("api-key"))
+              and all("input" not in f for f in KD.template_schema("api-key")["fields"]),
+              "schema: existing schemas normalise unchanged")
+        for bad in ({"kind": "url", "input": "file"}, {"kind": "select", "options": ["a"], "input": "file"},
+                    {"kind": "secret", "input": "bogus"}, {"kind": "secret", "input": True}):
+            s = upload_schema("svc")
+            s["fields"][0] = dict({"name": "private_key", "label": "Private key", "required": True}, **bad)
+            s["fields"].append({"name": "spare", "label": "Spare", "kind": "secret", "required": False})
+            check(refused(KD.validate_schema, s) is not None, f"schema: input refused with {bad}")
+        typed = {"schema": [json.dumps(schema)], "file_private_key": [pem.encode()],
+                 "f_private_key": [""], "f_key_id": ["KEYID12345"], "file_key_id": [b""],
+                 "f_team_id": ["TEAMID6789"], "file_team_id": [b""]}
+        raw, got_schema = si(typed)
+        item = json.loads(raw)["fields"]
+        check(item == {"private_key": pem, "key_id": "KEYID12345", "team_id": "TEAMID6789"} and got_schema == schema,
+              "typed: a file fills one field byte for byte, empty file parts are no file")
+        check(si(dict(typed, file_key_id=[b"FROMFILE\n"], f_key_id=[""]))[0].count("FROMFILE\\n") == 1,
+              "typed: any field can take a file, not only input=file ones")
+        check(refused(si, dict(typed, f_private_key=["pasted"])) == KD.BOTH,
+              "typed: value and file for one field refused")
+        check(refused(si, dict(typed, file_private_key=[b""])) == "Nothing was entered.",
+              "typed: a required field with neither is S-EMPTY")
+        check(refused(si, dict(typed, file_key_id=[b"x" * 65], f_key_id=[""])) == "A field is too long.",
+              "typed: a file over its field's max refused")
+        check("NUL" in (refused(si, dict(typed, file_private_key=[b"a\x00"])) or ""),
+              "typed: a file with NUL bytes refused")
+        check(refused(si, dict(typed, file_nope=[b"x"])) == "That didn't look like the form.",
+              "typed: a file part for a field the schema doesn't have refused")
+        sel = {"service": "svc", "fields": [
+            {"name": "token", "label": "Token", "kind": "secret", "required": True},
+            {"name": "region", "label": "Region", "kind": "select", "required": True, "options": ["one", "two"]}]}
+        check(refused(si, {"schema": [json.dumps(sel)], "f_token": ["t"], "f_region": ["one"],
+                           "file_region": [b"one"]}) == "That didn't look like the form.",
+              "typed: a select field takes no file")
+        check(refused(si, {"schema": [json.dumps(sel)], "f_token": ["t"], "f_region": ["one"],
+                           "file": [b"x"]}) == "That didn't look like the form.",
+              "typed: the secret form's `file` part is refused on a typed form")
+
+        html_ = KD.render_form("svc", "", "/tok", schema=schema)
+        main = html_.split("<details>")[0]
+        check('enctype="multipart/form-data"' in main, "typed request form is multipart")
+        check(main.index('name="file_private_key"') < main.index('name="f_private_key"'),
+              "input=file field shows the file picker first")
+        check(main.index('name="f_key_id"') < main.index('name="file_key_id"'),
+              "other fields show the typed input first, a file input after")
+        check(not re.search(r'<input[^>]*name="f_[a-z_]+"[^>]*required', main)
+              and not re.search(r'<input[^>]*type="file"[^>]*required', main),
+              "no value or file input is `required`: one of the two fills a field")
+        sel_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(sel)).split("<details>")[0]
+        check('name="file_region"' not in sel_html and 'name="file_token"' in sel_html,
+              "a select field gets no file input")
+        web = {"service": "svc", "fields": [
+            {"name": "token", "label": "Token", "kind": "secret", "required": True},
+            {"name": "site", "label": "Site", "kind": "url", "required": True}]}
+        check(refused(si, {"schema": [json.dumps(web)], "f_token": ["t"], "f_site": [""],
+                           "file_site": [b"https://example.com"]}) == "That didn't look like the form.",
+              "typed: a url field takes no file (SPEC 5.1)")
+        web_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(web)).split("<details>")[0]
+        check('name="file_site"' not in web_html and 'name="f_site"' in web_html,
+              "a url field gets no file input")
+        entry = KD.render_entry("/tok", "csrf", "svc", schema, "rotate")
+        check('enctype="multipart/form-data"' in entry and 'name="file_private_key"' in entry,
+              "vault rotate form for a typed item is multipart with file inputs")
+    finally:
+        os.unlink(KD.POLICY_FILE)
+
+    plain = KD.render_form("svc", "", "/tok")
+    main = plain.split("<details>")[0]
+    check('enctype="multipart/form-data"' in main and 'type="file" name="file"' in main,
+          "secret request form is multipart with a file input")
+    check(not re.search(r'<input[^>]*name="value"[^>]*required', main), "secret value input isn't `required`")
+    check(f"up to {KD.upload_limit(8192)} bytes" in main, "secret form says how big a file can be")
+    entry = KD.render_entry("/tok", "csrf")
+    check('enctype="multipart/form-data"' in entry and 'name="file"' in entry, "vault add form takes a file")
+
+    mb = KD.STORE.capabilities()["max_bytes"]
+    longest = "a" * 64
+    check(KD.STORE.fits(longest, "x" * mb, True) and not KD.STORE.fits(longest, "x" * (mb + 1), True),
+          f"max_bytes ({mb}) is exact for the longest name, typed")
+    check(KD.upload_limit(8192) == min(8192, mb) and KD.upload_limit(64) == 64,
+          "upload limit is the field max, capped by the vault's max_bytes")
+
+
+def raw_post_length(url, length, ctype):
+    """Headers claiming `length` bytes, and no body: the server must answer
+    without reading one."""
+    import http.client
+    u = urllib.parse.urlsplit(url)
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=5)
+    conn.putrequest("POST", u.path)
+    for k, v in dict(LOGIN, **{"Content-Type": ctype, "Content-Length": str(length)}).items():
+        conn.putheader(k, v)
+    conn.endheaders()
+    resp = conn.getresponse()
+    code = resp.status
+    conn.close()
+    return code
+
+
+def test_upload_local(watch):
+    # request page, secret
+    name, pem = test_name("upload"), pem_value()
+    fname = f"kdtest-{secrets.token_hex(4)}.pem"
+    watch.needles += [pem.encode().hex()[:64], pem.splitlines()[1]]
+    url = page(name, "--ttl", "1m")
+    code, body = http("GET", url, headers=LOGIN)
+    check(code == 200 and 'enctype="multipart/form-data"' in body, "request page form is multipart")
+    _, ctype = multipart({})
+    check(raw_post_length(url, KD.MAX_UPLOAD_BODY + 1, ctype) == 413 and name in pending_names(),
+          "oversize multipart Content-Length: 413, refused unread, link not used up")
+    check(raw_post_length(url, KD.MAX_BODY + 1, "application/x-www-form-urlencoded") == 413,
+          "oversize urlencoded Content-Length: 413")
+    code, body = mpost(url, {"value": "typed too"}, {"file": pem.encode()}, fname)
+    check(code == 400 and KD.BOTH in body and name in pending_names(), "request: value and file together, 400, link kept")
+    code, body = mpost(url, {"value": ""}, {"file": b""})
+    check(code == 400 and "Nothing was entered." in body and name in pending_names(),
+          "request: empty value and an empty file part, S-EMPTY, link kept")
+    code, body = mpost(url, {"value": ""}, {"file": pem.encode()}, fname)
+    check(code == 200 and "Stored" in body and pem not in body, "request: a file upload stores")
+    check(wait_gone(name), "request: page gone after an upload")
+    check(KD.keychain_get(name) == pem, "request: keychain holds the file byte for byte")
+    check(run("get", name).stdout == pem, "request: `keydrop get` prints the file exactly")
+    for label, needle in (("value", pem), ("value line", pem.splitlines()[1]), ("filename", fname)):
+        check(not state_contains(needle), f"upload: state dir free of {label}")
+
+    # request page, typed: one item, a file field and two short fields
+    KD.ensure_state()
+    with open(KD.POLICY_FILE, "w") as f:
+        json.dump({"types_enabled": ["secret", "credential"]}, f)
+    try:
+        name, pem = test_name("upload-typed"), pem_value()
+        watch.needles += [pem.splitlines()[1]]
+        schema = upload_schema(name)
+        path = os.path.join(STUB_DIR, "upload-schema.json")
+        with open(path, "w") as f:
+            json.dump(schema, f)
+        url = page(name, "--schema", path)
+        code, body = http("GET", url, headers=LOGIN)
+        check(code == 200 and body.index('name="file_private_key"') < body.index('name="f_private_key"'),
+              "typed request page shows the file picker first for an input=file field")
+        sent = {"schema": json.dumps(KD.validate_schema(schema)), "f_private_key": "",
+                "f_key_id": "KEYID12345", "f_team_id": "TEAMID6789"}
+        empties = {"file_key_id": b"", "file_team_id": b""}
+        big = pem_value(60)   # under the field's own max, over the vault's per-item limit
+        code, body = mpost(url, sent, dict(empties, file_private_key=big.encode()), fname)
+        check(code == 400 and html.escape(KD.TOO_LONG) in body and name in pending_names() and KD.keychain_get(name) is None,
+              "typed: a file that fits its field but not the vault item is refused after reading, link kept")
+        code, body = mpost(url, sent, dict(empties, file_private_key=pem.encode()), fname)
+        check(code == 200 and "Stored" in body and pem not in body and wait_gone(name),
+              "typed: file field plus typed fields store in one item")
+        raw = KD.keychain_get(name)
+        check(KD.item_value(name, raw, "private_key") == pem and KD.item_value(name, raw, "key_id") == "KEYID12345"
+              and KD.item_value(name, raw, "team_id") == "TEAMID6789", "typed: each field reads back exactly")
+        r = run("get", name, "--field", "private_key")
+        check(r.returncode == 0 and r.stdout.rstrip("\n") == pem.rstrip("\n"), "typed: get --field prints the file")
+        check(KD.read_items().get(name, {}).get("schema", {}).get("fields", [{}])[0].get("input") == "file",
+              "typed: items.json keeps input=file, so rotation shows the picker again")
+
+        # vault: add a secret by file, rotate the typed item by file
+        url = vault_page("--ttl", "2m")
+        csrf = csrf_of(http("GET", url, headers=LOGIN)[1])
+        code, body = vpost(url, {"csrf": csrf, "action": "rotate-form", "name": name})
+        check(code == 200 and 'enctype="multipart/form-data"' in body and 'name="file_private_key"' in body,
+              "vault: rotate form takes files")
+        pem2 = pem_value()
+        watch.needles += [pem2.splitlines()[1]]
+        code, body = mpost(url, dict(sent, csrf=csrf, action="rotate", name=name),
+                           dict(empties, file_private_key=pem2.encode()), fname)
+        check(code == 200 and pem2 not in body and KD.item_value(name, KD.keychain_get(name), "private_key") == pem2,
+              "vault: typed rotate by file stores the new file")
+        plain, pem3 = test_name("upload-vault"), pem_value()
+        watch.needles += [pem3.splitlines()[1]]
+        code, body = mpost(url, {"csrf": csrf, "action": "add", "name": plain, "note": "", "value": ""},
+                           {"file": pem3.encode()}, fname)
+        check(code == 200 and f"Stored {plain}." in body and KD.keychain_get(plain) == pem3,
+              "vault: add a secret by file")
+        code, body = mpost(url, {"csrf": csrf, "action": "replace", "name": plain, "note": "", "value": "x"},
+                           {"file": b"y\n"}, fname)
+        check(code == 400 and KD.keychain_get(plain) == pem3, "vault: replace with both refused, old value kept")
+        code, _ = mpost(url, {"action": "add", "name": test_name("upload-nocsrf"), "value": ""}, {"file": b"z"})
+        check(code == 403, "vault: a multipart POST still needs the form token")
+        vpost(url, {"csrf": csrf, "action": "done"})
+        check(wait_gone(KD.VAULT), "vault: closes after uploads")
+        with open(KD.LOG_FILE) as f:
+            logtext = f.read()
+        for label, needle in (("value", pem2.splitlines()[1]), ("value", pem3.splitlines()[1]), ("filename", fname)):
+            check(needle not in logtext and not state_contains(needle), f"vault upload: log and state free of {label}")
+    finally:
+        os.unlink(KD.POLICY_FILE)
+
+
 def cleanup():
     for name in MADE:
         subprocess.run([FAKE_SECURITY, "delete-generic-password", "-a", KD.ACCOUNT,
@@ -1051,6 +1339,8 @@ def main():
         test_vault_expiry()
         test_typed_local(watch)
         test_spec_credential(watch)
+        test_upload_units()
+        test_upload_local(watch)
         test_serve_routes()
         mode = oct(os.stat(STATE).st_mode & 0o777)
         check(mode == "0o700", f"state dir is 0700 ({mode})")
