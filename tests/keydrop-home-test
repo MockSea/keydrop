@@ -603,6 +603,51 @@ def test_typed_home(page, token):
         os.unlink(KD.POLICY_FILE)
 
 
+def mpost(url, fields, files, filename="upload.txt"):
+    """A browser-shaped multipart POST; files maps a part name to bytes, and b""
+    is what a browser sends for a file input left empty."""
+    boundary = "----kdhomeBoundary" + secrets.token_hex(8)
+    parts = [f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode() + v.encode() for k, v in fields.items()]
+    parts += [f'Content-Disposition: form-data; name="{k}"; filename="{filename if d else ""}"\r\n'
+              f'Content-Type: application/octet-stream\r\n\r\n'.encode() + d for k, d in files.items()]
+    delim = b"--" + boundary.encode()
+    body = delim + b"\r\n" + (b"\r\n" + delim + b"\r\n").join(parts) + b"\r\n" + delim + b"--\r\n"
+    return http("POST", url, data=body,
+                headers=dict(LOGIN, **{"Content-Type": f"multipart/form-data; boundary={boundary}"}))
+
+
+def test_upload_home(page, token):
+    """SPEC 7.3: home add and replace take a text file in place of the pasted value."""
+    KD.update_home(lambda st: dict(st, writes=[]))   # this test's writes, not the earlier ones
+    url = page.url(token)
+    csrf = csrf_of(get(url)[1])
+    code, entry = post(url, {"csrf": csrf, "action": "new"})
+    check(code == 200 and 'enctype="multipart/form-data"' in entry and 'type="file" name="file"' in entry,
+          "home add form takes a file")
+    n, fname = name("upload"), f"kdtest-{secrets.token_hex(4)}.txt"
+    v = value() + "\nsecond line\n"
+    VALUES.append(v)
+    code, html = mpost(url, {"csrf": csrf, "action": "add", "name": n, "note": "", "value": ""},
+                       {"file": v.encode()}, fname)
+    check(code == 200 and f"Stored {n}." in html and KD.keychain_get(n) == v and v not in html,
+          "home add by file stores the file byte for byte")
+    code, _ = mpost(url, {"csrf": csrf, "action": "replace", "name": n, "note": "", "value": "pasted"},
+                    {"file": b"filed\n"}, fname)
+    check(code == 400 and KD.keychain_get(n) == v, "home replace with value and file refused, old value kept")
+    v2 = value()
+    code, _ = mpost(url, {"csrf": csrf, "action": "replace", "name": n, "note": "", "value": v2}, {"file": b""})
+    check(code == 200 and KD.keychain_get(n) == v2, "home replace: an empty file part is no file, the paste is used")
+    v3 = value() + "\n"
+    VALUES.append(v3)
+    code, _ = mpost(url, {"csrf": csrf, "action": "replace", "name": n, "note": "", "value": ""},
+                    {"file": v3.encode()}, fname)
+    check(code == 200 and KD.keychain_get(n) == v3, "home replace by file")
+    check(not any(fname in l for l in log_lines(KD.AUDIT_FILE)) and not state_contains(fname),
+          "the uploaded file's name is never kept")
+    code, _ = post(url, {"csrf": csrf, "action": "delete-confirm", "name": n})
+    check(code == 200 and not KD.keychain_exists(n), "uploaded item deletes")
+
+
 def test_flood(page, token):
     url = page.url(token)
     codes = [get(url)[0] for _ in range(KD.REQUESTS_PER_MINUTE + 5)]
@@ -1477,6 +1522,7 @@ def main():
         test_writes(page, token)
         page = restart(page)
         test_typed_home(page, token)
+        test_upload_home(page, token)
         page = restart(page)
         test_flood(page, token)
         page = restart(page)

@@ -164,7 +164,7 @@ path in KEYDROP_CONFIG), and environment variables, which win over the file:
 Test-only overrides: KEYDROP_SECURITY (the `security` binary) and
 KEYDROP_WATCH_INTERVAL (seconds, capped at WATCH_INTERVAL).
 """
-import base64, calendar, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
+import base64, calendar, email.message, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
 import signal, subprocess, sys, time, urllib.parse
 
 CONFIG_PATH = os.environ.get("KEYDROP_CONFIG") or os.path.expanduser("~/.config/keydrop/config.json")
@@ -273,7 +273,8 @@ WRITE_LIMIT = 10              # adds/replaces/deletes per WRITE_WINDOW on the ho
 WRITE_WINDOW = 3600
 REQUESTS_PER_MINUTE = 60      # any requests at all; past this, a bare 429
 CSRF_MAX_AGE = 12 * 3600      # a home form older than this asks for a reload
-MAX_BODY = 16 * 1024
+MAX_BODY = 16 * 1024   # a urlencoded body: the buttons and the schema editor
+MAX_UPLOAD_BODY = MAX_BODY + 8 * 1024   # multipart: the same fields, plus a file of at most 8 KB
 REQUEST_TIMEOUT = 10   # per-connection socket timeout; one slow client can't hold the link
 SERVE_TIMEOUT = 20     # `tailscale serve` blocks forever if serve isn't enabled
 PORT_PICK_TRIES = 32   # loopback ports tried before claim_port gives up
@@ -416,9 +417,12 @@ def validate_schema(data):
         raise fail
     seen, result = set(), []
     for f in fs:
-        if not isinstance(f, dict) or set(f) - {"name", "id", "label", "kind", "required", "max", "options", "check"}:
+        if not isinstance(f, dict) or set(f) - {"name", "id", "label", "kind", "required", "max", "options", "check", "input"}:
             raise fail
         if "check" in f and (f["check"] != "totp" or f.get("kind") != "secret"):
+            raise fail
+        # "file": the page offers a file picker first for this field (SPEC 5.1).
+        if "input" in f and not (f["input"] == "text" or f["input"] == "file" and f.get("kind") in ("secret", "text")):
             raise fail
         name = f.get("name", f.get("id"))
         if ("name" in f and "id" in f or not isinstance(name, str)
@@ -437,7 +441,8 @@ def validate_schema(data):
         seen.add(name)
         result.append(dict(name=name, label=f["label"], kind=f["kind"], required=f["required"],
                            max=f.get("max", 8192), **({"options": opts} if opts is not None else {}),
-                           **({"check": f["check"]} if "check" in f else {})))
+                           **({"check": f["check"]} if "check" in f else {}),
+                           **({"input": "file"} if f.get("input") == "file" else {})))
     if not any(f["kind"] == "secret" for f in result):
         raise fail
     normalized = {"service": data["service"], "fields": result}
@@ -566,6 +571,11 @@ TOO_LONG = "That's too long to store in this vault."
 
 
 def submitted_item(fields, fallback=None):
+    """(value to store, schema or None) from a submitted form, or a
+    KeydropError fit to show on the page. Every value input has a file
+    alternative (SPEC 7.3): `file` beside a plain secret's `value`,
+    `file_<id>` beside a typed field's `f_<id>`. One or the other, never both;
+    an empty file part (a file input left empty) is no file."""
     if any(len(v) != 1 for v in fields.values()):
         raise KeydropError("That didn't look like the form.")
     raw = field(fields, "schema")
@@ -575,25 +585,24 @@ def submitted_item(fields, fallback=None):
         raise KeydropError("Invalid credential schema.")
     check_policy(schema)
     if not schema:
-        if set(fields) - {"csrf", "action", "name", "note", "rotate_by", "value", "schema"}:
+        if set(fields) - {"csrf", "action", "name", "note", "rotate_by", "value", "schema", "file"}:
             raise KeydropError("That didn't look like the form.")
-        value = field(fields, "value").strip()
+        value = one_value(field(fields, "value").strip(), uploaded(fields, "file"), 8192, "Value is too long.")
         if not value:
             raise KeydropError("Nothing was entered.")
-        if len(value.encode()) > 8192:
-            raise KeydropError("Value is too long.")
         return value, None
     schema = validate_schema(schema)
-    allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"} | {"f_" + f["name"] for f in schema["fields"]}
+    allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"}
+    for f in schema["fields"]:
+        allowed |= {"f_" + f["name"]} | (set() if f["kind"] == "select" else {"file_" + f["name"]})
     if set(fields) - allowed:
         raise KeydropError("That didn't look like the form.")
     values = {}
     for f in schema["fields"]:
-        v = field(fields, "f_" + f["name"])
+        v = one_value(field(fields, "f_" + f["name"]), uploaded(fields, "file_" + f["name"]),
+                      f["max"], "A field is too long.")
         if f["required"] and not v.strip():
             raise KeydropError("Nothing was entered.")
-        if len(v.encode()) > f["max"]:
-            raise KeydropError("A field is too long.")
         if v and f["kind"] == "url":
             try:
                 url = urllib.parse.urlsplit(v)
@@ -608,6 +617,102 @@ def submitted_item(fields, fallback=None):
         if v:
             values[f["name"]] = v
     return json.dumps({"keydrop": 1, "type": "credential", "fields": values}, ensure_ascii=False), schema
+
+
+BOTH = "Paste a value or choose a file, not both."
+
+
+def uploaded(fields, key):
+    """An uploaded file part's bytes, or b"" for no file: no part, an empty
+    part (what a browser, iOS Safari included, sends for a file input left
+    empty), or a urlencoded text field that happens to have the name."""
+    data = (fields.get(key) or [b""])[0]
+    return data if isinstance(data, bytes) else b""
+
+
+def one_value(pasted, upload, limit, too_long):
+    """The pasted text or the uploaded file, never both. A file is stored
+    exactly as sent, newlines and all; the caller has already decided
+    whether a paste is trimmed."""
+    if not upload:
+        if len(pasted.encode("utf-8", "surrogatepass")) > limit:
+            raise KeydropError(too_long)
+        return pasted
+    if pasted.strip():
+        raise KeydropError(BOTH)
+    if len(upload) > limit:
+        raise KeydropError(too_long)
+    if b"\x00" in upload:
+        raise KeydropError("That file has NUL bytes in it, so it isn't text. Only text files can be stored.")
+    try:
+        text = upload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise KeydropError("That file isn't UTF-8 text. Only text files can be stored.") from None
+    if not text.strip():
+        raise KeydropError("That file is empty.")
+    return text
+
+
+# ---------- multipart/form-data (SPEC 7.3) ----------
+
+BOUNDARY_RE = re.compile(r"[0-9A-Za-z'()+_,./:=? -]{0,69}[0-9A-Za-z'()+_,./:=?-]")   # RFC 2046 bchars
+
+
+def header_param(header, value, key):
+    """(main value lowercased, the one `key` parameter) from a MIME header,
+    or a KeydropError. A parameter given twice, or in RFC 2231 form, is
+    refused rather than guessed at."""
+    m = email.message.Message()
+    m[header] = value
+    params = m.get_params(header=header) or [("", "")]
+    found = [v for k, v in params[1:] if k.lower() == key]
+    if len(found) != 1 or not isinstance(found[0], str):
+        raise KeydropError(f"bad {key}")
+    return params[0][0].lower(), found[0]
+
+
+def is_file_part(name):
+    return name == "file" or name.startswith("file_")
+
+
+def parse_multipart(content_type, body, max_fields):
+    """A multipart/form-data body as parse_qs would give it, {name: [value]}.
+    File parts (`file`, `file_<id>`) keep their raw bytes; every other part
+    must be UTF-8 and comes back as str. A part's filename is never read, so
+    nothing the client named its file can reach a name, a path or a log.
+    Anything off-shape (no boundary, a bad delimiter, a part without a
+    form-data name, a name twice, more than max_fields parts) raises
+    KeydropError. The stdlib `cgi` module this replaces is gone in 3.13."""
+    kind, boundary = header_param("Content-Type", content_type, "boundary")
+    if kind != "multipart/form-data" or not BOUNDARY_RE.fullmatch(boundary):
+        raise KeydropError("bad boundary")
+    delim = b"--" + boundary.encode("ascii")
+    end = body.rfind(b"\r\n" + delim + b"--")
+    if not body.startswith(delim + b"\r\n") or end < 0 \
+            or body[end + len(delim) + 4:] not in (b"", b"\r\n"):
+        raise KeydropError("bad delimiter")
+    parts = body[len(delim) + 2:end].split(b"\r\n" + delim + b"\r\n")
+    if len(parts) > max_fields:
+        raise KeydropError("too many parts")
+    fields = {}
+    for part in parts:
+        head, sep, content = part.partition(b"\r\n\r\n")
+        disposition = [l.split(b":", 1)[1] for l in head.split(b"\r\n")
+                       if l.split(b":", 1)[0].strip().lower() == b"content-disposition"]
+        if not sep or len(disposition) != 1:
+            raise KeydropError("bad part")
+        kind, name = header_param("Content-Disposition",
+                                  disposition[0].decode("utf-8", "replace").strip(), "name")
+        if kind != "form-data" or name in fields:
+            raise KeydropError("bad part")
+        if is_file_part(name):
+            fields[name] = [content]
+            continue
+        try:
+            fields[name] = [content.decode("utf-8")]
+        except UnicodeDecodeError:
+            raise KeydropError("bad part") from None
+    return fields
 
 
 def totp_ok(value):
@@ -678,6 +783,17 @@ def store_command(name, value, typed=False):
     if len(line) >= SECURITY_LINE_MAX:
         raise KeydropError("too long for the keychain")
     return line + "\n"
+
+
+def keychain_max_bytes():
+    """The most any item can hold: what fits on one `security -i` line beside
+    the longest name, typed (the longer label), under this account and
+    prefix. About 1.9 KB with the defaults."""
+    try:
+        overhead = len(store_command("a" * 64, "", typed=True)) - 1   # without the newline
+    except KeydropError:
+        return 0
+    return (SECURITY_LINE_MAX - 1 - overhead) // 2
 
 
 def keychain_fits(name, value, typed=False):
@@ -800,7 +916,7 @@ class KeychainVault:
 
     def capabilities(self):
         return {"native_types": [], "write_channel": "stdin", "lists_without_unlock": True,
-                "max_bytes": (SECURITY_LINE_MAX - 160) // 2}
+                "max_bytes": keychain_max_bytes()}
 
     def fits(self, name, value, typed=False):
         return keychain_fits(name, value, typed)
@@ -1218,22 +1334,44 @@ def hidden(name, value):
     return f'<input type="hidden" name="{html.escape(name)}" value="{html.escape(value)}">'
 
 
+UPLOAD = "multipart/form-data"
+
+
+def upload_limit(field_max):
+    """The size a page shows beside a file input: the field's own max, or
+    less when the vault holds less per item."""
+    return min(field_max, STORE.capabilities()["max_bytes"])
+
+
+def file_input(ident, label_for, limit, first=False):
+    note = f'<p class="meta">or a text file, up to {limit} bytes</p>' if not first else ""
+    return note + f'<input id="{ident}" type="file" name="{ident}" aria-label="{html.escape(label_for)} as a text file">'
+
+
 def credential_inputs(schema, focus=False):
+    """The value inputs. No input is `required`: a paste or a file fills a
+    value, so submitted_item says when neither (or both) came in."""
     if not schema:
         return ('<label for="value">Secret value</label><input id="value" type="password" name="value" '
-                + NO_SAVE + (' autofocus' if focus else '') + ' required>')
+                + NO_SAVE + (' autofocus' if focus else '') + '>'
+                + file_input("file", "Secret value", upload_limit(8192)))
     out = hidden("schema", json.dumps(schema))
     for i, f in enumerate(schema["fields"]):
         ident = "f_" + f["name"]
         out += f'<label for="{ident}">{html.escape(f["label"])}' + ("" if f["required"] else " (optional)") + '</label>'
-        req = (" autofocus" if focus and i == 0 else "") + (" required" if f["required"] else "")
+        auto = " autofocus" if focus and i == 0 else ""
         if f["kind"] == "select":
-            out += f'<select id="{ident}" name="{ident}"{req}><option value="">Choose…</option>'
+            out += f'<select id="{ident}" name="{ident}"{auto}' + (" required" if f["required"] else "") + '><option value="">Choose…</option>'
             out += ''.join(f'<option>{html.escape(v)}</option>' for v in f["options"]) + '</select>'
+            continue
+        kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
+        attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
+        typed = f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{auto}>'
+        picker = file_input("file_" + f["name"], f["label"], upload_limit(f["max"]), f.get("input") == "file")
+        if f.get("input") == "file":
+            out += picker + f'<p class="meta">up to {upload_limit(f["max"])} bytes, or paste it</p>' + typed
         else:
-            kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
-            attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
-            out += f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{req}>'
+            out += typed + picker
     return out
 
 
@@ -1242,7 +1380,7 @@ def render_form(name, note, action, error="", schema=None, expires=None):
             + (f"<p>{html.escape(note)}</p>" if note else "")
             + '<p>It goes straight into the vault. Stored values never appear on this page.</p>'
             + (f'<p class="err">{html.escape(error)}</p>' if error else "")
-            + f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
+            + f'<form method="post" action="{html.escape(action)}" autocomplete="off" enctype="{UPLOAD}">'
             + credential_inputs(schema, focus=True) + '<button type="submit">Store</button></form>')
     if expires:
         body += '<p class="meta">Link ends ' + time.strftime("%H:%M", time.localtime(expires)) + '.</p>'
@@ -1266,6 +1404,7 @@ def schema_editor(action, csrf, name, schema, request=False, act="add"):
         controls += f'<div><label>Label</label><input name="l{i}" value="{html.escape(f.get("label", ""))}" maxlength="80"></div></div>'
         controls += f'<label>Kind</label><select name="k{i}">' + ''.join(f'<option{(" selected" if k == f.get("kind", "secret") else "")}>{k}</option>' for k in ("secret", "text", "url", "select")) + '</select>'
         controls += f'<label><input type="checkbox" name="r{i}" value="yes"' + (' checked' if f.get("required", True) else '') + '> Required</label>'
+        controls += f'<label><input type="checkbox" name="u{i}" value="file"' + (' checked' if f.get("input") == "file" else '') + '> Usually a file (show the file picker first)</label>'
         controls += f'<label>Select options (one per comma)</label><input name="o{i}" value="{html.escape(",".join(f.get("options", [])))}"></div>'
         if not f:
             controls += '</details>'
@@ -1287,6 +1426,8 @@ def schema_from_editor(fields):
         f = dict(name=name, label=field(fields, f"l{i}"), kind=field(fields, f"k{i}"), required=field(fields, f"r{i}") == "yes")
         if f["kind"] == "select":
             f["options"] = field(fields, f"o{i}").split(",")
+        if field(fields, f"u{i}") == "file":
+            f["input"] = "file"
         try:
             f["max"] = int(field(fields, f"m{i}") or "8192")
         except ValueError:
@@ -1303,20 +1444,19 @@ def render_entry(action, csrf, name="", schema=None, act="add", rotate_by=""):
     fields += '<label>Note · never put secrets here</label><input name="note" maxlength="200">'
     fields += '<label>Rotate by (optional)</label><input type="date" name="rotate_by" value="' + html.escape(rotate_by) + '">' + credential_inputs(schema)
     return PAGE.format(body='<div class="entry"><p class="meta">KEY MANAGEMENT</p><h1>' + html.escape(title) + '</h1><p>Rotation replaces the complete credential. Update the service first, then store all new fields here.</p>'
-        + vault_form(action, csrf, act, fields, "Rotate credential" if act == "rotate" else "Store")
+        + vault_form(action, csrf, act, fields, "Rotate credential" if act == "rotate" else "Store", enctype=UPLOAD)
         + schema_editor(action, csrf, name, schema, act=act) + vault_form(action, csrf, "back", "", "Back", "quiet") + '</div>')
-
-
-VALUE_INPUT = ('<input type="password" name="value" placeholder="{ph}" ' + NO_SAVE + ' required>')
 
 
 def render_message(text):
     return PAGE.format(body=f"<h1>{html.escape(text)}</h1>")
 
 
-def vault_form(action, csrf, act, fields, button, cls=""):
-    """A POST form carrying the session's form token and an action name."""
-    return (f'<form method="post" action="{html.escape(action)}" autocomplete="off">'
+def vault_form(action, csrf, act, fields, button, cls="", enctype=""):
+    """A POST form carrying the session's form token and an action name.
+    enctype=UPLOAD for the forms that take a value, so they can carry files."""
+    return (f'<form method="post" action="{html.escape(action)}" autocomplete="off"'
+            + (f' enctype="{enctype}"' if enctype else "") + '>'
             f'<input type="hidden" name="csrf" value="{html.escape(csrf)}">'
             f'<input type="hidden" name="action" value="{html.escape(act)}">'
             + fields
@@ -1517,22 +1657,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return None
 
     def _read_form(self, max_fields):
-        """The parsed POST body, or None after sending a 400."""
+        """The parsed POST body, or None after sending a 400 (or a 413 when
+        Content-Length is over the cap). urlencoded for the buttons and the
+        schema editor, multipart/form-data for the forms that take a value.
+        The length is checked before a byte is read, and nothing past it is
+        read: an oversize upload is refused unread, which a browser may show
+        as a dropped connection rather than the message."""
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             length = -1
-        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if not 0 < length <= MAX_BODY or ctype != "application/x-www-form-urlencoded":
+        ctype_header = self.headers.get("Content-Type") or ""
+        ctype = ctype_header.split(";")[0].strip().lower()
+        cap = {"application/x-www-form-urlencoded": MAX_BODY, UPLOAD: MAX_UPLOAD_BODY}.get(ctype)
+        if cap is None or length <= 0:
             self._send(400, render_message("That didn't look like the form.").encode())
             return None
+        if length > cap:
+            self._send(413, render_message(TOO_LONG).encode())
+            return None
+        body = self.rfile.read(length)
         try:
-            return urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"),
+            if ctype == UPLOAD:
+                return parse_multipart(ctype_header, body, max_fields)
+            return urllib.parse.parse_qs(body.decode("utf-8"),
                                          max_num_fields=max_fields, strict_parsing=True,
                                          keep_blank_values=True)
-        except (UnicodeDecodeError, ValueError):
+        except (KeydropError, UnicodeDecodeError, ValueError):
             self._send(400, render_message("That didn't look like the form.").encode())
             return None
+        finally:
+            body = None
 
     def do_GET(self):
         path = self._authorised()
@@ -1772,7 +1927,8 @@ class VaultHandler(Handler):
             return
         finally:
             value = None
-            fields.pop("value", None)
+            for key in [k for k in fields if k == "value" or is_file_part(k)]:
+                fields.pop(key, None)
         if note or act == "add":
             write_note(name, note or None)
         self.server.audit(name, f"{act} stored")

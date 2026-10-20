@@ -6,7 +6,8 @@ config file. A local tool or an agent asks for a key by name. keydrop
 prints a one-shot link on your tailnet, and the page behind it is a single
 password field (or, for a typed item such as a credential, the fields that
 type needs). You open the link on a device signed in to your tailnet,
-paste the value and submit, and the page shuts itself down. The tool then
+paste the value, or pick a text file such as a `.pem` or `.p8` key, and
+submit, and the page shuts itself down. The tool then
 reads the value back with `keydrop get <name>`.
 
 It is one Python file with no dependencies beyond the standard library, the
@@ -161,6 +162,20 @@ state dir. One keychain item holds about 1.9 KB once encoded, because
 `security -i` reads at most 4095 characters per command line and the value
 goes on it as hex. A bigger item is refused before anything is written, and
 an existing value stays as it was.
+
+Every value input, on the request page and on the vault and home pages,
+also takes a text file in its place: paste or pick, not both. The file is
+stored byte for byte, and the page shows the limit next to the picker. A
+field in a `--fields` or `--schema` list can set `"input": "file"` to show
+the picker first, for a key that usually arrives as a file:
+
+    keydrop request push-key --fields '[
+      {"name": "private_key", "label": "Private key", "kind": "secret",
+       "required": true, "input": "file"},
+      {"name": "key_id", "label": "Key ID", "kind": "text", "required": true},
+      {"name": "team_id", "label": "Team ID", "kind": "text", "required": true}]'
+
+The file's name is never kept, and only UTF-8 text is accepted.
 
 ### The home page under launchd
 
