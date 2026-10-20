@@ -363,6 +363,11 @@ CREDENTIAL_OPTIONAL = ("totp", "url", "notes")
 FILE_KINDS = ("secret", "text")   # SPEC 5.1 / I13: url and select fields take no file
 
 
+def takes_file(f):
+    """Only a field the schema marks `"input": "file"` gets a picker or accepts a file."""
+    return f.get("input") == "file"
+
+
 def credential_schema(name, optional=()):
     unknown = set(optional) - set(CREDENTIAL_OPTIONAL)
     if unknown:
@@ -423,7 +428,7 @@ def validate_schema(data):
         if "check" in f and (f["check"] != "totp" or f.get("kind") != "secret"):
             raise fail
         # "file": the page offers a file picker first for this field (SPEC 5.1).
-        if "input" in f and not (f["input"] == "text" or f["input"] == "file" and f.get("kind") in ("secret", "text")):
+        if "input" in f and not (f["input"] == "text" or f["input"] == "file" and f.get("kind") in FILE_KINDS):
             raise fail
         name = f.get("name", f.get("id"))
         if ("name" in f and "id" in f or not isinstance(name, str)
@@ -595,7 +600,7 @@ def submitted_item(fields, fallback=None):
     schema = validate_schema(schema)
     allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"}
     for f in schema["fields"]:
-        allowed |= {"f_" + f["name"]} | ({"file_" + f["name"]} if f["kind"] in FILE_KINDS else set())
+        allowed |= {"f_" + f["name"]} | ({"file_" + f["name"]} if takes_file(f) else set())
     if set(fields) - allowed:
         raise KeydropError("That didn't look like the form.")
     values = {}
@@ -1368,14 +1373,11 @@ def credential_inputs(schema, focus=False):
         kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
         attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
         typed = f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{auto}>'
-        if f["kind"] not in FILE_KINDS:
+        if not takes_file(f):
             out += typed
             continue
-        picker = file_input("file_" + f["name"], f["label"], upload_limit(f["max"]), f.get("input") == "file")
-        if f.get("input") == "file":
-            out += picker + f'<p class="meta">up to {upload_limit(f["max"])} bytes, or paste it</p>' + typed
-        else:
-            out += typed + picker
+        picker = file_input("file_" + f["name"], f["label"], upload_limit(f["max"]), True)
+        out += picker + f'<p class="meta">up to {upload_limit(f["max"])} bytes, or paste it</p>' + typed
     return out
 
 

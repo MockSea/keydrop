@@ -1125,19 +1125,19 @@ def test_upload_units():
             s["fields"].append({"name": "spare", "label": "Spare", "kind": "secret", "required": False})
             check(refused(KD.validate_schema, s) is not None, f"schema: input refused with {bad}")
         typed = {"schema": [json.dumps(schema)], "file_private_key": [pem.encode()],
-                 "f_private_key": [""], "f_key_id": ["KEYID12345"], "file_key_id": [b""],
-                 "f_team_id": ["TEAMID6789"], "file_team_id": [b""]}
+                 "f_private_key": [""], "f_key_id": ["KEYID12345"], "f_team_id": ["TEAMID6789"]}
         raw, got_schema = si(typed)
         item = json.loads(raw)["fields"]
         check(item == {"private_key": pem, "key_id": "KEYID12345", "team_id": "TEAMID6789"} and got_schema == schema,
               "typed: a file fills one field byte for byte, empty file parts are no file")
-        check(si(dict(typed, file_key_id=[b"FROMFILE\n"], f_key_id=[""]))[0].count("FROMFILE\\n") == 1,
-              "typed: any field can take a file, not only input=file ones")
+        check(refused(si, dict(typed, file_key_id=[b"FROMFILE"], f_key_id=[""])) == "That didn't look like the form.",
+              "typed: only an input=file field takes a file")
         check(refused(si, dict(typed, f_private_key=["pasted"])) == KD.BOTH,
               "typed: value and file for one field refused")
         check(refused(si, dict(typed, file_private_key=[b""])) == "Nothing was entered.",
               "typed: a required field with neither is S-EMPTY")
-        check(refused(si, dict(typed, file_key_id=[b"x" * 65], f_key_id=[""])) == "A field is too long.",
+        pk_max = next(f["max"] for f in schema["fields"] if f["name"] == "private_key")
+        check(refused(si, dict(typed, file_private_key=[b"x" * (pk_max + 1)])) == "A field is too long.",
               "typed: a file over its field's max refused")
         check("NUL" in (refused(si, dict(typed, file_private_key=[b"a\x00"])) or ""),
               "typed: a file with NUL bytes refused")
@@ -1158,13 +1158,13 @@ def test_upload_units():
         check('enctype="multipart/form-data"' in main, "typed request form is multipart")
         check(main.index('name="file_private_key"') < main.index('name="f_private_key"'),
               "input=file field shows the file picker first")
-        check(main.index('name="f_key_id"') < main.index('name="file_key_id"'),
-              "other fields show the typed input first, a file input after")
+        check('name="file_key_id"' not in main and 'name="file_team_id"' not in main and 'name="f_key_id"' in main,
+              "fields not marked input=file get no file picker")
         check(not re.search(r'<input[^>]*name="f_[a-z_]+"[^>]*required', main)
               and not re.search(r'<input[^>]*type="file"[^>]*required', main),
               "no value or file input is `required`: one of the two fills a field")
         sel_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(sel)).split("<details>")[0]
-        check('name="file_region"' not in sel_html and 'name="file_token"' in sel_html,
+        check('name="file_region"' not in sel_html and 'name="file_token"' not in sel_html and 'name="f_token"' in sel_html,
               "a select field gets no file input")
         web = {"service": "svc", "fields": [
             {"name": "token", "label": "Token", "kind": "secret", "required": True},
@@ -1257,7 +1257,7 @@ def test_upload_local(watch):
               "typed request page shows the file picker first for an input=file field")
         sent = {"schema": json.dumps(KD.validate_schema(schema)), "f_private_key": "",
                 "f_key_id": "KEYID12345", "f_team_id": "TEAMID6789"}
-        empties = {"file_key_id": b"", "file_team_id": b""}
+        empties = {}
         big = pem_value(60)   # under the field's own max, over the vault's per-item limit
         code, body = mpost(url, sent, dict(empties, file_private_key=big.encode()), fname)
         check(code == 400 and html.escape(KD.TOO_LONG) in body and name in pending_names() and KD.keychain_get(name) is None,
