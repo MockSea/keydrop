@@ -202,7 +202,7 @@ you trust with it.
 `contrib/fill-login.mjs` is an example command. It signs a browser profile in
 to a site:
 
-    keydrop run example-site --field username --field password -- \
+    keydrop run example-site --field username --field password --field url -- \
       node contrib/fill-login.mjs --profile ~/.local/state/browser-profiles/example-site \
         --url https://example.com/login
 
@@ -216,10 +216,16 @@ finish a second factor; it closes once the page has left the login flow, or
 after `--timeout` seconds (300 by default). The signed-in session stays in
 the profile directory for whatever opens it next.
 
-It refuses `--url` that isn't https (plain http only to localhost), won't
-type into a page that has moved to another site, and with `--field url` also
-checks `--url` against the credential's stored website. It needs Node and
-Playwright, which isn't bundled:
+The credential needs its website stored in its `url` field (request it with
+`--fields url`) and passed on with `--field url`; without it the filler
+refuses. `--url` has to be https and on the same site (scheme, host
+and port) as the stored website, and the page has to still be on that site
+after loading and again right before each field is filled, so a login page
+that redirects to a separate sign-in domain needs `--url` set to that page.
+The password only goes into an `input type=password`, whatever
+`--pass-selector` matches. `--allow-http-localhost` also accepts plain http to
+this machine, for testing against a local page. It needs Node and Playwright,
+which isn't bundled:
 
     npm install playwright && npx playwright install chromium
 
@@ -324,6 +330,7 @@ don't put secrets in them.
     tests/keydrop-test
     tests/keydrop-home-test
     tests/keydrop-management-test
+    tests/fill-login-test
 
 No suite touches a real keychain or a real tailnet. `security` is a fake
 (`tests/fakes.py`) that keeps items in a JSON file, and `tailscale` is a stub
@@ -331,8 +338,9 @@ that keeps the serve config in another JSON file. Pages run on 127.0.0.1, and
 the suites send the headers serve would set. They do bind loopback ports and
 spawn background processes, and they need `plutil` and `git`.
 
-`contrib/fill-login.mjs` has no automated test; it was checked by hand
-against a local login page.
+`tests/fill-login-test` covers `contrib/fill-login.mjs`'s refusals against a
+local page. Its browser cases need Playwright where the filler can find it
+(for example via `NODE_PATH`) and are skipped otherwise.
 
 The fakes copy today's output formats, so after a macOS or Tailscale upgrade,
 do one request by hand.

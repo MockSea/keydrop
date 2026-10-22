@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""fill-login-test — contrib/fill-login.mjs refuses before it types.
+
+What's asserted:
+
+1. Refusals that need no browser: a credential without a stored `url`, a
+   --url on another site than the stored one, plain http without
+   --allow-http-localhost, http to anywhere but this machine even with it,
+   and file: URLs. Each exits 2 with a fixed message.
+2. Refusals in the browser, against a local page on 127.0.0.1: a
+   --pass-selector that matches something other than a password input, a
+   --url that redirects to another origin before anything is filled, and a
+   two-step form whose password page is on another origin. Each exits 1 and
+   the password never reaches the server.
+3. The ordinary case fills, submits and reports "signed in".
+
+In every case neither value appears in the filler's stdout or stderr.
+
+Part 1 needs only `node`. Part 2 and 3 need Playwright with Chromium where
+the filler can find it (next to the repo, the current directory, NODE_PATH or
+node's global modules) and are skipped otherwise. Nothing touches a keychain:
+the credential is piped in directly, as `keydrop run` would.
+
+    tests/fill-login-test
+"""
+import json, os, secrets, shutil, subprocess, sys, tempfile, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FILLER = os.path.join(os.path.dirname(HERE), "contrib", "fill-login.mjs")
+BASE = tempfile.mkdtemp(prefix="fill-login-test-")
+USER = "user@example.com"
+PASSWORD = "fl-" + secrets.token_hex(12)
+FAILS = []
+SEEN = []          # every request line and body the server got
+
+LOGIN = """<!doctype html><title>Sign in</title>
+<form method="post" action="{action}">
+<input name="username" autocomplete="username">
+<input name="password" type="password"><button>Sign in</button></form>"""
+SEARCH = """<!doctype html><title>Sign in</title>
+<form method="get" action="/search"><input name="q" type="search"></form>
+<form method="post" action="/done"><input name="username" autocomplete="username">
+<input name="password" type="password"><button>Sign in</button></form>"""
+STEP_ONE = """<!doctype html><title>Sign in</title>
+<form method="post" action="{other}/step-two"><input name="username" autocomplete="username">
+<button>Next</button></form>"""
+DONE = "<!doctype html><title>Welcome</title><p>signed in</p>"
+
+
+def check(cond, label):
+    print(("ok   " if cond else "FAIL ") + label)
+    if not cond:
+        FAILS.append(label)
+
+
+class Page(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, body, code=200, location=None):
+        data = body.encode()
+        self.send_response(code)
+        if location:
+            self.send_header("Location", location)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        SEEN.append(self.path)
+        port = self.server.server_address[1]
+        other = f"http://localhost:{port}"
+        path = self.path.split("?")[0]
+        if path == "/login":
+            self.send(LOGIN.format(action="/done"))
+        elif path == "/search-login":
+            self.send(SEARCH)
+        elif path == "/redirect":
+            self.send("", 302, f"{other}/login")
+        elif path == "/redirect-away":
+            self.send("", 302, f"{other}/elsewhere")
+        elif path == "/two":
+            self.send(STEP_ONE.format(other=other))
+        else:
+            self.send(DONE)
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        SEEN.append(self.path + " " + body)
+        if self.path == "/step-two":
+            self.send(LOGIN.format(action="/done"))
+        else:
+            self.send(DONE)
+
+
+def filler(args, cred, timeout=90):
+    proc = subprocess.run(["node", FILLER, *args], input=json.dumps(cred).encode(),
+                          capture_output=True, timeout=timeout)
+    out, err = proc.stdout.decode(), proc.stderr.decode()
+    leaked = any(v in out + err for v in (PASSWORD, USER))
+    return proc.returncode, out, err, leaked
+
+
+def cred(url):
+    return {"username": USER, "password": PASSWORD, "url": url}
+
+
+def test_refusals_without_a_browser():
+    profile = os.path.join(BASE, "profile-none")
+    cases = [
+        ("a credential with no stored url",
+         ["--url", "https://example.com/login"], {"username": USER, "password": PASSWORD},
+         "the credential has no stored website (run keydrop with --field url)"),
+        ("a --url on another site than the stored one",
+         ["--url", "https://example.org/login"], cred("https://example.com/"),
+         "--url is not the credential's site"),
+        ("plain http to localhost without --allow-http-localhost",
+         ["--url", "http://127.0.0.1:9/login"], cred("http://127.0.0.1:9/"),
+         "--url must be https"),
+        ("plain http to another host even with --allow-http-localhost",
+         ["--allow-http-localhost", "--url", "http://example.com/login"], cred("http://example.com/"),
+         "--url must be https"),
+        ("a file: url",
+         ["--url", "file:///tmp/login.html"], cred("file:///tmp/login.html"),
+         "--url must be https"),
+    ]
+    for label, args, c, message in cases:
+        code, out, err, leaked = filler(["--profile", profile, *args], c)
+        check(code == 2 and out == "" and err == f"fill-login: {message}\n" and not leaked,
+              f"refuses {label} (exit {code})")
+    check(not os.path.exists(profile), "no profile is created when it refuses")
+
+
+def test_in_the_browser(base):
+    common = ["--allow-http-localhost", "--headless", "--timeout", "10"]
+
+    def go(name, path, extra=()):
+        start = len(SEEN)
+        code, out, err, leaked = filler(
+            ["--profile", os.path.join(BASE, f"profile-{name}"), "--url", f"{base}{path}", *common, *extra],
+            cred(f"{base}/"))
+        sent = any(PASSWORD in s for s in SEEN[start:])
+        return code, out, err, leaked, sent
+
+    code, out, err, leaked, sent = go("pass-selector", "/search-login", ["--pass-selector", 'input[name="q"]'])
+    check(code == 1 and out == "the password selector isn't a password field; not filling\n"
+          and not leaked and not sent,
+          f"refuses a --pass-selector that isn't a password input (exit {code})")
+
+    code, out, err, leaked, sent = go("redirect", "/redirect")
+    check(code == 1 and out == "page moved to another site; not filling\n" and not leaked
+          and not any(USER.replace("@", "%40") in s or USER in s for s in SEEN[-3:]) and not sent,
+          f"refuses a --url that lands on another origin, before filling anything (exit {code})")
+
+    code, out, err, leaked, _ = go("redirect-away", "/redirect-away")
+    check(code == 1 and out == "page moved to another site; not filling\n" and not leaked,
+          f"says it left the site, not that there's no form, when --url redirects away (exit {code})")
+
+    code, out, err, leaked, sent = go("two-step", "/two")
+    check(code == 1 and out == "page moved to another site; not filling\n" and not leaked and not sent,
+          f"refuses a password step on another origin (exit {code})")
+
+    start = len(SEEN)
+    code, out, err, leaked, _ = go("ok", "/login")
+    posted = [s for s in SEEN[start:] if s.startswith("/done ")]
+    fields = parse_qs(posted[0].split(" ", 1)[1]) if posted else {}
+    check(code == 0 and out == "filled\nsigned in\n" and err == "" and not leaked
+          and fields == {"username": [USER], "password": [PASSWORD]},
+          f"fills, submits and reports signed in (exit {code})")
+
+
+def playwright_available():
+    probe = ("import('node:module').then(({createRequire}) => {"
+             " for (const n of ['playwright', 'playwright-core']) {"
+             f"  try {{ createRequire({json.dumps(FILLER)}).resolve(n); process.exit(0); }} catch {{}}"
+             f"  try {{ createRequire(process.cwd() + '/x.js').resolve(n); process.exit(0); }} catch {{}}"
+             " } process.exit(1); })")
+    return subprocess.run(["node", "-e", probe], capture_output=True).returncode == 0
+
+
+def main():
+    if not shutil.which("node"):
+        print("skip all: node isn't installed")
+        return 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        test_refusals_without_a_browser()
+        if playwright_available():
+            test_in_the_browser(f"http://127.0.0.1:{server.server_address[1]}")
+        else:
+            print("skip browser cases: Playwright isn't installed where the filler looks")
+    finally:
+        server.shutdown()
+        shutil.rmtree(BASE, ignore_errors=True)
+    print(f"\n{'FAILED ' + str(len(FAILS)) if FAILS else 'all passed'}")
+    return 1 if FAILS else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

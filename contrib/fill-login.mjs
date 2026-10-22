@@ -3,14 +3,16 @@
 // from stdin, for `keydrop run`. An example consumer of SPEC 6.2, not part of
 // keydrop itself.
 //
-//   keydrop run example-site --field username --field password -- \
+//   keydrop run example-site --field username --field password --field url -- \
 //     node contrib/fill-login.mjs --profile ~/.local/state/browser-profiles/example-site \
 //       --url https://example.com/login
 //
-// stdin is one JSON object with `password` and/or `username`, and optionally
-// `url` (the credential's stored website). The values go into the page's form
-// fields and nowhere else: never argv, never the environment, never this
-// script's output, not even their lengths. Output is status lines only.
+// stdin is one JSON object with `password` and/or `username`, and `url`, the
+// credential's stored website. Without `url` it refuses: --url has to be on
+// the site the credential was stored for, and the page has to stay there
+// before each field is filled. The values go into the page's form fields and
+// nowhere else: never argv, never the environment, never this script's
+// output, not even their lengths. Output is status lines only.
 //
 // It runs headed, because the person usually has a second factor to enter.
 // The window stays open until the page has left the login flow (no password
@@ -28,7 +30,8 @@ import { pathToFileURL } from "node:url";
 
 const USAGE = `usage: keydrop run <name> --field username --field password -- \\
   node fill-login.mjs --profile <dir> --url <login url>
-    [--user-selector <css>] [--pass-selector <css>] [--timeout <seconds>] [--headless]`;
+    [--user-selector <css>] [--pass-selector <css>] [--timeout <seconds>] [--headless]
+    [--allow-http-localhost]   (testing only: also accept http://localhost and 127.0.0.1)`;
 
 const USER_SELECTORS = [
   'input[autocomplete~="username"]',
@@ -61,12 +64,13 @@ function fail(line, code) {
 }
 
 function parseArgs(argv) {
-  const opts = { timeout: DEFAULT_TIMEOUT_S, headless: false };
+  const opts = { timeout: DEFAULT_TIMEOUT_S, headless: false, httpLocal: false };
   const takes = { "--url": "url", "--profile": "profile", "--user-selector": "userSelector",
                   "--pass-selector": "passSelector", "--timeout": "timeout" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--headless") opts.headless = true;
+    else if (a === "--allow-http-localhost") opts.httpLocal = true;
     else if (a === "-h" || a === "--help") { status(USAGE); process.exit(EXIT.ok); }
     else if (takes[a] && i + 1 < argv.length) opts[takes[a]] = argv[++i];
     // Never echo an argument: a value passed by mistake would end up in a log.
@@ -75,24 +79,31 @@ function parseArgs(argv) {
   if (!opts.url || !opts.profile) fail(`--url and --profile are required\n${USAGE}`, EXIT.usage);
   opts.timeout = Number(opts.timeout);
   if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) fail("--timeout takes seconds", EXIT.usage);
-  opts.origin = loginOrigin(opts.url, "--url");
+  opts.origin = loginOrigin(opts.url, "--url", opts.httpLocal);
   return opts;
 }
 
-// https anywhere; http only to this machine; file: for testing a local page.
-function loginOrigin(raw, what) {
+// https only. Plain http to this machine needs --allow-http-localhost, which
+// is for testing against a local page.
+function loginOrigin(raw, what, httpLocal) {
   let u;
   try { u = new URL(raw); } catch { fail(`${what} is not a URL`, EXIT.usage); }
+  if (u.protocol === "https:") return u.origin;
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
-  if (u.protocol === "https:" || u.protocol === "file:" || (u.protocol === "http:" && local)) {
-    return u.protocol === "file:" ? `file://${u.pathname}` : u.origin;
-  }
-  fail(`${what} must be https (http only for localhost)`, EXIT.usage);
+  if (u.protocol === "http:" && local && httpLocal) return u.origin;
+  fail(`${what} must be https`, EXIT.usage);
 }
 
-function pageOrigin(page) {
-  const u = new URL(page.url());
-  return u.protocol === "file:" ? `file://${u.pathname}` : u.origin;
+// The page is still on the site --url names. Checked after loading and again
+// immediately before each field is filled.
+function onSite(page, opts) {
+  try { return new URL(page.url()).origin === opts.origin; } catch { return false; }
+}
+
+// Whatever selector found it, the password only goes into a password input,
+// never a text or search box that could carry it into a URL or history.
+async function isPasswordInput(el) {
+  return el.evaluate((e) => e instanceof HTMLInputElement && e.type === "password").catch(() => false);
 }
 
 async function readCredential() {
@@ -112,6 +123,7 @@ async function readCredential() {
   const pick = (k) => (typeof data[k] === "string" && data[k] !== "" ? data[k] : null);
   const cred = { username: pick("username"), password: pick("password"), url: pick("url") };
   if (!cred.username && !cred.password) fail("stdin has no username or password", EXIT.usage);
+  if (!cred.url) fail("the credential has no stored website (run keydrop with --field url)", EXIT.usage);
   return cred;
 }
 
@@ -168,21 +180,31 @@ async function inLoginFlow(page, formUrl) {
   return false;
 }
 
+const OFF_SITE = "page moved to another site; not filling";
+const NOT_PASSWORD = "the password selector isn't a password field; not filling";
+
+// Fills username and password and submits. There is no second-factor step to
+// fill: a one-time code is left for the person at the window.
 async function fill(page, opts, cred) {
   const userSelectors = opts.userSelector ? [opts.userSelector] : USER_SELECTORS;
   const passSelectors = [opts.passSelector ?? PASS_SELECTOR];
   let pass = cred.password ? await firstVisible(page, passSelectors, FIELD_WAIT_MS) : null;
   const user = cred.username ? await firstVisible(page, userSelectors, pass ? 0 : FIELD_WAIT_MS) : null;
   if (cred.username && !user && !pass) return "no login form found";
-  if (user) await user.fill(cred.username);
+  if (pass && !(await isPasswordInput(pass))) return NOT_PASSWORD;
+  if (user) {
+    if (!onSite(page, opts)) return OFF_SITE;
+    await user.fill(cred.username);
+  }
   if (cred.password && !pass && user) {
     // Two-step sign-in: the username goes first and the password field follows.
     await submit(user);
     pass = await firstVisible(page, passSelectors, FIELD_WAIT_MS);
   }
   if (cred.password && !pass) return "no password field found";
-  if (pageOrigin(page) !== opts.origin) return "page moved to another site; not filling";
   if (pass) {
+    if (!(await isPasswordInput(pass))) return NOT_PASSWORD;
+    if (!onSite(page, opts)) return OFF_SITE;
     await pass.fill(cred.password);
     await submit(pass);
   } else {
@@ -194,11 +216,9 @@ async function fill(page, opts, cred) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const cred = await readCredential();
-  if (cred.url) {
-    // The credential knows its site: refuse to type it into a different one.
-    const stored = loginOrigin(cred.url, "the credential's url");
-    if (stored !== opts.origin) fail("--url is not the credential's site", EXIT.usage);
-  }
+  // The credential knows its site: refuse to type it into a different one.
+  const stored = loginOrigin(cred.url, "the credential's url", opts.httpLocal);
+  if (stored !== opts.origin) fail("--url is not the credential's site", EXIT.usage);
   const chromium = await loadPlaywright();
   if (!chromium) {
     fail("Playwright isn't installed. Install it where this runs, e.g.\n"
@@ -228,7 +248,7 @@ async function main() {
     const page = context.pages()[0] ?? await context.newPage();
     await page.goto(opts.url, { waitUntil: "domcontentloaded" });
     const formUrl = page.url();
-    outcome = await fill(page, opts, cred);
+    outcome = onSite(page, opts) ? await fill(page, opts, cred) : OFF_SITE;
     cred.username = cred.password = null;
     status(outcome);
     if (outcome !== "filled") return shutdown(EXIT.failed);
