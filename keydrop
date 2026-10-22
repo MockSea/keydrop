@@ -9,6 +9,10 @@ instead of pasting it into a chat.
                               and deleting entries under the service prefix
     keydrop get <name> [--field F]
                               print the stored value, or one credential field
+    keydrop run <name> [--field F]... -- <cmd> [args...]
+                              start <cmd> with the value on its stdin (a
+                              credential's fields as one JSON object) and
+                              nowhere else; exits with <cmd>'s status
     keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
     keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
                               local write, no page: a generated password or a
@@ -164,8 +168,8 @@ path in KEYDROP_CONFIG), and environment variables, which win over the file:
 Test-only overrides: KEYDROP_SECURITY (the `security` binary) and
 KEYDROP_WATCH_INTERVAL (seconds, capped at WATCH_INTERVAL).
 """
-import base64, calendar, email.message, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
-import signal, subprocess, sys, time, urllib.parse
+import base64, calendar, email.message, errno, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
+import signal, subprocess, sys, threading, time, urllib.parse
 
 CONFIG_PATH = os.environ.get("KEYDROP_CONFIG") or os.path.expanduser("~/.config/keydrop/config.json")
 CONFIG_KEYS = {   # file key: (env var, default)
@@ -293,6 +297,13 @@ class RefusedError(KeydropError):
 
 class PolicyError(RefusedError):
     pass
+
+
+class RunStartError(KeydropError):
+    """`run` couldn't start the command: 127 or 126, as a shell would exit."""
+    def __init__(self, message, exit_code):
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def require_config(stop=False):
@@ -742,19 +753,15 @@ def totp_ok(value):
         return False
 
 
-def item_value(name, raw, selected=None):
+def item_typed(name):
     # State marks envelopes we wrote: a legacy secret that resembles JSON stays raw.
     entry = STORE.list().get(name)
     if entry is None:
         raise KeydropError("Cannot establish the item type.")
-    typed = entry.get("type") == "credential"
-    schema = read_items().get(name, {}).get("schema")
-    if not schema and not typed:
-        if selected not in (None, "value"):
-            raise KeydropError("Unknown field.")
-        return raw
-    if not selected:
-        raise KeydropError("Credentials require get <name> --field <name>.")
+    return entry.get("type") == "credential" or bool(read_items().get(name, {}).get("schema"))
+
+
+def envelope_field(raw, selected):
     try:
         data = json.loads(raw)
         if data.get("keydrop") != 1 or data.get("type") != "credential" or not isinstance(data.get("fields"), dict):
@@ -765,6 +772,16 @@ def item_value(name, raw, selected=None):
         return value
     except (ValueError, KeyError, TypeError, AttributeError):
         raise KeydropError("Field is absent or the item is invalid.")
+
+
+def item_value(name, raw, selected=None):
+    if not item_typed(name):
+        if selected not in (None, "value"):
+            raise KeydropError("Unknown field.")
+        return raw
+    if not selected:
+        raise KeydropError("Credentials require get <name> --field <name>.")
+    return envelope_field(raw, selected)
 
 
 # ---------- keychain ----------
@@ -2373,6 +2390,124 @@ def put_cli(rest):
     return 0
 
 
+# ---------- run ----------
+
+# Shell conventions for a command that couldn't be started, so a caller can
+# tell "never ran" from the child's own exit codes.
+RUN_NOT_FOUND = 127
+RUN_NOT_EXECUTABLE = 126
+# Forwarded to the child. SIGINT isn't: at a terminal the child is in the same
+# process group and already has it, and a second copy reads as "force quit".
+RUN_FORWARD = (signal.SIGTERM, signal.SIGHUP)
+
+
+def run_parse(rest):
+    """`run <name> [--field F]... -- <cmd> [args...]` -> (name, fields, cmd)."""
+    if "--" not in rest:
+        raise RefusedError("run needs -- <command>")
+    split = rest.index("--")
+    head, cmd = rest[:split], rest[split + 1:]
+    name, fields = None, []
+    it = iter(head)
+    for a in it:
+        if a == "--field":
+            field = next(it, None)
+            if not field:
+                raise RefusedError("--field takes a field name")
+            if field not in fields:
+                fields.append(field)
+        elif name is None and not a.startswith("-"):
+            name = a
+        else:
+            # Never echo the argument: it may be a value someone tried to pass.
+            raise RefusedError("run takes a name, --field flags, then -- <command>")
+    if name is None:
+        raise RefusedError("run needs a name")
+    if not valid_name(name):
+        raise RefusedError("bad name")
+    if not cmd:
+        raise RefusedError("run needs a command after --")
+    return name, fields, cmd
+
+
+def run_payload(name, raw, fields):
+    """The bytes for the child's stdin (SPEC 6.2): a secret's raw value, or a
+    JSON object of exactly the credential fields asked for."""
+    if not item_typed(name):
+        if fields not in ([], ["value"]):
+            raise KeydropError("Unknown field.")
+        return raw.encode("utf-8", "surrogatepass")
+    if not fields:
+        raise RefusedError("Credentials require run <name> --field <name> (one or more).")
+    return json.dumps({f: envelope_field(raw, f) for f in fields}).encode("utf-8", "surrogatepass")
+
+
+def run_feed(pipe, payload):
+    """Write the payload and close stdin. A child that exits or closes stdin
+    without reading gets nothing more, and that isn't an error."""
+    try:
+        pipe.write(payload)
+    except OSError as e:   # BrokenPipeError; EINVAL on some kernels
+        if e.errno not in (errno.EPIPE, errno.EINVAL):
+            raise
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def run(name, fields, cmd):
+    """Start cmd with the item on its stdin and nowhere else: not argv, not the
+    environment, not our output. Returns the child's exit code."""
+    raw = STORE.get(name)
+    if raw is None:
+        raise KeydropError(f"no key named {name}")
+    payload = run_payload(name, raw, fields)   # a missing field fails before anything starts
+    raw = None
+    try:
+        child = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0, shell=False,
+                                 close_fds=True)
+    except FileNotFoundError:
+        payload = None
+        # The command isn't echoed either: it's argv, and argv is where a value goes by mistake.
+        raise RunStartError("couldn't start the command: not found", RUN_NOT_FOUND) from None
+    except PermissionError:
+        payload = None
+        raise RunStartError("couldn't start the command: not executable", RUN_NOT_EXECUTABLE) from None
+    except OSError:
+        payload = None
+        raise RunStartError("couldn't start the command", RUN_NOT_EXECUTABLE) from None
+    previous = {}
+
+    def forward(signum, frame):
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+    try:
+        previous[signal.SIGINT] = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for sig in RUN_FORWARD:
+            previous[sig] = signal.signal(sig, forward)
+        # A thread, so a child that never reads can't hold us in write(): we
+        # wait on the child, and its exit breaks the pipe under the writer.
+        feeder = threading.Thread(target=run_feed, args=(child.stdin, payload), daemon=True)
+        feeder.start()
+        payload = None
+        code = child.wait()
+        feeder.join(timeout=5)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 128 - code if code < 0 else code
+
+
+def run_cli(rest):
+    # Gated like get: config only. Nothing opens, so there is no owner login to pin.
+    name, fields, cmd = run_parse(rest)
+    return run(name, fields, cmd)
+
+
 def vault(ttl, plain_http=False):
     ensure_state()
     reap()
@@ -2968,6 +3103,8 @@ def main(argv):
         if cmd == "put":
             # Gated like get: config only. No page opens, so there is no owner login to pin.
             return put_cli(rest)
+        if cmd == "run":
+            return run_cli(rest)
         if cmd == "get" and (len(rest) == 1 or len(rest) == 3 and rest[1] == "--field"):
             if not valid_name(rest[0]):
                 raise KeydropError("bad name")
