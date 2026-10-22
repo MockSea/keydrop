@@ -79,6 +79,13 @@ function parseArgs(argv) {
   if (!opts.url || !opts.profile) fail(`--url and --profile are required\n${USAGE}`, EXIT.usage);
   opts.timeout = Number(opts.timeout);
   if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) fail("--timeout takes seconds", EXIT.usage);
+  // Plain selectors only: `>>` chains and `internal:` engines can step into
+  // another frame, which may belong to another site.
+  for (const sel of [opts.userSelector, opts.passSelector]) {
+    if (sel !== undefined && (sel.includes(">>") || sel.includes("internal:"))) {
+      fail("selectors can't contain >> or internal:", EXIT.usage);
+    }
+  }
   opts.origin = loginOrigin(opts.url, "--url", opts.httpLocal);
   return opts;
 }
@@ -100,10 +107,18 @@ function onSite(page, opts) {
   try { return new URL(page.url()).origin === opts.origin; } catch { return false; }
 }
 
-// Whatever selector found it, the password only goes into a password input,
-// never a text or search box that could carry it into a URL or history.
-async function isPasswordInput(el) {
-  return el.evaluate((e) => e instanceof HTMLInputElement && e.type === "password").catch(() => false);
+// Asked of the element itself, in whatever frame it lives in: it must be in
+// the top-level page on the expected origin (not a frame from somewhere
+// else), and the password only goes into a password input, never a text or
+// search box that could carry it into a URL or history.
+async function fieldProblem(el, origin, password) {
+  const state = await el.evaluate((e, o) => {
+    if (window !== window.top || location.origin !== o) return "frame";
+    return e instanceof HTMLInputElement && e.type === "password" ? "password" : "other";
+  }, origin).catch(() => "frame");
+  if (state === "frame") return FOREIGN_FRAME;
+  if (password && state !== "password") return NOT_PASSWORD;
+  return null;
 }
 
 async function readCredential() {
@@ -182,6 +197,7 @@ async function inLoginFlow(page, formUrl) {
 
 const OFF_SITE = "page moved to another site; not filling";
 const NOT_PASSWORD = "the password selector isn't a password field; not filling";
+const FOREIGN_FRAME = "the field isn't in the site's own page; not filling";
 
 // Fills username and password and submits. There is no second-factor step to
 // fill: a one-time code is left for the person at the window.
@@ -191,9 +207,12 @@ async function fill(page, opts, cred) {
   let pass = cred.password ? await firstVisible(page, passSelectors, FIELD_WAIT_MS) : null;
   const user = cred.username ? await firstVisible(page, userSelectors, pass ? 0 : FIELD_WAIT_MS) : null;
   if (cred.username && !user && !pass) return "no login form found";
-  if (pass && !(await isPasswordInput(pass))) return NOT_PASSWORD;
+  const passProblem = pass ? await fieldProblem(pass, opts.origin, true) : null;
+  if (passProblem) return passProblem;
   if (user) {
     if (!onSite(page, opts)) return OFF_SITE;
+    const problem = await fieldProblem(user, opts.origin, false);
+    if (problem) return problem;
     await user.fill(cred.username);
   }
   if (cred.password && !pass && user) {
@@ -203,8 +222,9 @@ async function fill(page, opts, cred) {
   }
   if (cred.password && !pass) return "no password field found";
   if (pass) {
-    if (!(await isPasswordInput(pass))) return NOT_PASSWORD;
     if (!onSite(page, opts)) return OFF_SITE;
+    const problem = await fieldProblem(pass, opts.origin, true);
+    if (problem) return problem;
     await pass.fill(cred.password);
     await submit(pass);
   } else {

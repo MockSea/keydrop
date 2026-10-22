@@ -46,6 +46,13 @@ SEARCH = """<!doctype html><title>Sign in</title>
 STEP_ONE = """<!doctype html><title>Sign in</title>
 <form method="post" action="{other}/step-two"><input name="username" autocomplete="username">
 <button>Next</button></form>"""
+FRAMED = """<!doctype html><title>Sign in</title>
+<form method="post" action="/done"><input name="username" autocomplete="username">
+<button>Next</button></form>
+<iframe src="{other}/frame"></iframe>"""
+FRAME = """<!doctype html><form method="post" action="/frame-done">
+<input name="password" type="password"></form>"""
+INTO_FRAME = "iframe >> internal:control=enter-frame >> input[type=password]"
 DONE = "<!doctype html><title>Welcome</title><p>signed in</p>"
 
 
@@ -82,6 +89,10 @@ class Page(BaseHTTPRequestHandler):
             self.send("", 302, f"{other}/login")
         elif path == "/redirect-away":
             self.send("", 302, f"{other}/elsewhere")
+        elif path == "/framed":
+            self.send(FRAMED.format(other=other))
+        elif path == "/frame":
+            self.send(FRAME)
         elif path == "/two":
             self.send(STEP_ONE.format(other=other))
         else:
@@ -123,6 +134,12 @@ def test_refusals_without_a_browser():
         ("plain http to another host even with --allow-http-localhost",
          ["--allow-http-localhost", "--url", "http://example.com/login"], cred("http://example.com/"),
          "--url must be https"),
+        ("a selector that enters a frame",
+         ["--url", "https://example.com/login", "--pass-selector", INTO_FRAME], cred("https://example.com/"),
+         "selectors can't contain >> or internal:"),
+        ("a selector using an internal: engine",
+         ["--url", "https://example.com/login", "--user-selector", "internal:label=Email"],
+         cred("https://example.com/"), "selectors can't contain >> or internal:"),
         ("a file: url",
          ["--url", "file:///tmp/login.html"], cred("file:///tmp/login.html"),
          "--url must be https"),
@@ -162,6 +179,14 @@ def test_in_the_browser(base):
     code, out, err, leaked, sent = go("two-step", "/two")
     check(code == 1 and out == "page moved to another site; not filling\n" and not leaked and not sent,
           f"refuses a password step on another origin (exit {code})")
+
+    # The page's own origin is right; the password field is in a frame from
+    # another one. The selector check refuses this before the browser opens,
+    # and the in-frame origin check would refuse it if a selector got through.
+    code, out, err, leaked, sent = go("framed", "/framed", ["--pass-selector", INTO_FRAME])
+    check(code in (1, 2) and out in ("", "the field isn't in the site's own page; not filling\n")
+          and not leaked and not sent,
+          f"refuses a password field in another site's frame (exit {code})")
 
     start = len(SEEN)
     code, out, err, leaked, _ = go("ok", "/login")

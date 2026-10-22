@@ -223,7 +223,9 @@ and port) as the stored website, and the page has to still be on that site
 after loading and again right before each field is filled, so a login page
 that redirects to a separate sign-in domain needs `--url` set to that page.
 The password only goes into an `input type=password`, whatever
-`--pass-selector` matches. `--allow-http-localhost` also accepts plain http to
+`--pass-selector` matches, and both fields have to be in the site's own page,
+not a frame inside it; selectors can't contain `>>` or `internal:`, which is
+how Playwright reaches into frames. `--allow-http-localhost` also accepts plain http to
 this machine, for testing against a local page. It needs Node and Playwright,
 which isn't bundled:
 
