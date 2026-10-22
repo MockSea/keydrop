@@ -80,6 +80,7 @@ in effect.
                     [--type secret|credential|<template>] [--fields totp,url,notes]
     keydrop vault [--ttl 15m] [--http]
     keydrop get <name> [--field F]
+    keydrop run <name> [--field F]... -- <cmd> [args...]
     keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
     keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
     keydrop list [--long]
@@ -176,6 +177,51 @@ the picker first, for a key that usually arrives as a file:
       {"name": "team_id", "label": "Team ID", "kind": "text", "required": true}]'
 
 The file's name is never kept, and only UTF-8 text is accepted.
+
+### Handing a value to a command without printing it
+
+`get` prints the value, so whatever called it has the value in its output. An
+agent that only needs to pass a password on, say into a login form, can use
+`run` instead:
+
+    keydrop run <name> [--field F]... -- <cmd> [args...]
+
+keydrop starts `<cmd>` without a shell, writes the value to its stdin and
+closes it. A secret goes as its raw bytes. A credential needs at least one
+`--field` and goes as one JSON object holding only those fields, such as
+`{"username": "...", "password": "..."}`. The value is never in the command's
+arguments or environment, and keydrop never prints it. The command's own
+output passes through, and `run` exits with the command's status. keydrop's
+own errors start with `keydrop: `; a missing item or field fails before the
+command starts, and a command that can't be found exits 127.
+
+This keeps the value out of keydrop's output, not out of the command's: the
+command can do whatever it likes with what it reads, so only run commands
+you trust with it.
+
+`contrib/fill-login.mjs` is an example command. It signs a browser profile in
+to a site:
+
+    keydrop run example-site --field username --field password -- \
+      node contrib/fill-login.mjs --profile ~/.local/state/browser-profiles/example-site \
+        --url https://example.com/login
+
+It opens `--url` in a Chromium window using the persistent profile in
+`--profile`, finds the username and password inputs (or uses
+`--user-selector` and `--pass-selector`), fills them, submits, and prints
+status lines only, never the values: `filled`, then `signed in`, `timed out
+waiting for the sign-in to finish` or `browser closed`, or `no login form
+found` and similar if it couldn't fill. The window is headed so a person can
+finish a second factor; it closes once the page has left the login flow, or
+after `--timeout` seconds (300 by default). The signed-in session stays in
+the profile directory for whatever opens it next.
+
+It refuses `--url` that isn't https (plain http only to localhost), won't
+type into a page that has moved to another site, and with `--field url` also
+checks `--url` against the credential's stored website. It needs Node and
+Playwright, which isn't bundled:
+
+    npm install playwright && npx playwright install chromium
 
 ### The home page under launchd
 
@@ -284,6 +330,9 @@ No suite touches a real keychain or a real tailnet. `security` is a fake
 that keeps the serve config in another JSON file. Pages run on 127.0.0.1, and
 the suites send the headers serve would set. They do bind loopback ports and
 spawn background processes, and they need `plutil` and `git`.
+
+`contrib/fill-login.mjs` has no automated test; it was checked by hand
+against a local login page.
 
 The fakes copy today's output formats, so after a macOS or Tailscale upgrade,
 do one request by hand.
