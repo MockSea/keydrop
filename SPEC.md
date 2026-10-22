@@ -853,7 +853,7 @@ last column.
 | C-30 | `run` gives the child exactly the secret's bytes, or a JSON object of exactly the fields asked for; the value is absent from keydrop's stdout and stderr, the child's argv and environment, and every state file | I14, 6.2 | `test_secret_goes_to_stdin_only`, `test_credential_fields_as_one_json_object` |
 | C-31 | `run` on a non-secret item without `--field` is refused with exit 2; a missing item, field or command fails with a message and no traceback, and in the first two cases the command never starts | I14, 6.2 | `test_credential_without_field_is_refused`, `test_missing_item_or_field_fails_before_the_child_starts`, `test_command_problems_are_messages_not_tracebacks` |
 | C-32 | `run` returns the child's exit status (128 + N for signal N) and passes the child's output through | 6.2 | `test_child_exit_code_and_output_pass_through` |
-| C-33 | A child that exits or closes stdin without reading, with a value larger than a pipe buffer, neither hangs `run` nor makes it fail; a termination signal sent to keydrop reaches the child | 6.2 | `test_child_that_ignores_stdin`, `test_sigterm_reaches_the_child` |
+| C-33 | A child that exits or closes stdin without reading, with a value larger than a pipe buffer, neither hangs `run` nor makes it fail; SIGTERM or SIGHUP sent to keydrop reaches the child | 6.2 | `test_child_that_ignores_stdin`, `test_sigterm_and_sighup_reach_the_child` |
 
 ### 10.3 Manual round trip
 
