@@ -160,7 +160,8 @@ marked secret (section 5) ever appears in:
 - any log, audit file or state file keydrop writes;
 - an HTTP response body, header or redirect;
 - shell history, a chat transcript, or the requester's output, except when
-  the requester explicitly runs `get` and consumes stdout itself;
+  the requester explicitly runs `get` and consumes stdout itself, or hands
+  the value to a command's stdin with `run` (I14);
 - an error message, including errors from a failed or mismatched store.
 
 The page token is held to the same rule outside the link itself. Where a
@@ -176,8 +177,8 @@ only once the transport confirms the route is gone. Routes left by a killed
 process are found and removed later, and only routes keydrop itself created
 are ever removed.
 
-**I8. Read-back by name only.** The requester reads items through `get <name>`
-on the same machine. No page, response or log ever renders a stored value.
+**I8. Read-back by name only.** The requester reads items through `get <name>`,
+or passes them on through `run <name>`, on the same machine. No page, response or log ever renders a stored value.
 The vault and home pages are write-only.
 
 **I9. The route is checked on every request.** Before anything else, each
@@ -218,6 +219,24 @@ read. In addition:
   neither counts as blank;
 - a file is stored exactly as sent, trailing newline included. It MUST be
   UTF-8 text with no NUL bytes and not only whitespace, or it is refused.
+
+**I14. `run` hands the value to one child's stdin and nowhere else.** When
+`run` is implemented (6.2), the value goes vault → keydrop → the stdin of the
+command it starts, and that is its only path out of keydrop:
+
+- it is never in the child's argv or environment, nor in the argv or
+  environment of anything else keydrop starts;
+- keydrop's own stdout and stderr never carry it, on success or on any
+  failure;
+- an item, field or command that can't be resolved fails before the child
+  starts, so a half-built value is never sent.
+
+What the child does with the value is outside this guarantee. A child that
+prints its stdin, logs it, passes it on argv or sends it over the network
+has the value, and so does whoever reads that. I14 covers keydrop's side of
+the pipe: what reaches the requester through keydrop itself, and what other
+processes on the machine can see in argv and the environment. Choosing a
+child that keeps the value to itself is the requester's job.
 
 ## 5. Item types
 
@@ -351,6 +370,7 @@ are part of the contract so that one skill can drive any implementation.
 | `vault [--ttl D]` | OPTIONAL. opens a vault session |
 | `home [--new-link \| --stop \| --unlock]` | OPTIONAL. the always-on page |
 | `put <name> (--generate \| --stdin) [--username U] [--replace]` | OPTIONAL. the local write path (6.1) |
+| `run <name> [--field F]... -- <cmd> [args...]` | OPTIONAL. starts `<cmd>` with the value on its stdin (6.2) |
 
 Exit status: 0 on success, 1 when the item doesn't exist, 2 for a refused
 request (bad name, disabled type, invalid TTL, policy), 3 for a vault or
@@ -409,6 +429,48 @@ this machine (section 1).
   `home-audit.log` as well as the request log, in the same
   time/name/event shape and never with a value.
 - Exit status as above: 2 for a refusal, including an existing name.
+
+### 6.2 `run`, a value to a command without printing it
+
+`get` prints the value, so a requester that only needs to pass it on (an
+agent signing a browser in, a script that wants an API key) ends up with it
+in its own output, and often in a transcript. `run` passes it on without
+that: it reads the item and starts a command with the value on the
+command's stdin. Like `get` and `put` it opens no page and trusts whoever can
+already run commands as the owner on this machine (section 1). I14 is its
+invariant.
+
+- **Arguments.** The first `--` ends keydrop's arguments; everything after
+  it is the command and its arguments, passed as an argv list with no shell.
+  Before it come the name and zero or more `--field <id>` flags. A missing
+  `--`, an empty command, a missing name or any other argument is refused,
+  and a refused argument is never echoed.
+- **What the child reads.** For a `secret`, the value's bytes exactly, with
+  no trailing newline added; `--field value` is accepted and means the same.
+  For any other type, at least one `--field` is required and the child reads
+  one JSON object (UTF-8, no trailing newline) holding exactly the fields
+  asked for, each as a string, keyed by field id. A field asked for twice
+  appears once. Without `--field` the request is refused (exit 2); a field
+  the item doesn't have fails like `get --field` does. keydrop closes the
+  child's stdin after the value, so the child sees end of file.
+- **Order.** The name, the item and every field are resolved before the
+  command is started. A failure at any of those steps starts nothing.
+- **The child's output.** The child inherits keydrop's stdout and stderr and
+  its environment, unchanged. keydrop itself prints nothing on success.
+- **A child that doesn't read.** keydrop MUST NOT hang or fail because the
+  child exits or closes stdin without reading it. The child's exit status is
+  still what `run` returns.
+- **Signals.** Termination and hangup signals sent to keydrop while the
+  child runs are passed on to the child. An interrupt from a terminal
+  already reaches the child through its process group, so keydrop doesn't
+  pass that one on again.
+- **Exit status.** The child's own status once it has started. If it was
+  ended by a signal, 128 plus the signal number. Before the child starts,
+  section 6's codes apply (1 for a missing item, 2 for a refusal), and a
+  command that can't be started exits 127 if it wasn't found and 126
+  otherwise, as a shell does. Because the child's codes overlap keydrop's,
+  a caller that needs to tell them apart reads stderr: keydrop's own
+  failures are one line starting `keydrop: `.
 
 ## 7. UX contract
 
@@ -788,6 +850,10 @@ last column.
 | C-27 | Home: stop takes the route down and keeps it down until unlock, including mid start-up | I7 | `test_stop`, `test_stop_race`, `test_stop_guards`, `test_stop_flag_ends_loop` |
 | C-28 | A port the transport already routes is never reused for a new page: keydrop skips it, and refuses after a bounded number of tries, closing every listener it bound | T6 | `test_same_port_units` |
 | C-29 | Every `secret` and `text` input takes a text file in its place: the body cap is checked unread (413), an empty file part is no file, both a value and a file is refused, a file is stored byte for byte and read back exactly, the item limit is checked after the file is read, a `select` takes no file, and no file name reaches a log, state file or page | I13, 7.3 | `test_upload_units`, `test_upload_local`, `test_upload_home` |
+| C-30 | `run` gives the child exactly the secret's bytes, or a JSON object of exactly the fields asked for; the value is absent from keydrop's stdout and stderr, the child's argv and environment, and every state file | I14, 6.2 | `test_secret_goes_to_stdin_only`, `test_credential_fields_as_one_json_object` |
+| C-31 | `run` on a non-secret item without `--field` is refused with exit 2; a missing item, field or command fails with a message and no traceback, and in the first two cases the command never starts | I14, 6.2 | `test_credential_without_field_is_refused`, `test_missing_item_or_field_fails_before_the_child_starts`, `test_command_problems_are_messages_not_tracebacks` |
+| C-32 | `run` returns the child's exit status (128 + N for signal N) and passes the child's output through | 6.2 | `test_child_exit_code_and_output_pass_through` |
+| C-33 | A child that exits or closes stdin without reading, with a value larger than a pipe buffer, neither hangs `run` nor makes it fail; a termination signal sent to keydrop reaches the child | 6.2 | `test_child_that_ignores_stdin`, `test_sigterm_reaches_the_child` |
 
 ### 10.3 Manual round trip
 
@@ -929,6 +995,9 @@ and the spec, for whoever brings it into line:
   item). That stays as the `secret` layout.
 - **Size limit.** The keychain adapter refuses an item whose `security -i`
   line would reach 4096 characters (5.4), before anything is written.
+- **`run`.** The reference implements 6.2. It writes no log or audit
+  line for a `run`, as it writes none for a `get`. `get` without `--field` on
+  a credential exits 1, where `run` without `--field` exits 2 as 6.2 says.
 - **Exit codes.** Refusals (bad type or fields, disabled type or field)
   exit 2. Everything else that fails exits 1, including vault and transport
   failures that section 6 puts at 3.
