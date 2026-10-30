@@ -139,9 +139,11 @@ submission. After it, the page answers nothing further and the route is
 closed. A replayed link gets no form.
 
 **I2. Bounded lifetime.** Every request link has a TTL. The default is 15
-minutes and the maximum is 1 hour. When it passes, the route is closed. The
-home page is the one exception and replaces the TTL with I10's lockout and
-rate limit.
+minutes and the maximum is 1 hour. When it passes, the route is closed, and
+a request still arriving or waiting to write stores nothing. Every request
+also has its own deadline for its whole duration, however slowly its bytes
+arrive, so one client can't hold a page past its TTL. The home page is the
+one exception and replaces the TTL with I10's lockout and rate limit.
 
 **I3. Only the owner can submit.** Every request, of every method, to every
 path, is refused unless the transport has proven that the connecting identity
@@ -174,7 +176,9 @@ succeeds. A vault CLI's exit status is not evidence on its own.
 signal or crash, the route is closed and the listener exits. Teardown counts
 only once the transport confirms the route is gone. Routes left by a killed
 process are found and removed later, and only routes keydrop itself created
-are ever removed.
+are ever removed: every teardown, not just the orphan sweep, first checks the
+route still points where keydrop pointed it, and leaves it alone if not. A
+teardown that can't read the transport's state keeps its record and retries.
 
 **I8. Read-back by name only.** The requester reads items through `get <name>`
 on the same machine. No page, response or log ever renders a stored value.
@@ -201,9 +205,10 @@ Section 9 lists what this rules out.
 transport that policy disables is refused at the command line. No link is
 printed and no route is opened.
 
-**I13. A file is a value, nothing more.** Every input that takes a value of
-kind `secret` or `text` also takes an uploaded text file in its place
-(7.3). The upload is held to every rule a typed value is: I5 and I8 cover its
+**I13. A file is a value, nothing more.** A field takes a file when it is
+marked `"input": "file"` (5.1), and then a file is the only way to fill it.
+The one value of a plain `secret` request takes a typed value or a file. An
+upload is held to every rule a typed value is: I5 and I8 cover its
 contents, the field's `max` and the vault's `max_bytes` (8.1) apply to it,
 and the whole-item limit is checked after every file on the form has been
 read. In addition:
@@ -214,8 +219,8 @@ read. In addition:
   stored or rendered;
 - a file part with no bytes means no file was chosen (browsers, iOS Safari
   included, send one for an empty file input);
-- a field gets a typed value or a file, never both: both is refused, and
-  neither counts as blank;
+- where a value takes either (a plain `secret`), it gets a typed value or a
+  file, never both: both is refused, and neither counts as blank;
 - a file is stored exactly as sent, trailing newline included. It MUST be
   UTF-8 text with no NUL bytes and not only whitespace, or it is refused.
 
@@ -243,12 +248,14 @@ with the no-save attributes in 7.3. Fields of kind `text` and `url` are also
 never logged, and never rendered back, but they use visible inputs so the
 owner can check what they typed.
 
-`input` only changes how the page leads. Every `secret` and `text` field
-accepts a typed value or a file either way (I13). A field marked
-`"input": "file"`, such as a private key that arrives as a `.p8` or `.pem`
-file, shows its file picker first and the typed input second. `file` is
-allowed only on `secret` and `text` fields; `url` and `select` fields take no
-file.
+`input` says what the field's one input is. `text`, the default, is a typed
+input and takes no file. `file` is a file picker and takes nothing typed: a
+multi-line value such as a private key in a `.p8` or `.pem` file, pasted into
+a one-line input, loses its line breaks in the browser, before the page can
+notice, and would be stored damaged. `file` is allowed only on `secret` and
+`text` fields; `url` and `select` fields take no file. A plain `secret`
+request (5.2) has no fields to mark, so its one input takes a typed value or
+a file.
 
 The reference implementation's schema JSON spells `id` as `name`, and accepts
 one `check`, `"totp"`, on a `secret` field, and `input` as above. Any other
@@ -363,7 +370,10 @@ The reference adds, beyond this contract:
 - `request <name> --type <template>` or `--template <name>` proposes a
   built-in field set (`api-key`, `username-password`, `aws` and others);
   `--fields '<JSON list>'` or `--schema <file>` proposes custom fields. The
-  owner can edit proposed fields on the page before storing. A bare name that
+  request page shows exactly those fields: the owner can't add, remove or
+  change one there, and a submit that carries a schema of its own is refused
+  as S-BAD-FORM. Editing fields is part of the vault page's add and rotate
+  forms only. A bare name that
   matches a multi-field template proposes it only when credentials are
   enabled.
 - `list` prints names only, one per line, for scripts; `list --long` adds
@@ -460,18 +470,18 @@ All dynamic text (item name, note, error) is HTML-escaped.
 |---|---|---|---|
 | S-FORM | owner, valid token, page open | 200 | the form for the type (7.3) |
 | S-STORED | submit stored and verified | 200 | `<h1>Stored. You can close this.</h1>` |
-| S-EMPTY | a required field was blank: no typed value and no file | 400 | the form again, with `<p class="err">Nothing was entered.</p>`; the link is not used up |
+| S-EMPTY | a required field was blank: no typed value and no file | 400 | the form again, with `<p class="err">Nothing was entered.</p>` (for a typed item, `Nothing was entered for {Label}.`), the field's input marked `aria-invalid` and pointing at the error; the link is not used up |
 | S-INVALID | a field failed its check, got both a typed value and a file, or got a file that isn't text (I13) | 400 | the form again, with `<p class="err">{Label} doesn't look right.</p>`, or for an upload `Paste a value or choose a file, not both.` or the file's own reason; the link is not used up |
 | S-TOO-LONG | a field or the encoded item is over its limit, after every file is read | 400 | the form again, with `<p class="err">That's too long to store in this vault.</p>`; the link is not used up |
-| S-BAD-FORM | body malformed or wrong fields | 400 | `<h1>That didn't look like the form.</h1>`; counts as a bad request |
+| S-BAD-FORM | body malformed or wrong fields: a percent-escape that isn't one or doesn't decode to UTF-8, a body shorter than its `Content-Length`, more than one `Content-Length` or any `Transfer-Encoding`, a field the form doesn't have, or a schema on a request page | 400 | `<h1>That didn't look like the form.</h1>`; counts as a bad request |
 | S-TOO-BIG | body over the fixed cap (I13), refused before it is read | 413 | `<h1>That's too long to store in this vault.</h1>`; counts as a bad request |
 | S-STORE-FAILED | vault write failed or didn't verify | 500 | `<h1>Couldn't store it. Tell whoever sent you the link.</h1>` |
-| S-STALE | vault or home form token aged out | 403 | `<h1>That form is stale. Reload the page.</h1>` |
-| S-EXPIRED | TTL passed, listener still up | 410 | `<h1>This link has expired. Ask for a new one.</h1>` |
+| S-STALE | form token missing, wrong or aged out, or another site's Origin or Fetch Metadata (7.3) | 403 | `<h1>That form is stale. Reload the page.</h1>`; counts as a bad request unless it is a real token that aged out |
+| S-EXPIRED | TTL passed, listener still up (a request in flight when it passed) | 410 | `<h1>This link has expired. Ask for a new one.</h1>`; nothing is stored |
 | S-CANCELLED | cancelled, listener still up | 410 | `<h1>This link was cancelled. Nothing was stored.</h1>` |
 | S-USED | already stored, listener still up | 410 | `<h1>This link has already been used.</h1>` |
 | S-GONE | listener and route are down | none | connection refused, or the transport's own error |
-| S-REFUSED | wrong identity, wrong token, wrong Host, route not ours | 404 | empty body |
+| S-REFUSED | wrong identity, wrong token, wrong Host, route not ours; any method but GET and POST, after the same checks | 404 | empty body |
 
 How the states fit together:
 
@@ -488,11 +498,20 @@ How the states fit together:
   MUST NOT keep a listener up longer just to show them.
 - **The form tells the owner the deadline.** S-FORM includes
   `Link ends HH:MM.` so a later S-GONE is not a surprise.
-- **Bad requests.** S-REFUSED (except a wrong Host) and S-BAD-FORM count
-  toward I4's limit. Browser auto-fetches of `/favicon.ico`,
+- **Bad requests.** S-REFUSED (except a wrong Host), S-BAD-FORM, S-TOO-BIG
+  and a refused form token count toward I4's limit, under I10's rules on a
+  surface that persists a lockout. Browser auto-fetches of `/favicon.ico`,
   `/apple-touch-icon*.png` and `/robots.txt` get S-REFUSED and don't count.
 
 ### 7.3 Forms
+
+Every form carries a form token, a hidden `csrf` field separate from the
+link's token: whoever has the link can build a form that posts to it from
+any site, and the owner's browser would carry the owner's identity with it.
+A POST is refused (S-STALE) without the right form token, when
+`Sec-Fetch-Site` is present and not `same-origin` or `none`, or when `Origin`
+is present, not `null`, and isn't exactly one of the page's own origins:
+scheme, host and port.
 
 All inputs for `secret` fields carry these attributes, which ask browsers and
 password managers not to offer to save the value:
@@ -506,14 +525,17 @@ Inputs for `text` and `url` fields carry `autocomplete="off" autocapitalize="off
 autocorrect="off" spellcheck="false"`. Every form that carries a value is
 `<form method="post" action="{link path}" enctype="multipart/form-data" autocomplete="off">`.
 
-Each `secret` and `text` input is followed by a file input for the same field
-(I13), `<input type="file" name="{id}.file" aria-label="{Label} as a file">`,
-with a short line giving the limit in bytes. For a field marked
-`"input": "file"` (5.1) the file input comes first. An input that has a file
+A plain `secret`'s input is followed by a file input for the same value
+(I13), `<input type="file" name="value.file" aria-label="Value as a file">`,
+with a short line giving the limit in bytes. That input and its file
 alternative MUST NOT carry `required`, because the browser would refuse a
-form whose value came as a file; the server answers S-EMPTY instead. A
-`select` keeps `required`. The file input carries no `accept` attribute: text
-files have no reliable type, and the server checks the bytes.
+form whose value came as a file; the server answers S-EMPTY instead. Every
+field of a typed item has exactly one input (5.1): a typed input, or for a
+field marked `"input": "file"` a file input
+`<input type="file" id="{id}.file" name="{id}.file">` with the limit line,
+labelled by the field's `<label>`. That one input carries `required` when the
+field is required. The file input carries no `accept` attribute: text files
+have no reliable type, and the server checks the bytes.
 
 **`secret`:**
 
@@ -523,6 +545,7 @@ files have no reliable type, and the server checks the bytes.
 <p class="meta">Link ends {HH:MM}.</p>
 <p class="err">{error}</p>                     <!-- only on S-EMPTY / S-INVALID -->
 <form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{form token}">
 <input name="value" {secret attributes} autofocus>
 <p class="meta">or a text file, up to {limit} bytes</p>
 <input type="file" name="value.file" aria-label="Value as a file">
@@ -536,12 +559,11 @@ files have no reliable type, and the server checks the bytes.
 <p>{note}</p>
 <p class="meta">Link ends {HH:MM}.</p>
 <form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{form token}">
 <label for="username">Username</label>
-<input id="username" name="username" type="text" {text attributes} autofocus>
-<input type="file" name="username.file" aria-label="Username as a file">
+<input id="username" name="username" type="text" {text attributes} autofocus required>
 <label for="password">Password</label>
-<input id="password" name="password" {secret attributes}>
-<input type="file" name="password.file" aria-label="Password as a file">
+<input id="password" name="password" {secret attributes} required>
 <label for="totp">One-time code secret (optional)</label>
 <input id="totp" name="totp" {secret attributes}>
 <label for="url">Website (optional)</label>
@@ -551,11 +573,9 @@ files have no reliable type, and the server checks the bytes.
 <button type="submit">Store</button></form>
 ```
 
-(The optional `secret` and `text` fields get a file input too; the limit
-lines are left out above.)
-
 A new type renders the same way: heading, note, deadline, one labelled input
-per field in declared order, each with its file input, one `Store` button.
+per field in declared order (a file input for a field marked
+`"input": "file"`), one `Store` button.
 
 ### 7.4 Vault and home pages
 
@@ -579,16 +599,18 @@ These are OPTIONAL. When present, they use this copy.
 | end button (home) | `Stop this page` |
 | after end (vault) | `Closed. The link is dead now.` |
 | after stop (home) | `Stopped. It stays down until keydrop home --unlock is run on this machine.` |
-| exists | `{name} already exists. Use Replace on it instead.` |
+| exists | `{name} already exists. Use Replace on it instead.` (the reference's redesigned pages say `Rotate`) |
 | missing | `There's no {name}.` |
 | rate limited | `Too many changes in the last hour. Try again later.` |
 | vault unreadable | `Couldn't read the vault.` |
 | delete failed | `Couldn't delete {name}.` |
 | store failed | `Couldn't store {name}.` |
 
-Every POST on these pages carries a form token, and is refused when
-`Sec-Fetch-Site` is present and not `same-origin` or `none`, or when `Origin`
-is present and isn't the page's own. Writes answer with a 303 to the page.
+Every POST on these pages carries a form token and is checked as in 7.3.
+Writes answer with a 303 to the page. A refused add or replace comes back to
+the same form, with the error naming the field and no value filled in. The
+existence check, the write and the metadata update for one write, delete
+included, happen under one lock, so two writers can't both find a name free.
 Delete always goes through the confirm screen.
 
 ## 8. Vault adapters
@@ -649,7 +671,7 @@ it, and record what was confirmed in the adapter.
 
 | Store | Typical tool | What to check |
 |---|---|---|
-| macOS login keychain | `/usr/bin/security` | Reference. Write through `security -i` on stdin with `-X <hex>`. Items created by another binary prompt on every read. Exit status is the low 8 bits of an OSStatus. |
+| macOS login keychain | `/usr/bin/security` | Reference. Write through `security -i` on stdin with `-X <hex>`. Name the login keychain (`security login-keychain`) on every call: without one, `add-generic-password` writes to the default keychain, which need not be login, and find, delete and dump search every keychain on the search list. Items created by another binary prompt on every read. Exit status is the low 8 bits of an OSStatus. |
 | GNOME Keyring, KWallet (Secret Service) | `secret-tool` or D-Bus | Whether `secret-tool store` reads the secret from stdin. Use an attribute such as `keydrop-name` as the namespace. Locked collections prompt on the desktop. |
 | pass | `pass insert -m` | Reads from stdin. Each item becomes a GPG file and, if the store is a git repo, a commit: the value is encrypted, but names and times land in git history. |
 | KeePassXC | `keepassxc-cli` | How the database password is supplied without argv. Whether `add`/`edit` read the entry password from stdin. Native fields for credentials. |
@@ -787,7 +809,7 @@ last column.
 | C-26 | Home: a strike needs the owner's identity and exactly one `Sec-Fetch-Site` of `same-origin` or `none`; absent, empty or doubled gets a bare 404 and no strike; the lockout and rate limit persist across restarts | I10 | `test_strangers_cant_lock`, `test_fetch_metadata`, `test_lockout`, `test_rate_limit`, `test_peer_flood`, `test_flood` |
 | C-27 | Home: stop takes the route down and keeps it down until unlock, including mid start-up | I7 | `test_stop`, `test_stop_race`, `test_stop_guards`, `test_stop_flag_ends_loop` |
 | C-28 | A port the transport already routes is never reused for a new page: keydrop skips it, and refuses after a bounded number of tries, closing every listener it bound | T6 | `test_same_port_units` |
-| C-29 | Every `secret` and `text` input takes a text file in its place: the body cap is checked unread (413), an empty file part is no file, both a value and a file is refused, a file is stored byte for byte and read back exactly, the item limit is checked after the file is read, a `select` takes no file, and no file name reaches a log, state file or page | I13, 7.3 | `test_upload_units`, `test_upload_local`, `test_upload_home` |
+| C-29 | A plain secret takes a text file in place of a typed value, and an `"input": "file"` field takes only a file: the body cap is checked unread (413), an empty file part is no file, both a value and a file is refused, a file is stored byte for byte and read back exactly, the item limit is checked after the file is read, a field not marked `file` takes no file, and no file name reaches a log, state file or page | I13, 5.1, 7.3 | `test_upload_units`, `test_upload_local`, `test_upload_home`, `keydrop-review-test` |
 
 ### 10.3 Manual round trip
 
@@ -831,8 +853,8 @@ Requirements:
 
 Things to watch:
 
-- Multi-line values (certificates, SSH keys) can already come in as a file
-  (I13); mark the field `"input": "file"`. Typing one would need a
+- Multi-line values (certificates, SSH keys) come in as a file (I13); mark
+  the field `"input": "file"`, and the file is its only input. Typing one would need a
   `<textarea>`, which is a new input element, so it needs the same no-save
   attributes and a spec change, in that order.
 - File uploads put a multipart parser in front of every value, which is where
@@ -900,8 +922,9 @@ and the spec, for whoever brings it into line:
   `get --field`, `list --long`, `policy.json` (5.5) and `items.json` (field
   definitions and rotate-by dates, never values), plus the templates and
   custom fields in section 6. Form inputs are named `f_<id>`,
-  not `<id>` as in 7.3, and the page carries the schema in a hidden `schema`
-  field that the server re-validates. `select` is an extra field kind.
+  not `<id>` as in 7.3. The vault's add and rotate forms carry the schema in
+  a hidden `schema` field that the server re-validates; the request page
+  carries none and refuses one. `select` is an extra field kind.
 - **Partial adapter seam.** The pages and commands reach the keychain only
   through `STORE`, a `KeychainVault` with the 8.1 methods plus `fits()`;
   `store` takes the encoded string, not `{type, fields}`. The Tailscale calls
@@ -912,21 +935,16 @@ and the spec, for whoever brings it into line:
   7.4 table: the empty list reads `No matching keys. Add your first credential
   below.`, the add section is `Add a credential`, and items have `Rotate` and
   `Delete…` actions. 7.4 should be rewritten against the new pages.
-- **States.** It has no S-EXPIRED, S-CANCELLED or S-USED screens, and no
-  `Link ends HH:MM.` line on the request form. Once a page is done it is
+- **States.** It answers S-EXPIRED only to a request in flight when the link
+  ends, and has no S-CANCELLED or S-USED screens. Once a page is done it is
   S-GONE, which this spec allows.
-- **S-EMPTY.** It answers `Nothing was entered.` as a message page; the spec
-  re-renders the form with the error so the owner can retry.
 - **Copy.** The vault confirm text says "keychain" (`It goes from the keychain
   for good.`, `Couldn't read the keychain.`). The spec says "vault" so the copy
   is the same everywhere. The home stop message says "on the Mac".
 - **Uploads.** File inputs are named `file` on the `secret` request form and
   `file_<id>` for typed fields, not `{id}.file` as in 7.3. A `secret`
   request's typed value is trimmed and a file is not. S-TOO-BIG (413) is a
-  message page. The vault and home pages answer upload errors as message
-  pages; the request form re-renders with the error.
-- **Labels.** The request form's input has no label (the heading names the
-  item). That stays as the `secret` layout.
+  message page.
 - **Size limit.** The keychain adapter refuses an item whose `security -i`
   line would reach 4096 characters (5.4), before anything is written.
 - **Exit codes.** Refusals (bad type or fields, disabled type or field)

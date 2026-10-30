@@ -62,7 +62,8 @@ What's asserted:
    past the drop, so the idle watchdog isn't what ends it, and then a request
    carrying a valid Host, the owner's login and the right token gets a bare 404, no
    strike, and the page exits (home with 1). Unreadable or garbled status
-   counts as gone. A repointed route is left in place by teardown.
+   counts as gone. A repointed route is left in place by teardown, and so is
+   one teardown can't read: it keeps its record and the next reap removes it.
 
     tests/keydrop-home-test
 """
@@ -1317,8 +1318,9 @@ def test_watchdog(token):
                               "Proxy": f"http://127.0.0.1:{KD.HOME_PORT + 1}"}}}}))):
         if page.port is None:
             page = Page(fast)
+        changed = change(serve_cfg())   # read before open("w") truncates it
         with open(SERVE_JSON, "w") as f:
-            json.dump(change(serve_cfg()), f)
+            json.dump(changed, f)
         rc = page.wait(5)
         err = page.proc.stderr.read() if rc is not None else ""
         check(rc == 1 and "went away" in err, f"watchdog: route {label}: exits 1 and says why ({rc})")
@@ -1326,6 +1328,8 @@ def test_watchdog(token):
         check(not any(r.get("kind") == "home" for r in KD.read_pending()),
               f"watchdog: route {label}: no home record left")
         page.kill()
+        if label == "repointed":
+            drop_route(KD.HOME_PORT)   # the other service's route: its owner removes it, not keydrop
         page = Page(fast) if label == "removed" else None
     check(not route_up() or run("home", "--stop", "--force").returncode == 0, "watchdog: tidy")
     unlock()
@@ -1359,8 +1363,9 @@ def test_route_check_home(token):
         page = Page()
         check(page.port is not None and get(page.url(token))[0] == 200, f"route check, {label}: page up, the owner gets in")
         before = strikes()
+        changed = change(serve_cfg())   # read before open("w") truncates it
         with open(SERVE_JSON, "w") as f:
-            json.dump(change(serve_cfg()), f)
+            json.dump(changed, f)
         set_garble(garble)
         time.sleep(1.5)
         check(page.proc.poll() is None and accepts(KD.HOME_PORT),
@@ -1376,12 +1381,16 @@ def test_route_check_home(token):
         if label == "repointed":
             check(home_proxy() == f"http://127.0.0.1:{KD.HOME_PORT + 1}",
                   "route check, repointed: teardown leaves someone else's route alone")
-        if garble:   # it couldn't see the route, so it tried to remove it and kept the record
-            check(outcomes(KD.HOME)[-1:] == ["teardown-failed"] and route_up() is False
+        if garble:
+            # It couldn't see whose route :HOME_PORT is, so it removed nothing (it may
+            # be someone else's by now) and kept its record for the reap to retry.
+            check(outcomes(KD.HOME)[-1:] == ["teardown-failed"] and route_up() is True
                   and any(r.get("kind") == "home" and r.get("teardown_failed") for r in KD.read_pending()),
-                  f"route check, {label}: teardown still ran and kept its record for the reap")
+                  f"route check, {label}: teardown removed nothing it couldn't verify and kept its record")
         page.kill()
         set_garble(None)
+        if label == "repointed":
+            drop_route(KD.HOME_PORT)   # the other service's route: its owner removes it, not keydrop
         run("status")   # reap: retries a teardown the garbled status made fail
         if route_up():
             run("home", "--stop", "--force")

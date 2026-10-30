@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""The findings of the October 2026 security review, one test class each, in
+order of severity. No ports: each page is a real OneShot, Vault or Home
+whose socket is never bound, and every request goes over a
+socket.socketpair() straight into the server's own finish_request, so the
+real handler reads the real bytes. `tailscale serve status` is patched to show
+the page's route; `security` is the fake in tests/fakes.py.
+
+    tests/keydrop-review-test
+
+KEYDROP_UNDER_TEST=<path> runs the same tests against another copy of the
+script (an older commit, say), to see which of them it fails.
+"""
+import contextlib, email.message, html.parser, importlib.machinery, importlib.util, io, json, math
+import os, re, socket, subprocess, sys, tempfile, threading, time, types, unittest
+from unittest.mock import patch
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+from fakes import fake_security, set_keychains  # noqa: E402
+
+BASE = tempfile.TemporaryDirectory(prefix="keydrop-review-")
+OWNER = "owner@example.com"
+for var in ("KEYDROP_ACCOUNT", "KEYDROP_SERVICE_PREFIX", "KEYDROP_LAUNCHD_LABEL", "KEYDROP_TS_SOCKET"):
+    os.environ.pop(var, None)
+os.environ.update(KEYDROP_CONFIG=os.path.join(BASE.name, "no-such-config.json"),
+                  KEYDROP_STATE_DIR=os.path.join(BASE.name, "state"),
+                  KEYDROP_TAILSCALE=os.path.join(BASE.name, "no-tailscale"),
+                  KEYDROP_OWNER_LOGIN=OWNER,
+                  KEYDROP_SECURITY=fake_security(BASE.name))
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("kd", os.environ.get("KEYDROP_UNDER_TEST") or os.path.join(ROOT, "keydrop"))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+KD = importlib.util.module_from_spec(spec)
+loader.exec_module(KD)
+
+PORT = 47999
+HOST = "box.example.ts.net"
+TOKEN = "t" * 43
+LOGIN_KC = "/fake/login.keychain-db"
+
+
+def route(port=PORT, local=None):
+    return {"TCP": {str(port): {"HTTPS": True}},
+            "Web": {f"{HOST}:{port}": {"Handlers": {"/": {"Proxy": f"http://127.0.0.1:{local or port}"}}}}}
+
+
+def unbound(self):
+    self.server_address = ("127.0.0.1", PORT)
+
+
+PAGES = []
+
+
+def make_page(kind="oneshot", name="req", schema=None):
+    """A page as launch() would leave it, minus the bound port. Closed after
+    each test."""
+    with patch.object(KD.http.server.HTTPServer, "server_bind", unbound):
+        if kind == "oneshot":
+            srv = KD.OneShot(TOKEN, name, "", True, schema=schema)
+        elif kind == "vault":
+            srv = KD.Vault(TOKEN, time.time() + 600, True)
+        else:
+            srv = KD.Home(pin=True, port=PORT)
+    srv.allow_hosts(HOST, PORT)
+    PAGES.append(srv)
+    return srv
+
+
+def build(method, path="/" + TOKEN, body=b"", headers=(), length=True, host=f"{HOST}:{PORT}"):
+    lines = [f"{method} {path} HTTP/1.1", f"Host: {host}", f"Tailscale-User-Login: {OWNER}"]
+    lines += [f"{k}: {v}" for k, v in headers]
+    if length:
+        lines.append(f"Content-Length: {len(body)}")
+    return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+
+
+def form_body(fields):
+    return KD.urllib.parse.urlencode(fields).encode()
+
+
+FORM = ("Content-Type", "application/x-www-form-urlencoded")
+
+
+class Reply:
+    def __init__(self, raw, took):
+        head, _, self.body = raw.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        self.status = int(lines[0].split(" ")[1]) if lines and lines[0].startswith("HTTP/") else None
+        self.headers = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in lines[1:] if ":" in l}
+        self.took = took
+        self.text = self.body.decode("utf-8", "replace")
+
+
+def exchange(srv, chunks, delay=0.0, wait=15):
+    """Send chunks (bytes, or a list of them, `delay` seconds apart) to srv
+    over a socketpair, and return the Reply and how long the server took."""
+    if isinstance(chunks, bytes):
+        chunks = [chunks]
+    a, b = socket.socketpair()
+    finished = {}
+
+    def serve():
+        try:
+            srv.finish_request(b, ("127.0.0.1", 50000))
+        except Exception as e:   # noqa: BLE001 - recorded for the test to see
+            finished["error"] = e
+        finally:
+            finished["at"] = time.monotonic()
+            try:
+                srv.shutdown_request(b)
+            except OSError:
+                pass
+    start = time.monotonic()
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    try:
+        for c in chunks:
+            if "at" in finished:
+                break
+            a.sendall(c)
+            if delay:
+                time.sleep(delay)
+        a.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    t.join(wait)
+    a.settimeout(2)
+    raw = b""
+    try:
+        while True:
+            got = a.recv(65536)
+            if not got:
+                break
+            raw += got
+    except OSError:
+        pass
+    a.close()
+    return Reply(raw, finished.get("at", time.monotonic()) - start)
+
+
+class Forms(html.parser.HTMLParser):
+    """Every form's fields as a browser would submit them, untouched."""
+
+    def __init__(self, page):
+        super().__init__()
+        self.forms, self._select, self._option = [], None, None
+        self.feed(page)
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "form":
+            self.forms.append({"fields": {}, "enctype": a.get("enctype")})
+        elif not self.forms:
+            return
+        elif tag == "input" and a.get("name"):
+            if a.get("type") == "checkbox" and "checked" not in a:
+                return
+            if a.get("type") != "file":
+                self.forms[-1]["fields"][a["name"]] = a.get("value") or ""
+        elif tag == "select":
+            self._select = a.get("name")
+        elif tag == "option" and self._select and "selected" in a:
+            if "value" in a:
+                self.forms[-1]["fields"][self._select] = a["value"]
+            else:
+                self._option = self._select   # an option with no value submits its text
+
+    def handle_data(self, data):
+        if self._option:
+            self.forms[-1]["fields"][self._option] = data.strip()
+            self._option = None
+
+    def handle_endtag(self, tag):
+        if tag == "select":
+            self._select = None
+
+    def with_field(self, name, value=None):
+        return next(f["fields"] for f in self.forms
+                    if name in f["fields"] and (value is None or f["fields"][name] == value))
+
+
+def csrf_of(page):
+    m = re.search(r'name="csrf" value="([^"]*)"', page)
+    return m.group(1) if m else ""
+
+
+def stored(name):
+    return KD.keychain_get(name)
+
+
+class PageTest(unittest.TestCase):
+    def setUp(self):
+        KD.ensure_state()
+        with open(KD.POLICY_FILE, "w") as f:
+            json.dump({"types_enabled": ["secret", "credential"]}, f)
+        p = patch.object(KD, "serve_status", side_effect=lambda: json.loads(json.dumps(route())))
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(lambda: [PAGES.pop().server_close() for _ in list(PAGES)])
+
+    def form_page(self, srv):
+        r = exchange(srv, build("GET", length=False))
+        self.assertEqual(r.status, 200)
+        return r.text
+
+
+# ---------- 1. High: one-shot requests lack CSRF protection ----------
+
+class OneShotCsrf(PageTest):
+    def test_post_without_the_form_token_is_refused_and_counts(self):
+        srv = make_page(name="csrf-none")
+        self.form_page(srv)
+        r = exchange(srv, build("POST", body=form_body({"value": "attacker-value"}), headers=[FORM]))
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(srv.outcome)
+        self.assertIsNone(stored("csrf-none"))
+        self.assertEqual(srv.bad, 1)
+
+    def test_the_link_token_is_not_the_form_token(self):
+        srv = make_page(name="csrf-link")
+        r = exchange(srv, build("POST", body=form_body({"value": "v", "csrf": TOKEN}), headers=[FORM]))
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(stored("csrf-link"))
+
+    def test_another_sites_origin_or_fetch_metadata_is_refused_even_with_the_token(self):
+        srv = make_page(name="csrf-site")
+        csrf = csrf_of(self.form_page(srv))
+        for extra in (("Origin", "https://evil.example"), ("Sec-Fetch-Site", "cross-site"),
+                      ("Origin", f"http://{HOST}:{PORT}")):   # right host, wrong scheme
+            with self.subTest(extra=extra):
+                r = exchange(srv, build("POST", body=form_body({"value": "v", "csrf": csrf}), headers=[FORM, extra]))
+                self.assertEqual(r.status, 403)
+                self.assertIsNone(stored("csrf-site"))
+
+    def test_the_pages_own_form_stores(self):
+        srv = make_page(name="csrf-ok")
+        csrf = csrf_of(self.form_page(srv))
+        self.assertTrue(csrf and csrf != TOKEN)
+        r = exchange(srv, build("POST", body=form_body({"value": "owner-value", "csrf": csrf}),
+                                headers=[FORM, ("Origin", f"https://{HOST}:{PORT}"), ("Sec-Fetch-Site", "same-origin")]))
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(srv.outcome, "stored")
+        self.assertEqual(stored("csrf-ok"), "owner-value")
+
+    def test_vault_origin_check_includes_the_scheme(self):
+        srv = make_page("vault")
+        csrf = csrf_of(self.form_page(srv))
+        add = {"csrf": csrf, "action": "add", "name": "vault-origin", "note": "", "value": "v"}
+        r = exchange(srv, build("POST", body=form_body(add), headers=[FORM, ("Origin", f"http://{HOST}:{PORT}")]))
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(stored("vault-origin"))
+        r = exchange(srv, build("POST", body=form_body(add), headers=[FORM, ("Origin", f"https://{HOST}:{PORT}")]))
+        self.assertEqual(r.status, 303)
+        self.assertEqual(stored("vault-origin"), "v")
+
+
+# ---------- 2. High: a slow request can outlive its TTL ----------
+
+class Deadlines(PageTest):
+    def post_bytes(self, srv, name, value="slow-value"):
+        csrf = csrf_of(self.form_page(srv))
+        return build("POST", body=form_body({"value": value, "csrf": csrf}), headers=[FORM])
+
+    def test_slow_headers_are_cut_off_at_the_request_deadline(self):
+        srv = make_page(name="slow-head")
+        raw = self.post_bytes(srv, "slow-head")
+        with patch.object(KD, "REQUEST_DEADLINE", 1, create=True):
+            # A byte every 0.25s: never idle long enough for the socket timeout.
+            r = exchange(srv, [raw[i:i + 1] for i in range(len(raw))], delay=0.25, wait=30)
+        self.assertLess(r.took, 3, "the page stayed busy with one slow client")
+        self.assertIsNone(stored("slow-head"))
+
+    def test_a_body_still_arriving_when_the_link_ends_stores_nothing(self):
+        srv = make_page(name="slow-body")
+        raw = self.post_bytes(srv, "slow-body")
+        head, body = raw[:raw.index(b"\r\n\r\n") + 4], raw[raw.index(b"\r\n\r\n") + 4:]
+        srv.deadline = time.monotonic() + 1
+        srv.expires = time.time() + 1
+        r = exchange(srv, [head] + [body[i:i + 4] for i in range(0, len(body), 4)], delay=0.15, wait=30)
+        self.assertIsNone(stored("slow-body"))
+        self.assertNotEqual(srv.outcome, "stored")
+        self.assertLess(r.took, 3)
+
+    def test_waiting_on_the_store_lock_past_the_link_stores_nothing(self):
+        srv = make_page(name="lock-wait")
+        raw = self.post_bytes(srv, "lock-wait")
+        srv.deadline = time.monotonic() + 0.8
+        srv.expires = time.time() + 0.8
+        out = {}
+        with KD.store_lock():
+            t = threading.Thread(target=lambda: out.update(r=exchange(srv, raw, wait=30)), daemon=True)
+            t.start()
+            time.sleep(1.5)
+        t.join(30)
+        self.assertIsNone(stored("lock-wait"))
+        self.assertEqual(out["r"].status, 410)
+        self.assertEqual(srv.outcome, "expired")
+
+    def test_link_lifetime_is_on_the_monotonic_clock(self):
+        srv = types.SimpleNamespace(outcome=None, bad=0, requests=0, max_requests=50, watch=lambda: None,
+                                    deadline=time.monotonic() - 1)
+        srv.handle_request = lambda: setattr(srv, "outcome", "handled")
+        with patch.object(KD.time, "time", return_value=0.0):   # the wall clock set back
+            self.assertEqual(KD.run_until_done(srv, srv.deadline), "expired")
+
+
+# ---------- 3. High: teardown can remove a route another service owns ----------
+
+class TeardownOwnership(PageTest):
+    def dead_pid(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        return p.pid
+
+    def record(self, port):
+        rec = {"id": "deadbeef", "name": "gone-page", "pid": self.dead_pid(), "tailnet_port": port,
+               "local_port": port, "plain_http": False, "created": time.time(), "expires": time.time() + 60}
+        KD.write_pending(rec)
+        self.addCleanup(KD.drop_pending, rec)
+        return rec
+
+    def ts_calls(self):
+        calls = []
+
+        def ts(*args, **kw):
+            calls.append(args)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        p = patch.object(KD, "ts", side_effect=ts)
+        p.start()
+        self.addCleanup(p.stop)
+        return calls
+
+    def test_reap_leaves_a_repointed_route_alone(self):
+        port = 47100
+        self.record(port)
+        calls = self.ts_calls()
+        with patch.object(KD, "serve_status", return_value=route(port, local=8080)):
+            KD.reap()
+        self.assertFalse([c for c in calls if "off" in c], calls)
+        self.assertNotIn("gone-page", [r["name"] for r in KD.read_pending()])
+
+    def test_reap_keeps_the_record_when_status_is_unreadable(self):
+        port = 47101
+        self.record(port)
+        calls = self.ts_calls()
+        with patch.object(KD, "serve_status", return_value=None):
+            KD.reap()
+        self.assertFalse([c for c in calls if "off" in c], calls)
+        recs = [r for r in KD.read_pending() if r["name"] == "gone-page"]
+        self.assertTrue(recs and recs[0].get("teardown_failed"))
+
+    def test_reap_still_removes_its_own_route(self):
+        port = 47102
+        self.record(port)
+        calls, state = self.ts_calls(), {"st": route(port)}
+        real_ts = KD.ts
+
+        def ts(*args, **kw):
+            calls.append(args)
+            if "off" in args:
+                state["st"] = {}
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch.object(KD, "ts", side_effect=ts), patch.object(KD, "serve_status", side_effect=lambda: state["st"]):
+            KD.reap()
+        self.assertTrue([c for c in calls if "off" in c])
+        self.assertNotIn("gone-page", [r["name"] for r in KD.read_pending()])
+        del real_ts
+
+    def test_expiry_teardown_leaves_a_repointed_route_alone(self):
+        port = 47103
+        calls = self.ts_calls()
+        srv = types.SimpleNamespace(refusal=lambda: None, listen=lambda: None, server_close=lambda: None,
+                                    deadline=time.monotonic() + 60)
+        rec = {"id": "cafef00d", "name": "expiring", "pid": os.getpid(), "tailnet_port": port,
+               "local_port": port, "plain_http": False, "created": time.time(), "expires": time.time() + 60}
+        r, w = os.pipe()
+        with patch.object(KD, "serve_on"), patch.object(KD, "run_until_done", return_value="expired"), \
+                patch.object(KD, "serve_status", return_value=route(port, local=8080)), \
+                patch.object(KD.signal, "signal"):
+            KD.serve_child(srv, rec, w)
+        os.close(r)
+        self.assertFalse([c for c in calls if "off" in c], calls)
+        self.assertNotIn("expiring", [x["name"] for x in KD.read_pending()])
+
+
+# ---------- 4. High: operations not pinned to the login keychain ----------
+
+class KeychainPinning(unittest.TestCase):
+    OTHER = "/fake/other.keychain-db"
+
+    def security(self, *args, input=None):
+        return subprocess.run([KD.SECURITY, *args], capture_output=True, text=True, input=input)
+
+    def setUp(self):
+        KD.ensure_state()
+        # A Mac whose default keychain isn't login, with both on the search list, other first.
+        set_keychains(BASE.name, login=LOGIN_KC, default=self.OTHER, search=[self.OTHER, LOGIN_KC])
+        self.addCleanup(os.unlink, os.path.join(BASE.name, "fake-keychain.json.keychains"))
+        if hasattr(KD, "_VAULT_KEYCHAIN"):
+            KD._VAULT_KEYCHAIN.clear()
+            self.addCleanup(KD._VAULT_KEYCHAIN.clear)
+
+    def decoy(self, name, value="decoy-value", typed=True):
+        svc = KD.service(name)
+        self.assertEqual(self.security("add-generic-password", "-a", KD.ACCOUNT, "-s", svc, "-l",
+                                       svc + (".credential-v1" if typed else ""), "-w", value, self.OTHER).returncode, 0)
+        self.addCleanup(self.security, "delete-generic-password", "-a", KD.ACCOUNT, "-s", svc, self.OTHER)
+
+    def in_keychain(self, name, keychain):
+        return self.security("find-generic-password", "-a", KD.ACCOUNT, "-s", KD.service(name), keychain).returncode == 0
+
+    def test_store_goes_to_login_not_the_default_keychain(self):
+        KD.STORE.store("pinned-add", "login-value")
+        self.addCleanup(self.security, "delete-generic-password", "-a", KD.ACCOUNT, "-s", KD.service("pinned-add"), LOGIN_KC)
+        self.assertTrue(self.in_keychain("pinned-add", LOGIN_KC))
+        self.assertFalse(self.in_keychain("pinned-add", self.OTHER))
+
+    def test_identical_items_in_another_keychain_are_invisible(self):
+        self.decoy("pinned-twin")
+        self.assertFalse(KD.STORE.exists("pinned-twin"))
+        self.assertIsNone(KD.STORE.get("pinned-twin"))
+        self.assertNotIn("pinned-twin", KD.STORE.list())
+        KD.STORE.store("pinned-twin", "login-value")
+        self.addCleanup(self.security, "delete-generic-password", "-a", KD.ACCOUNT, "-s", KD.service("pinned-twin"), LOGIN_KC)
+        self.assertEqual(KD.STORE.get("pinned-twin"), "login-value")
+        self.assertEqual(KD.STORE.list()["pinned-twin"]["type"], "secret")   # not the decoy's credential label
+        KD.STORE.delete("pinned-twin")
+        self.assertTrue(self.in_keychain("pinned-twin", self.OTHER), "delete reached the other keychain")
+        self.assertFalse(self.in_keychain("pinned-twin", LOGIN_KC))
+
+    def test_an_unusable_login_keychain_path_is_refused(self):
+        set_keychains(BASE.name, login='/odd path/with "quotes".keychain-db')
+        with self.assertRaises(KD.KeydropError):
+            KD.STORE.store("pinned-odd", "v")
+
+
+# ---------- 5. Medium: vault checks and deletion outside the write lock ----------
+
+class VaultLocking(unittest.TestCase):
+    def setUp(self):
+        KD.ensure_state()
+        self.responses = []
+        self.h = object.__new__(KD.VaultHandler)
+        self.h.server = types.SimpleNamespace(write_allowed=lambda: True, audit=lambda *x: None,
+                                              issue_csrf=lambda: "csrf", deadline=math.inf, flash="")
+        self.h._page = lambda path, code=200, error="", **kw: self.responses.append((code, error))
+        self.h._done = lambda path, msg: self.responses.append((303, msg))
+        self.h._send = lambda code, body, *a, **kw: self.responses.append((code, body))
+
+    def probe(self, run, *targets):
+        seen = []
+
+        def wrap(step, real):
+            def wrapped(*a, **kw):
+                fd = os.open(os.path.join(KD.STATE_DIR, "store.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    KD.fcntl.flock(fd, KD.fcntl.LOCK_EX | KD.fcntl.LOCK_NB)
+                    seen.append((step, "free"))
+                except BlockingIOError:
+                    seen.append((step, "held"))
+                finally:
+                    os.close(fd)
+                return real(*a, **kw)
+            return wrapped
+        with contextlib.ExitStack() as stack:
+            for obj, attr in targets:
+                stack.enter_context(patch.object(obj, attr, wrap(attr, getattr(obj, attr))))
+            run()
+        return seen
+
+    def test_add_checks_existence_under_the_lock(self):
+        seen = self.probe(lambda: self.h._act("/t", "add", {"name": ["locked-add"], "value": ["v"], "note": [""]}),
+                          (KD.STORE, "exists"), (KD.STORE, "store"), (KD, "write_item_meta"), (KD, "write_note"))
+        self.assertEqual(self.responses[-1][0], 303, self.responses)
+        self.assertIn(("exists", "held"), seen)
+        self.assertNotIn(("exists", "free"), seen)
+        self.assertEqual({s for _, s in seen}, {"held"}, seen)
+
+    def test_two_adds_cannot_both_see_the_name_absent(self):
+        started, out = threading.Event(), {}
+        real = KD.STORE.exists
+
+        def exists(name):
+            started.set()
+            return real(name)
+        with patch.object(KD.STORE, "exists", exists):
+            with KD.store_lock():
+                t = threading.Thread(target=lambda: self.h._act("/t", "add", {"name": ["race-add"], "value": ["second"], "note": [""]}))
+                t.start()
+                self.assertFalse(started.wait(0.5), "the vault checked the name while another write held the lock")
+                KD.keychain_store("race-add", "first")   # the other add, under the lock
+            t.join(30)
+        self.assertEqual(self.responses[-1][0], 409)
+        self.assertEqual(KD.keychain_get("race-add"), "first")
+
+    def test_delete_holds_the_lock_from_check_to_metadata(self):
+        KD.keychain_store("locked-del", "v")
+        seen = self.probe(lambda: self.h._act("/t", "delete-confirm", {"name": ["locked-del"]}),
+                          (KD.STORE, "exists"), (KD.STORE, "delete"), (KD, "write_item_meta"), (KD, "write_note"))
+        self.assertEqual(self.responses[-1][0], 303, self.responses)
+        self.assertIn(("delete", "held"), seen)
+        self.assertEqual({s for _, s in seen}, {"held"}, seen)
+
+
+# ---------- 6. Medium: the request schema is browser-controlled ----------
+
+class RequestSchema(PageTest):
+    def schema(self):
+        return KD.validate_schema({"service": "svc", "fields": [
+            {"name": "api_key", "label": "API key", "kind": "secret", "required": True},
+            {"name": "account_id", "label": "Account ID", "kind": "text", "required": True}]})
+
+    def test_a_substituted_schema_is_refused(self):
+        srv = make_page(name="schema-swap", schema=self.schema())
+        page = self.form_page(srv)
+        swapped = {"service": "svc", "fields": [{"name": "api_key", "label": "API key", "kind": "secret", "required": True}]}
+        r = exchange(srv, build("POST", body=form_body({"csrf": csrf_of(page), "schema": json.dumps(swapped),
+                                                       "f_api_key": "k"}), headers=[FORM]))
+        self.assertEqual(r.status, 400)
+        self.assertIsNone(stored("schema-swap"))
+
+    def test_the_request_page_has_no_field_editor(self):
+        srv = make_page(name="schema-edit", schema=self.schema())
+        page = self.form_page(srv)
+        self.assertNotIn("Edit proposed fields", page)
+        self.assertNotIn('name="schema"', page)
+        r = exchange(srv, build("POST", body=form_body({"csrf": csrf_of(page), "action": "edit-schema", "service": "svc",
+                                                       "n0": "other", "l0": "Other", "k0": "secret", "r0": "yes"}),
+                                headers=[FORM]))
+        self.assertEqual(r.status, 400)
+        self.assertNotIn("f_other", r.text)
+
+    def test_the_server_schema_is_what_gets_stored(self):
+        srv = make_page(name="schema-kept", schema=self.schema())
+        page = self.form_page(srv)
+        r = exchange(srv, build("POST", body=form_body({"csrf": csrf_of(page), "f_api_key": "k", "f_account_id": "a"}),
+                                headers=[FORM]))
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(KD.read_items()["schema-kept"]["schema"], self.schema())
+
+    def test_the_vault_editor_keeps_a_totp_check(self):
+        schema = KD.credential_schema("site", ("totp",))
+        editor = Forms(KD.schema_editor("/t", "csrf", "", schema))
+        fields = {k: [v] for k, v in editor.with_field("action", "edit-schema").items()}
+        self.assertEqual(KD.schema_from_editor(fields), schema)
+
+
+# ---------- 7. Medium: "or paste it" damages multi-line keys ----------
+
+class FileFields(PageTest):
+    def schema(self):
+        return KD.validate_schema({"service": "push", "fields": [
+            {"name": "private_key", "label": "Private key", "kind": "secret", "required": True, "input": "file"},
+            {"name": "key_id", "label": "Key ID", "kind": "text", "required": True}]})
+
+    def test_a_file_field_offers_no_one_line_paste(self):
+        page = KD.render_form("push", "", "/t", schema=self.schema())
+        self.assertIn('name="file_private_key"', page)
+        self.assertNotIn('name="f_private_key"', page)
+
+    def test_a_paste_into_a_file_field_is_refused(self):
+        flattened = "-----BEGIN PRIVATE KEY-----MIGTAgEAMBMG-----END PRIVATE KEY-----"
+        with self.assertRaises(KD.KeydropError):
+            KD.submitted_item({"f_private_key": [flattened], "f_key_id": ["K"]}, self.schema())
+
+    def test_the_file_is_still_stored_byte_for_byte(self):
+        pem = "-----BEGIN PRIVATE KEY-----\nMIGTAgEAMBMG\n-----END PRIVATE KEY-----\n"
+        raw, _ = KD.submitted_item({"file_private_key": [pem.encode()], "f_key_id": ["K"]}, self.schema())
+        self.assertEqual(json.loads(raw)["fields"]["private_key"], pem)
+
+
+# ---------- 8. Medium: urlencoded parsing substitutes data, accepts short bodies ----------
+
+class StrictBodies(PageTest):
+    def post(self, srv, body, headers=(FORM,), length=True):
+        return exchange(srv, build("POST", body=body, headers=list(headers), length=length))
+
+    def test_invalid_utf8_escapes_are_refused_not_replaced(self):
+        srv = make_page(name="pct-ff")
+        csrf = csrf_of(self.form_page(srv))
+        r = self.post(srv, f"csrf={csrf}&value=%FF".encode())
+        self.assertEqual(r.status, 400)
+        self.assertIsNone(stored("pct-ff"))
+
+    def test_malformed_escapes_are_refused(self):
+        srv = make_page(name="pct-bad")
+        csrf = csrf_of(self.form_page(srv))
+        for body in (f"csrf={csrf}&value=%G1", f"csrf={csrf}&value=abc%", f"csrf={csrf}&value=%4"):
+            with self.subTest(body=body[-8:]):
+                self.assertEqual(self.post(srv, body.encode()).status, 400)
+        self.assertIsNone(stored("pct-bad"))
+
+    def test_a_body_shorter_than_its_length_is_refused(self):
+        srv = make_page(name="short-body")
+        csrf = csrf_of(self.form_page(srv))
+        body = f"csrf={csrf}&value=abc".encode()
+        raw = (build("POST", headers=[FORM], length=False)[:-2]
+               + f"Content-Length: {len(body) + 40}\r\n\r\n".encode() + body)
+        r = exchange(srv, raw)
+        self.assertEqual(r.status, 400)
+        self.assertIsNone(stored("short-body"))
+
+    def test_ambiguous_framing_is_refused(self):
+        srv = make_page(name="framing")
+        csrf = csrf_of(self.form_page(srv))
+        body = f"csrf={csrf}&value=abc".encode()
+        for extra in ([("Transfer-Encoding", "chunked")], [("Content-Length", str(len(body)))],
+                      [("Content-Length", "+" + str(len(body)))]):
+            with self.subTest(extra=extra):
+                plus = extra[0][1].startswith("+")
+                r = self.post(srv, body, [FORM] + extra, length=not plus)
+                self.assertEqual(r.status, 400)
+        self.assertIsNone(stored("framing"))
+
+    def test_a_clean_body_still_parses(self):
+        self.assertEqual(KD.parse_urlencoded(b"a=%C3%BC+x&b=&a=2", 10), {"a": ["ü x", "2"], "b": [""]})
+
+
+# ---------- 9. Medium: unknown methods bypass the gates; bad bodies spend no strikes ----------
+
+class Gates(PageTest):
+    def test_an_unknown_method_gets_the_gates_and_the_headers(self):
+        srv = make_page(name="trace")
+        r = exchange(srv, build("TRACE", length=False, host="evil.example"))
+        self.assertEqual(r.status, 404)
+        self.assertIn("content-security-policy", r.headers)
+        self.assertEqual(srv.bad, 0, "a wrong Host is never a strike")
+        r = exchange(srv, build("PROPFIND", path="/wrong", length=False))
+        self.assertEqual(r.status, 404)
+        self.assertEqual(srv.bad, 1)
+
+    def test_an_unknown_method_with_the_route_gone_ends_the_page(self):
+        srv = make_page(name="trace-gone")
+        with patch.object(KD, "serve_status", return_value={}):
+            r = exchange(srv, build("TRACE", length=False))
+        self.assertEqual(r.status, 404)
+        self.assertEqual(srv.outcome, "route-gone")
+
+    def test_a_malformed_request_line_gets_the_security_headers(self):
+        srv = make_page(name="badline")
+        for line in (b"GET /x HTTP/9.9\r\n\r\n", b"GET /x HTTP/1.x\r\n\r\n", b"GET\r\n\r\n"):
+            with self.subTest(line=line):
+                r = exchange(srv, line)
+                self.assertIn("content-security-policy", r.headers)
+                self.assertEqual(r.body, b"")
+
+    def test_malformed_and_oversized_bodies_are_strikes(self):
+        srv = make_page(name="strikes")
+        csrf = csrf_of(self.form_page(srv))
+        exchange(srv, build("POST", body=b"%%%", headers=[FORM]))
+        self.assertEqual(srv.bad, 1)
+        r = exchange(srv, build("POST", body=b"", headers=[FORM], length=False)[:-2]
+                     + f"Content-Length: {KD.MAX_BODY + 1}\r\n\r\n".encode())
+        self.assertEqual(r.status, 413)
+        self.assertEqual(srv.bad, 2)
+        exchange(srv, build("POST", body=form_body({"csrf": csrf, "value": "v", "extra": "x"}), headers=[FORM]))
+        self.assertEqual(srv.bad, 3, "wrong fields are S-BAD-FORM too")
+        self.assertIsNone(stored("strikes"))
+
+    def test_home_strikes_a_bad_body_only_with_same_origin_fetch_metadata(self):
+        KD.update_home(lambda st: {})
+        srv = make_page("home")
+        with patch.object(srv, "token_ok", return_value=True):
+            exchange(srv, build("POST", body=b"%%%", headers=[FORM]))
+            self.assertEqual(srv.bad, 0, "no Fetch Metadata: no strike")
+            exchange(srv, build("POST", body=b"%%%", headers=[FORM, ("Sec-Fetch-Site", "same-origin")]))
+            self.assertEqual(srv.bad, 1)
+        KD.update_home(lambda st: {})
+
+
+# ---------- 10. Medium: validation recovery loses the task ----------
+
+class Recovery(PageTest):
+    def vault_handler(self):
+        responses = []
+        h = object.__new__(KD.VaultHandler)
+        h.server = types.SimpleNamespace(write_allowed=lambda: True, audit=lambda *x: None,
+                                         issue_csrf=lambda: "csrf", deadline=math.inf, flash="")
+        h._page = lambda path, code=200, error="", **kw: responses.append((code, error, "list"))
+        h._done = lambda path, msg: responses.append((303, msg, "list"))
+        h._send = lambda code, body, *a, **kw: responses.append((code, body.decode(), "page"))
+        return h, responses
+
+    def test_a_refused_vault_add_comes_back_to_the_same_form(self):
+        h, responses = self.vault_handler()
+        schema = KD.template_schema("stripe")
+        h._act("/t", "add", {"name": ["stripe-live"], "note": ["for billing"], "schema": [json.dumps(schema)],
+                             "f_secret_key": [""], "f_publishable_key": ["pk_live_visible"]})
+        code, body, kind = responses[-1]
+        self.assertEqual((code, kind), (400, "page"), responses[-1][:2])
+        self.assertIn('name="f_secret_key"', body)
+        self.assertIn("Secret key", body.split('role="alert"')[1].split("</p>")[0])
+        self.assertRegex(body, r'id="f_secret_key"[^>]*aria-describedby="form-error"')
+        self.assertIn('value="stripe-live"', body)
+        self.assertNotIn("pk_live_visible", body)
+
+    def test_add_over_an_existing_name_names_the_real_action(self):
+        h, responses = self.vault_handler()
+        KD.keychain_store("exists-already", "v")
+        h._act("/t", "add", {"name": ["exists-already"], "note": [""], "value": ["w"]})
+        self.assertEqual(responses[-1][0], 409)
+        self.assertIn("Use Rotate", responses[-1][1])
+
+    def test_request_errors_name_the_field(self):
+        srv = make_page(name="named-error", schema=KD.validate_schema({"service": "svc", "fields": [
+            {"name": "token", "label": "Token", "kind": "secret", "required": True},
+            {"name": "site", "label": "Website", "kind": "url", "required": True}]}))
+        csrf = csrf_of(self.form_page(srv))
+        r = exchange(srv, build("POST", body=form_body({"csrf": csrf, "f_token": "t", "f_site": "javascript:x"}), headers=[FORM]))
+        self.assertEqual(r.status, 400)
+        self.assertIn("Website doesn&#x27;t look right.", r.text)
+        self.assertRegex(r.text, r'id="f_site"[^>]*aria-invalid="true"')
+        r = exchange(srv, build("POST", body=form_body({"csrf": csrf, "f_token": "", "f_site": "https://x.example"}), headers=[FORM]))
+        self.assertIn("Nothing was entered for Token.", r.text)
+
+    def test_single_input_fields_are_required_and_labels_are_associated(self):
+        schema = KD.validate_schema({"service": "svc", "fields": [
+            {"name": "token", "label": "Token", "kind": "secret", "required": True},
+            {"name": "key", "label": "Key", "kind": "secret", "required": True, "input": "file"},
+            {"name": "extra", "label": "Extra", "kind": "text", "required": False}]})
+        page = KD.render_form("svc", "", "/t", schema=schema)
+        self.assertRegex(page, r'<input id="f_token"[^>]*required')
+        self.assertRegex(page, r'<input id="file_key"[^>]*required')
+        self.assertNotRegex(page, r'<input id="f_extra"[^>]*required')
+        entry = KD.render_entry("/t", "csrf", schema=schema)
+        for label_for in re.findall(r'<label for="([^"]+)"', entry):
+            self.assertIn(f'id="{label_for}"', entry)
+        bare = re.findall(r"<label>(?!<input)", entry)
+        self.assertEqual(bare, [], "a label with no control")
+        self.assertIn('<label for="template">', KD.render_vault("/t", "csrf", {}, {}, None))
+
+
+if __name__ == "__main__":
+    unittest.main()

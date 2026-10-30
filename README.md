@@ -151,8 +151,10 @@ request exits 2 and opens nothing.
 
 `--type` also takes a built-in template (`api-key`, `username-password`,
 `aws`, `google-oauth`, `stripe` and others), and `--fields '<JSON list>'` or
-`--schema <file>` proposes any fields an agent needs; the owner can edit the
-proposed fields on the page before storing. The type, field names and an
+`--schema <file>` proposes any fields an agent needs. The request page shows
+exactly those fields, and refuses a submit that tries to change them, so the
+item stored is the one the agent can read back; editing fields is on the
+vault and home pages' add and rotate forms. The type, field names and an
 optional rotate-by date are kept in `items.json` in the state dir (mode
 0600), never the values. The vault and home pages search items, flag overdue
 rotations and show recent activity.
@@ -163,11 +165,13 @@ state dir. One keychain item holds about 1.9 KB once encoded, because
 goes on it as hex. A bigger item is refused before anything is written, and
 an existing value stays as it was.
 
-Every value input, on the request page and on the vault and home pages,
-also takes a text file in its place: paste or pick, not both. The file is
-stored byte for byte, and the page shows the limit next to the picker. A
-field in a `--fields` or `--schema` list can set `"input": "file"` to show
-the picker first, for a key that usually arrives as a file:
+A plain secret's input, on the request page and on the vault and home pages,
+also takes a text file in its place: paste or pick, not both. A field in a
+`--fields` or `--schema` list is typed, unless it sets `"input": "file"`:
+then it is a file picker and nothing else, because a multi-line key pasted
+into a one-line input loses its line breaks in the browser and would be
+stored damaged. A file is stored byte for byte, and the page shows the limit
+next to the picker:
 
     keydrop request push-key --fields '[
       {"name": "private_key", "label": "Private key", "kind": "secret",
@@ -239,8 +243,13 @@ What it defends against:
   counts; 5 of those in 24 hours lock it until `keydrop home --unlock`.
   Anything else gets a bare 404 and isn't counted.
 - **Browsers on the Mac.** An exact Host allowlist stops DNS rebinding. Form
-  tokens and Fetch Metadata stop cross-site posts, and a cross-site request
-  can't run up strikes on the home page.
+  tokens, on every page including the one-shot request, and Fetch Metadata
+  and exact Origin checks stop cross-site posts, so a site that learns a link
+  can't submit its own value through the owner's browser. A cross-site
+  request can't run up strikes on the home page.
+- **Slow clients.** Every request has a deadline for its whole duration and
+  the link's own end, so a client trickling bytes can't hold a page open or
+  land a write after the link expired.
 - **A loopback port left open to the tailnet.** Under userspace networking,
   tailscaled forwards tailnet traffic to `127.0.0.1:<same port>` when serve
   doesn't claim it. keydrop uses the same port on both sides, listens only

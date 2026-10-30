@@ -33,8 +33,11 @@ hr{border:0;border-top:2px dashed #ccc;margin:36px 0}
 <h1>openai-api-key</h1>
 <p>for the summariser</p>
 <p class="meta">Link ends 14:32.</p>
-<form method="post" action="{path}" autocomplete="off">
-<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required>
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{csrf}">
+<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+<p class="meta">or a text file, up to 1900 bytes</p>
+<input type="file" name="value.file" aria-label="Value as a file">
 <button type="submit">Store</button></form>
 </section>
 <hr>
@@ -44,7 +47,8 @@ hr{border:0;border-top:2px dashed #ccc;margin:36px 0}
 <h1>staging-admin</h1>
 <p>login for the staging dashboard</p>
 <p class="meta">Link ends 14:32.</p>
-<form method="post" action="{path}" autocomplete="off">
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{csrf}">
 <label for="username">Username</label>
 <input id="username" name="username" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
 <label for="password">Password</label>
@@ -59,20 +63,38 @@ hr{border:0;border-top:2px dashed #ccc;margin:36px 0}
 </section>
 <hr>
 
+<section id="S-FORM-file">
+<p class="screen">S-FORM, custom fields, private_key marked "input": "file" (200). A file field has a file input and nothing typed.</p>
+<h1>push-key</h1>
+<p class="meta">Link ends 14:32.</p>
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{csrf}">
+<label for="private_key.file">Private key</label>
+<input type="file" id="private_key.file" name="private_key.file" required>
+<p class="meta">a text file, up to 1900 bytes</p>
+<label for="key_id">Key ID</label>
+<input id="key_id" name="key_id" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+<button type="submit">Store</button></form>
+</section>
+<hr>
+
 <section id="S-EMPTY">
 <p class="screen">S-EMPTY (400, link not used up)</p>
 <h1>openai-api-key</h1>
 <p>for the summariser</p>
 <p class="meta">Link ends 14:32.</p>
 <p class="err">Nothing was entered.</p>
-<form method="post" action="{path}" autocomplete="off">
-<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other" required>
+<form method="post" action="{path}" enctype="multipart/form-data" autocomplete="off">
+<input type="hidden" name="csrf" value="{csrf}">
+<input name="value" type="password" autocomplete="new-password" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" data-bwignore data-form-type="other">
+<p class="meta">or a text file, up to 1900 bytes</p>
+<input type="file" name="value.file" aria-label="Value as a file">
 <button type="submit">Store</button></form>
 </section>
 <hr>
 
 <section id="S-INVALID">
-<p class="screen">S-INVALID (400, link not used up; form re-rendered as above)</p>
+<p class="screen">S-INVALID (400, link not used up; form re-rendered as above, the field's input with aria-invalid="true")</p>
 <p class="err">One-time code secret doesn't look right.</p>
 </section>
 <hr>
@@ -86,7 +108,7 @@ hr{border:0;border-top:2px dashed #ccc;margin:36px 0}
 <section id="S-STORE-FAILED"><p class="screen">S-STORE-FAILED (500)</p>
 <h1>Couldn't store it. Tell whoever sent you the link.</h1></section>
 <hr>
-<section id="S-STALE"><p class="screen">S-STALE (403, vault and home only)</p>
+<section id="S-STALE"><p class="screen">S-STALE (403): form token missing, wrong or aged out, or another site's Origin or Fetch Metadata</p>
 <h1>That form is stale. Reload the page.</h1></section>
 <hr>
 <section id="S-EXPIRED"><p class="screen">S-EXPIRED (410, only while a listener is still up)</p>

@@ -29,11 +29,23 @@ instead of pasting it into a chat.
 
 `request` binds a one-shot HTTP server to 127.0.0.1, exposes it on the tailnet
 with `tailscale serve` on the same port number, prints the URL and detaches. The
-page proposes a single secret or validated credential fields. One good submit, or the TTL, or a handful of
-bad guesses, and it tears its serve config down and exits.
+page shows a single secret or the requester's fields, exactly: the schema is
+held server-side and a form that sends its own is refused. Its form carries a
+form token of its own, separate from the link: the link alone is enough to
+build a form on any site that posts to it from the owner's browser, so a POST
+needs the form token, and a foreign Origin (scheme, host and port) or
+cross-site Fetch Metadata is refused even with it. One good submit, or the
+TTL, or a handful of bad requests, and it tears its serve config down and
+exits. Every request has a deadline for its whole duration (REQUEST_DEADLINE,
+or the link's end if sooner), enforced on each read, and the link's end is
+checked again before and after waiting for the store lock, so a client
+trickling bytes can't hold the page or land a write after the TTL.
 
 The vault is the login keychain: service `<prefix><name>` (prefix `keydrop.`
-by default), account from the config (`keydrop` by default).
+by default), account from the config (`keydrop` by default). Every `security`
+call names the login keychain's path (vault_keychain), so neither a changed
+default keychain nor a same-named item in another keychain on the search list
+can stand in for it.
 Created/updated times are the keychain item's own cdat/mdat. Typed fields are
 stored together in the spec v1 JSON envelope, with a non-secret label marker.
 Field definitions and rotate-by dates live in items.json, never field values. Notes live in
@@ -46,7 +58,8 @@ TTL or the Done button. The page is write-only. It lists names, notes and
 times and takes new values; it never renders a stored value, so nothing that
 reads the page (a screenshot, the browser's cache, someone over a shoulder)
 can see one. Every POST needs the session's form token as well as the path
-token. Delete asks to confirm first, and can only ever reach a
+token. A write's existence check, store and metadata all happen under
+store_lock, delete included. Delete asks to confirm first, and can only ever reach a
 `<prefix><NAME_RE>` item with the configured account.
 
 On the tailnet, requests must carry `Tailscale-User-Login: <owner login>`, the
@@ -109,7 +122,8 @@ with outcome route-gone: the serve loop stops as soon as that response is
 written, the listener closes, and the process exits (home exits 1). Failing
 closed matters: "can't read the config" is not evidence the route is there.
 Teardown then leaves the port alone if serve shows it gone or pointing
-somewhere else; it only removes a route that is still ours.
+somewhere else; it only removes a route that is still ours. That check is in
+serve_off itself, so every teardown (submit, TTL, signal, reap) makes it.
 
 Teardown runs on every exit path the process can see: submit, TTL, lockout,
 SIGTERM/SIGINT/SIGHUP, and exceptions. SIGKILL can't be caught, so `request`
@@ -164,8 +178,8 @@ path in KEYDROP_CONFIG), and environment variables, which win over the file:
 Test-only overrides: KEYDROP_SECURITY (the `security` binary) and
 KEYDROP_WATCH_INTERVAL (seconds, capped at WATCH_INTERVAL).
 """
-import base64, calendar, email.message, fcntl, hashlib, hmac, html, http.server, json, os, re, secrets, shutil
-import signal, subprocess, sys, time, urllib.parse
+import base64, calendar, email.message, fcntl, hashlib, hmac, html, http.server, io, json, math, os, re, secrets
+import shutil, signal, socket, subprocess, sys, time, urllib.parse
 
 CONFIG_PATH = os.environ.get("KEYDROP_CONFIG") or os.path.expanduser("~/.config/keydrop/config.json")
 CONFIG_KEYS = {   # file key: (env var, default)
@@ -276,6 +290,7 @@ CSRF_MAX_AGE = 12 * 3600      # a home form older than this asks for a reload
 MAX_BODY = 16 * 1024   # a urlencoded body: the buttons and the schema editor
 MAX_UPLOAD_BODY = MAX_BODY + 8 * 1024   # multipart: the same fields, plus a file of at most 8 KB
 REQUEST_TIMEOUT = 10   # per-connection socket timeout; one slow client can't hold the link
+REQUEST_DEADLINE = 20  # seconds for a whole request, however slowly its bytes arrive
 SERVE_TIMEOUT = 20     # `tailscale serve` blocks forever if serve isn't enabled
 PORT_PICK_TRIES = 32   # loopback ports tried before claim_port gives up
 # Paths browsers fetch on their own. 404'd, but not counted as guesses.
@@ -293,6 +308,32 @@ class RefusedError(KeydropError):
 
 class PolicyError(RefusedError):
     pass
+
+
+BAD_FORM = "That didn't look like the form."
+
+
+class BadForm(KeydropError):
+    """S-BAD-FORM: a body that isn't the page's own form. Counts as a bad request."""
+
+    def __init__(self, message=BAD_FORM):
+        super().__init__(message)
+
+
+class FieldError(KeydropError):
+    """A value the owner can fix, naming the form control it belongs to, so
+    the page can point at it."""
+
+    def __init__(self, message, control):
+        super().__init__(message)
+        self.control = control
+
+
+class Expired(KeydropError):
+    """The link's deadline passed while a request was in flight: nothing is written."""
+
+    def __init__(self):
+        super().__init__("This link has expired. Ask for a new one.")
 
 
 def require_config(stop=False):
@@ -364,7 +405,9 @@ FILE_KINDS = ("secret", "text")   # SPEC 5.1 / I13: url and select fields take n
 
 
 def takes_file(f):
-    """Only a field the schema marks `"input": "file"` gets a picker or accepts a file."""
+    """A field the schema marks `"input": "file"` takes a file and only a file:
+    pasted into a one-line input, a multi-line key loses its line breaks in
+    the browser, before keydrop could notice. Every other field is typed only."""
     return f.get("input") == "file"
 
 
@@ -576,14 +619,20 @@ def rotation_date(value):
 TOO_LONG = "That's too long to store in this vault."
 
 
-def submitted_item(fields, fallback=None):
+def submitted_item(fields, fallback=None, form_schema=True):
     """(value to store, schema or None) from a submitted form, or a
-    KeydropError fit to show on the page. Every value input has a file
-    alternative (SPEC 7.3): `file` beside a plain secret's `value`,
-    `file_<id>` beside a typed field's `f_<id>`. One or the other, never both;
-    an empty file part (a file input left empty) is no file."""
+    KeydropError fit to show on the page: BadForm for a body that isn't the
+    form, FieldError for a value the owner can fix. A plain secret's `value`
+    has a `file` alternative, one or the other, never both; an empty file
+    part (a file input left empty) is no file. A typed field takes `f_<id>`,
+    or `file_<id>` alone when it is marked input=file.
+
+    form_schema=False is the request page: the schema is the requester's
+    (fallback), and a form that carries one of its own is refused."""
     if any(len(v) != 1 for v in fields.values()):
-        raise KeydropError("That didn't look like the form.")
+        raise BadForm()
+    if "schema" in fields and not form_schema:
+        raise BadForm()
     raw = field(fields, "schema")
     try:
         schema = validate_schema(schema_json(raw)) if raw else fallback
@@ -592,34 +641,40 @@ def submitted_item(fields, fallback=None):
     check_policy(schema)
     if not schema:
         if set(fields) - {"csrf", "action", "name", "note", "rotate_by", "value", "schema", "file"}:
-            raise KeydropError("That didn't look like the form.")
-        value = one_value(field(fields, "value").strip(), uploaded(fields, "file"), 8192, "Value is too long.")
+            raise BadForm()
+        value = one_value(field(fields, "value").strip(), uploaded(fields, "file"), 8192,
+                          "Value is too long.", "value")
         if not value:
-            raise KeydropError("Nothing was entered.")
+            raise FieldError("Nothing was entered.", "value")
         return value, None
     schema = validate_schema(schema)
     allowed = {"csrf", "action", "name", "note", "schema", "rotate_by"}
     for f in schema["fields"]:
-        allowed |= {"f_" + f["name"]} | ({"file_" + f["name"]} if takes_file(f) else set())
+        allowed.add(("file_" if takes_file(f) else "f_") + f["name"])
     if set(fields) - allowed:
-        raise KeydropError("That didn't look like the form.")
+        raise BadForm()
     values = {}
     for f in schema["fields"]:
-        v = one_value(field(fields, "f_" + f["name"]), uploaded(fields, "file_" + f["name"]),
-                      f["max"], "A field is too long.")
+        label = f["label"]
+        if takes_file(f):
+            control = "file_" + f["name"]
+            v = one_value("", uploaded(fields, control), f["max"], f"{label} is too long.", control)
+        else:
+            control = "f_" + f["name"]
+            v = one_value(field(fields, control), b"", f["max"], f"{label} is too long.", control)
         if f["required"] and not v.strip():
-            raise KeydropError("Nothing was entered.")
+            raise FieldError(f"Nothing was entered for {label}.", control)
         if v and f["kind"] == "url":
             try:
                 url = urllib.parse.urlsplit(v)
             except ValueError:
-                raise KeydropError("A URL doesn't look right.")
+                raise FieldError(f"{label} doesn't look right.", control)
             if url.scheme not in ("http", "https") or not url.netloc or re.search(r"[\x00-\x20]", v):
-                raise KeydropError("A URL doesn't look right.")
+                raise FieldError(f"{label} doesn't look right.", control)
         if v and f.get("check") == "totp" and not totp_ok(v):
-            raise KeydropError("The one-time code secret doesn't look right.")
+            raise FieldError(f"{label} doesn't look right.", control)
         if v and f["kind"] == "select" and v not in f["options"]:
-            raise KeydropError("Choose a listed option.")
+            raise FieldError(f"Choose one of the listed options for {label}.", control)
         if v:
             values[f["name"]] = v
     return json.dumps({"keydrop": 1, "type": "credential", "fields": values}, ensure_ascii=False), schema
@@ -636,26 +691,26 @@ def uploaded(fields, key):
     return data if isinstance(data, bytes) else b""
 
 
-def one_value(pasted, upload, limit, too_long):
+def one_value(pasted, upload, limit, too_long, control):
     """The pasted text or the uploaded file, never both. A file is stored
     exactly as sent, newlines and all; the caller has already decided
-    whether a paste is trimmed."""
+    whether a paste is trimmed. Errors name `control`, the input to fix."""
     if not upload:
         if len(pasted.encode("utf-8", "surrogatepass")) > limit:
-            raise KeydropError(too_long)
+            raise FieldError(too_long, control)
         return pasted
     if pasted.strip():
-        raise KeydropError(BOTH)
+        raise FieldError(BOTH, control)
     if len(upload) > limit:
-        raise KeydropError(too_long)
+        raise FieldError(too_long, control)
     if b"\x00" in upload:
-        raise KeydropError("That file has NUL bytes in it, so it isn't text. Only text files can be stored.")
+        raise FieldError("That file has NUL bytes in it, so it isn't text. Only text files can be stored.", control)
     try:
         text = upload.decode("utf-8")
     except UnicodeDecodeError:
-        raise KeydropError("That file isn't UTF-8 text. Only text files can be stored.") from None
+        raise FieldError("That file isn't UTF-8 text. Only text files can be stored.", control) from None
     if not text.strip():
-        raise KeydropError("That file is empty.")
+        raise FieldError("That file is empty.", control)
     return text
 
 
@@ -721,6 +776,36 @@ def parse_multipart(content_type, body, max_fields):
     return fields
 
 
+BAD_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def parse_urlencoded(body, max_fields):
+    """An application/x-www-form-urlencoded body as {name: [value]}, or
+    BadForm. Stricter than parse_qs, which decodes with replacement: there,
+    `value=%FF` becomes U+FFFD and would be stored as if it had been typed.
+    Here the body must be ASCII, every pair needs `=` and a name, every `%`
+    starts a two-digit escape, and the decoded bytes must be UTF-8."""
+    try:
+        text = body.decode("ascii")
+    except UnicodeDecodeError:
+        raise BadForm() from None
+    pairs = text.split("&")
+    if len(pairs) > max_fields:
+        raise BadForm()
+    fields = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep or not key or BAD_ESCAPE_RE.search(pair):
+            raise BadForm()
+        try:
+            key, value = (urllib.parse.unquote_to_bytes(s.replace("+", " ")).decode("utf-8")
+                          for s in (key, value))
+        except UnicodeDecodeError:
+            raise BadForm() from None
+        fields.setdefault(key, []).append(value)
+    return fields
+
+
 def totp_ok(value):
     """base32, or an otpauth:// URI carrying a base32 secret (SPEC 5.3)."""
     if value.startswith("otpauth://"):
@@ -779,13 +864,38 @@ def service(name):
 SECURITY_LINE_MAX = 4096
 
 
+KEYCHAIN_PATH_RE = re.compile(r"/[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*")
+_VAULT_KEYCHAIN = []
+
+
+def vault_keychain():
+    """The login keychain's path, resolved once and named on every `security`
+    call. Left out, add-generic-password writes to the *default* keychain,
+    which need not be login, and find, delete and dump search every keychain
+    on the search list, where another keychain can hold the same service and
+    account. The path goes on a `security -i` line, so it is held to a plain
+    charset with no spaces or quotes; anything else is refused."""
+    if not _VAULT_KEYCHAIN:
+        try:
+            r = subprocess.run([SECURITY, "login-keychain"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            raise KeydropError("Couldn't find the login keychain.") from None
+        path = r.stdout.strip()
+        path = path[1:-1] if len(path) > 1 and path[0] == path[-1] == '"' else path
+        if r.returncode != 0 or not KEYCHAIN_PATH_RE.fullmatch(path) or ".." in path.split("/"):
+            raise KeydropError("Couldn't find the login keychain.")
+        _VAULT_KEYCHAIN.append(path)
+    return _VAULT_KEYCHAIN[0]
+
+
 def store_command(name, value, typed=False):
     """The `security -i` line. Goes to stdin, never argv. Hex means no quoting
     rules to get wrong, whatever the value contains."""
     if not (valid_name(name) and ACCOUNT_RE.fullmatch(ACCOUNT) and PREFIX_RE.fullmatch(SERVICE_PREFIX)):
         raise KeydropError("bad name or config")
     line = (f"add-generic-password -U -a {ACCOUNT} -s {service(name)} "
-            f"-l {service(name) + ('.credential-v1' if typed else '')} -X {value.encode('utf-8').hex()}")
+            f"-l {service(name) + ('.credential-v1' if typed else '')} -X {value.encode('utf-8').hex()} "
+            f"{vault_keychain()}")
     if len(line) >= SECURITY_LINE_MAX:
         raise KeydropError("too long for the keychain")
     return line + "\n"
@@ -838,7 +948,7 @@ def keychain_get(name):
     that happens to be hex. `-g` marks the two forms apart on stderr:
     `password: "text"` or `password: 0xHEX  "escaped"`."""
     r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT,
-                        "-s", service(name), "-g"], capture_output=True, text=True, timeout=30)
+                        "-s", service(name), "-g", vault_keychain()], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         return None
     line = next((l for l in r.stderr.splitlines() if l.startswith("password: ")), None)
@@ -855,7 +965,8 @@ def keychain_entries():
     """{name: {"created": epoch, "updated": epoch, "type": ...}} for every <prefix>* item,
     from dump-keychain's attribute listing. Without -d it prints no secret
     data. cdat survives an -U update and mdat moves with it."""
-    r = subprocess.run([SECURITY, "dump-keychain"], capture_output=True, text=True, timeout=30)
+    keychain = vault_keychain()
+    r = subprocess.run([SECURITY, "dump-keychain", keychain], capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
         raise KeydropError("Couldn't read the keychain.")
     out, cur = {}, {}
@@ -863,14 +974,17 @@ def keychain_entries():
     def flush(item):
         svce = item.get("svce") or ""
         name = svce[len(SERVICE_PREFIX):]
-        if item.get("acct") == ACCOUNT and svce.startswith(SERVICE_PREFIX) and valid_name(name):
+        # Only the vault keychain's own items, even if dump printed others.
+        if (item.get("keychain") == keychain and item.get("acct") == ACCOUNT
+                and svce.startswith(SERVICE_PREFIX) and valid_name(name)):
             out[name] = {"created": item.get("cdat"), "updated": item.get("mdat"),
                          "type": "credential" if item.get("labl") == service(name) + ".credential-v1" else "secret"}
 
     for line in r.stdout.splitlines():
         if line.startswith("keychain:"):
             flush(cur)
-            cur = {}
+            m = re.fullmatch(r'keychain: "(.*)"', line)
+            cur = {"keychain": m.group(1)} if m else {}
             continue
         m = re.match(r'\s+"(svce|acct|labl)"<blob>="(.*)"$', line)
         if m:
@@ -897,8 +1011,8 @@ def keychain_exists(name):
     the secret, so this can't prompt or put a value in memory."""
     if not valid_name(name):
         raise KeydropError("bad name")
-    r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", service(name)],
-                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", service(name),
+                        vault_keychain()], capture_output=True, text=True, timeout=30)
     return r.returncode == 0
 
 
@@ -907,14 +1021,14 @@ def keychain_delete(name):
     here, not just by callers, and the service is built from the prefix."""
     if not valid_name(name):
         raise KeydropError("bad name")
-    subprocess.run([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", service(name)],
-                   capture_output=True, text=True, timeout=30)
+    subprocess.run([SECURITY, "delete-generic-password", "-a", ACCOUNT, "-s", service(name),
+                    vault_keychain()], capture_output=True, text=True, timeout=30)
     if keychain_exists(name):
         raise KeydropError("security didn't delete it")
 
 
 class KeychainVault:
-    """The macOS login keychain, behind the SPEC 8.1 vault interface. This is
+    """The macOS login keychain (and only it: see vault_keychain), behind the SPEC 8.1 vault interface. This is
     the only macOS-specific part of keydrop: pages, handlers and the CLI reach
     the store through STORE, so another store is another class with these
     methods. A typed item arrives already encoded per SPEC 5.4."""
@@ -1093,20 +1207,32 @@ def route_ours(status, port):
         return False
 
 
-def serve_off(port, plain_http):
-    """True only once `serve status` confirms the port is gone. A nonzero exit
-    from `off` is fine if the route is gone anyway (already removed); a zero
-    exit is not enough if it isn't."""
-    flag = f"--http={port}" if plain_http else f"--https={port}"
-    try:
-        ts("serve", flag, "off", timeout=SERVE_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+def serve_off(port, plain_http, local):
+    """Remove the route keydrop made on :port, proxying to 127.0.0.1:local,
+    and nothing else. Every teardown goes through here, so the ownership
+    check can't be skipped: if serve status shows :port gone, or now pointing
+    somewhere else (repointed to another service after keydrop died, say),
+    it is left alone, its ledger entry dropped, and that counts as done.
+
+    True only once serve status confirms :port is no longer keydrop's route.
+    Unreadable status is False, before and after `off`, so the caller keeps
+    its record and a reap retries. A nonzero exit from `off` is fine if the
+    route is gone anyway; a zero exit is not enough if it isn't."""
+    mine = {"local": local, "plain_http": plain_http}
     st = serve_status()
-    gone = st is not None and str(port) not in (st.get("TCP") or {})
-    if gone:
-        ledger_drop(port)
-    return gone
+    if st is None:
+        return False
+    if ledger_route(st, port, mine):
+        flag = f"--http={port}" if plain_http else f"--https={port}"
+        try:
+            ts("serve", flag, "off", timeout=SERVE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        st = serve_status()
+        if st is None or ledger_route(st, port, mine):
+            return False
+    ledger_drop(port)
+    return True
 
 
 # ---------- state ----------
@@ -1139,8 +1265,34 @@ class store_lock(serve_lock):
     by both pages, so put's origin check and its write see the same item: a
     page store can't land between them (SPEC 6.1). A flock, so it holds
     across processes. Taken before meta_lock and never while holding it;
-    flock on a second fd blocks even in the same process, so it never nests."""
+    flock on a second fd blocks even in the same process, so it never nests.
+
+    A page passes its link's monotonic deadline: the wait gives up with
+    Expired once it passes, so a lock held elsewhere can't carry a request
+    past the end of its link. None (or an infinite deadline) waits as long as
+    it takes."""
     FILE = "store.lock"
+
+    def __init__(self, deadline=None):
+        self.deadline = None if deadline is None or math.isinf(deadline) else deadline
+
+    def __enter__(self):
+        if self.deadline is None:
+            return super().__enter__()
+        self.fd = os.open(os.path.join(STATE_DIR, self.FILE), os.O_RDWR | os.O_CREAT, 0o600)
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= self.deadline:
+                    os.close(self.fd)
+                    raise Expired() from None
+                time.sleep(0.05)
+                continue
+            if time.monotonic() >= self.deadline:   # a wait can win the lock just after the link ends
+                os.close(self.fd)
+                raise Expired()
+            return self
 
 
 def read_ledger():
@@ -1251,8 +1403,8 @@ def reap():
         for rec in read_pending():
             if not rec.get("teardown_failed") and alive(rec["pid"]):
                 continue
-            if rec.get("tailnet_port") and not serve_off(rec["tailnet_port"],
-                                                         rec.get("plain_http", False)):
+            if rec.get("tailnet_port") and not serve_off(rec["tailnet_port"], rec.get("plain_http", False),
+                                                         rec.get("local_port", rec["tailnet_port"])):
                 if not rec.get("teardown_failed"):
                     write_pending(dict(rec, teardown_failed=True))
                     log(rec["name"], "teardown-failed")
@@ -1271,7 +1423,7 @@ def reap():
         for port, plain_http, local in sweep:
             if keydrop_listening(local):
                 continue
-            log("-", f"swept orphan :{port} " + ("ok" if serve_off(port, plain_http) else "failed"))
+            log("-", f"swept orphan :{port} " + ("ok" if serve_off(port, plain_http, local) else "failed"))
 
 
 # ---------- pages ----------
@@ -1349,75 +1501,93 @@ def upload_limit(field_max):
     return min(field_max, STORE.capabilities()["max_bytes"])
 
 
-def file_input(ident, label_for, limit, first=False):
-    note = f'<p class="meta">or a text file, up to {limit} bytes</p>' if not first else ""
-    return note + f'<input id="{ident}" type="file" name="{ident}" aria-label="{html.escape(label_for)} as a text file">'
+ERROR_ID = "form-error"
 
 
-def credential_inputs(schema, focus=False):
-    """The value inputs. No input is `required`: a paste or a file fills a
-    value, so submitted_item says when neither (or both) came in."""
+def error_line(error):
+    """The page's one error, which the control it is about points at."""
+    return f'<p class="err" id="{ERROR_ID}" role="alert">{html.escape(error)}</p>' if error else ""
+
+
+def invalid(ident, error_control):
+    return f' aria-invalid="true" aria-describedby="{ERROR_ID}"' if error_control and ident == error_control else ""
+
+
+def file_input(ident, label_for, limit, extra=""):
+    return (f'<p class="meta">or a text file, up to {limit} bytes</p>'
+            f'<input id="{ident}" type="file" name="{ident}" aria-label="{html.escape(label_for)} as a text file"{extra}>')
+
+
+def credential_inputs(schema, focus=False, carry_schema=True, error_control=None):
+    """The value inputs. A plain secret takes a paste or a file, so neither
+    of its inputs is `required`: submitted_item says when neither (or both)
+    came in. Every typed field has exactly one input, a file picker for an
+    input=file field and a typed input otherwise, and it carries `required`
+    when the field is required. carry_schema=False leaves out the hidden
+    schema: the request page's schema is the requester's, held server-side."""
     if not schema:
         return ('<label for="value">Secret value</label><input id="value" type="password" name="value" '
-                + NO_SAVE + (' autofocus' if focus else '') + '>'
+                + NO_SAVE + (' autofocus' if focus else '') + invalid("value", error_control) + '>'
                 + file_input("file", "Secret value", upload_limit(8192)))
-    out = hidden("schema", json.dumps(schema))
+    out = hidden("schema", json.dumps(schema)) if carry_schema else ""
     for i, f in enumerate(schema["fields"]):
-        ident = "f_" + f["name"]
+        ident = ("file_" if takes_file(f) else "f_") + f["name"]
+        extra = ((" autofocus" if focus and i == 0 else "") + (" required" if f["required"] else "")
+                 + invalid(ident, error_control))
         out += f'<label for="{ident}">{html.escape(f["label"])}' + ("" if f["required"] else " (optional)") + '</label>'
-        auto = " autofocus" if focus and i == 0 else ""
         if f["kind"] == "select":
-            out += f'<select id="{ident}" name="{ident}"{auto}' + (" required" if f["required"] else "") + '><option value="">Choose…</option>'
+            out += f'<select id="{ident}" name="{ident}"{extra}><option value="">Choose…</option>'
             out += ''.join(f'<option>{html.escape(v)}</option>' for v in f["options"]) + '</select>'
+            continue
+        if takes_file(f):
+            out += (f'<input id="{ident}" type="file" name="{ident}"{extra}>'
+                    f'<p class="meta">a text file, up to {upload_limit(f["max"])} bytes</p>')
             continue
         kind = {"secret": "password", "text": "text", "url": "url"}[f["kind"]]
         attrs = NO_SAVE if kind == "password" else NO_SAVE.replace('new-password', 'off')
-        typed = f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{auto}>'
-        if not takes_file(f):
-            out += typed
-            continue
-        picker = file_input("file_" + f["name"], f["label"], upload_limit(f["max"]), True)
-        out += picker + f'<p class="meta">up to {upload_limit(f["max"])} bytes, or paste it</p>' + typed
+        out += f'<input id="{ident}" name="{ident}" type="{kind}" {attrs} maxlength="{f["max"]}"{extra}>'
     return out
 
 
-def render_form(name, note, action, error="", schema=None, expires=None):
+def render_form(name, note, action, error="", schema=None, expires=None, csrf="", error_control=None):
+    """The request page: exactly the requester's fields. There is no field
+    editor here: what the requester asked for is what gets stored."""
     body = (f'<div class="entry"><p class="meta">CREDENTIAL REQUEST</p><h1>{html.escape(name)}</h1>'
             + (f"<p>{html.escape(note)}</p>" if note else "")
             + '<p>It goes straight into the vault. Stored values never appear on this page.</p>'
-            + (f'<p class="err">{html.escape(error)}</p>' if error else "")
+            + error_line(error)
             + f'<form method="post" action="{html.escape(action)}" autocomplete="off" enctype="{UPLOAD}">'
-            + credential_inputs(schema, focus=True) + '<button type="submit">Store</button></form>')
+            + hidden("csrf", csrf)
+            + credential_inputs(schema, focus=True, carry_schema=False, error_control=error_control)
+            + '<button type="submit">Store</button></form>')
     if expires:
         body += '<p class="meta">Link ends ' + time.strftime("%H:%M", time.localtime(expires)) + '.</p>'
-    body += schema_editor(action, "", name, schema, request=True) + '</div>'
-    return PAGE.format(body=body)
+    return PAGE.format(body=body + '</div>')
 
 
-def schema_editor(action, csrf, name, schema, request=False, act="add"):
+def schema_editor(action, csrf, name, schema, act="add"):
+    """The vault's field editor, for authoring an item's fields. Not on the
+    request page."""
     if not credentials_enabled():
         return '<p class="meta">Additional credential types are disabled by this vault’s policy.</p>'
     schema = schema or {"service": "generic", "fields": [schema_field("value")]}
     out = '<details><summary>Edit proposed fields</summary><p>Definitions only. Remove a field by clearing its name. Add fields in the empty rows. Applying changes clears entered values.</p>'
     controls = hidden("name", name) + hidden("target", act)
-    controls += '<label>Service</label><input name="service" value="' + html.escape(schema["service"]) + '" required>'
+    controls += '<label for="ed-service">Service</label><input id="ed-service" name="service" value="' + html.escape(schema["service"]) + '" required>'
     for i in range(FIELD_LIMIT):
         f = schema["fields"][i] if i < len(schema["fields"]) else {}
         if not f:
             controls += '<details><summary>Add another field</summary>'
-        controls += hidden(f"m{i}", str(f.get("max", 8192)))
-        controls += f'<div class="field-row"><div class="field-grid"><div><label>Field {i+1} · name</label><input name="n{i}" value="{html.escape(f.get("name", ""))}" maxlength="32"></div>'
-        controls += f'<div><label>Label</label><input name="l{i}" value="{html.escape(f.get("label", ""))}" maxlength="80"></div></div>'
-        controls += f'<label>Kind</label><select name="k{i}">' + ''.join(f'<option{(" selected" if k == f.get("kind", "secret") else "")}>{k}</option>' for k in ("secret", "text", "url", "select")) + '</select>'
+        controls += hidden(f"m{i}", str(f.get("max", 8192))) + (hidden(f"c{i}", f["check"]) if f.get("check") else "")
+        controls += f'<div class="field-row"><div class="field-grid"><div><label for="ed-n{i}">Field {i+1} · name</label><input id="ed-n{i}" name="n{i}" value="{html.escape(f.get("name", ""))}" maxlength="32"></div>'
+        controls += f'<div><label for="ed-l{i}">Label</label><input id="ed-l{i}" name="l{i}" value="{html.escape(f.get("label", ""))}" maxlength="80"></div></div>'
+        controls += f'<label for="ed-k{i}">Kind</label><select id="ed-k{i}" name="k{i}">' + ''.join(f'<option{(" selected" if k == f.get("kind", "secret") else "")}>{k}</option>' for k in ("secret", "text", "url", "select")) + '</select>'
         controls += f'<label><input type="checkbox" name="r{i}" value="yes"' + (' checked' if f.get("required", True) else '') + '> Required</label>'
-        controls += f'<label><input type="checkbox" name="u{i}" value="file"' + (' checked' if f.get("input") == "file" else '') + '> Usually a file (show the file picker first)</label>'
-        controls += f'<label>Select options (one per comma)</label><input name="o{i}" value="{html.escape(",".join(f.get("options", [])))}"></div>'
+        controls += f'<label><input type="checkbox" name="u{i}" value="file"' + (' checked' if f.get("input") == "file" else '') + '> A file (a file picker instead of a typed input)</label>'
+        controls += f'<label for="ed-o{i}">Select options (one per comma)</label><input id="ed-o{i}" name="o{i}" value="{html.escape(",".join(f.get("options", [])))}"></div>'
         if not f:
             controls += '</details>'
-    if request:
-        out += f'<form method="post" action="{html.escape(action)}" autocomplete="off">' + hidden("action", "edit-schema") + controls + '<button>Apply fields</button></form>'
-    else:
-        out += vault_form(action, csrf, "edit-schema", controls, "Apply fields")
+    out += vault_form(action, csrf, "edit-schema", controls, "Apply fields")
     return out + '</details>'
 
 
@@ -1434,6 +1604,8 @@ def schema_from_editor(fields):
             f["options"] = field(fields, f"o{i}").split(",")
         if field(fields, f"u{i}") == "file":
             f["input"] = "file"
+        if field(fields, f"c{i}"):
+            f["check"] = field(fields, f"c{i}")   # validate_schema refuses anything but totp on a secret
         try:
             f["max"] = int(field(fields, f"m{i}") or "8192")
         except ValueError:
@@ -1444,14 +1616,26 @@ def schema_from_editor(fields):
     return schema
 
 
-def render_entry(action, csrf, name="", schema=None, act="add", rotate_by=""):
-    title = "Rotate " + name if act == "rotate" else "Add a credential"
-    fields = (hidden("name", name) if name else '<label>Name</label><input name="name" required pattern="[a-z0-9._-]{1,64}" maxlength="64">')
-    fields += '<label>Note · never put secrets here</label><input name="note" maxlength="200">'
-    fields += '<label>Rotate by (optional)</label><input type="date" name="rotate_by" value="' + html.escape(rotate_by) + '">' + credential_inputs(schema)
+def render_entry(action, csrf, name="", schema=None, act="add", rotate_by="", error="", note="",
+                 error_control=None):
+    """The vault's add or rotate form. After a refused submit it comes back
+    with the same fields, the error, and the name, note and date the owner
+    typed; never a value."""
+    rotating = act != "add"
+    title = "Rotate " + name if rotating else "Add a credential"
+    fields = (hidden("name", name) if rotating else
+              '<label for="entry-name">Name</label><input id="entry-name" name="name" value="' + html.escape(name)
+              + '" required pattern="[a-z0-9._-]{1,64}" maxlength="64"' + invalid("name", error_control) + '>')
+    fields += ('<label for="entry-note">Note · never put secrets here</label><input id="entry-note" name="note" maxlength="200" value="'
+               + html.escape(note) + '"' + invalid("note", error_control) + '>')
+    fields += ('<label for="entry-rotate-by">Rotate by (optional)</label><input id="entry-rotate-by" type="date" name="rotate_by" value="'
+               + html.escape(rotate_by) + '"' + invalid("rotate_by", error_control) + '>'
+               + credential_inputs(schema, error_control=error_control))
     return PAGE.format(body='<div class="entry"><p class="meta">KEY MANAGEMENT</p><h1>' + html.escape(title) + '</h1><p>Rotation replaces the complete credential. Update the service first, then store all new fields here.</p>'
-        + vault_form(action, csrf, act, fields, "Rotate credential" if act == "rotate" else "Store", enctype=UPLOAD)
-        + schema_editor(action, csrf, name, schema, act=act) + vault_form(action, csrf, "back", "", "Back", "quiet") + '</div>')
+        + error_line(error)
+        + vault_form(action, csrf, act, fields, "Rotate credential" if rotating else "Store", enctype=UPLOAD)
+        + schema_editor(action, csrf, name, schema, act="rotate" if rotating else "add")
+        + vault_form(action, csrf, "back", "", "Back", "quiet") + '</div>')
 
 
 def render_message(text):
@@ -1522,7 +1706,7 @@ def render_vault(action, csrf, entries, notes, expires, flash="", error="",
     body += (f'<p class="ok" role="status">{html.escape(flash)}</p>' if flash else '') + (f'<p class="err" role="alert">{html.escape(error)}</p>' if error else '')
     body += vault_form(action, csrf, "search", '<div class="toolbar">' + toolbar + '</div>', "Filter", "quiet")
     body += '<table><thead><tr><th>Name / note</th><th>Created</th><th>Updated / age</th><th>Rotation</th><th>Actions</th></tr></thead><tbody>' + (''.join(rows) or '<tr><td>No matching keys. Add your first credential below.</td></tr>') + '</tbody></table>'
-    body += '<h2>Add a credential</h2>' + vault_form(action, csrf, "new", '<label>Proposed template</label><select name="template"><option value="">Single secret</option>' + ''.join('<option>' + t + '</option>' for t in (TEMPLATES if credentials_enabled() else [])) + '</select>', "Continue")
+    body += '<h2>Add a credential</h2>' + vault_form(action, csrf, "new", '<label for="template">Proposed template</label><select id="template" name="template"><option value="">Single secret</option>' + ''.join('<option>' + t + '</option>' for t in (TEMPLATES if credentials_enabled() else [])) + '</select>', "Continue")
     body += '<details><summary>Activity · recent outcomes</summary><p class="meta">Names, times and outcomes only. Latest 100 events.</p><table><thead><tr><th>Time</th><th>Name</th><th>Outcome</th></tr></thead><tbody>' + ''.join('<tr>' + ''.join('<td>' + html.escape(v) + '</td>' for v in ev) + '</tr>' for ev in read_activity()) + '</tbody></table></details>'
     body += f'<p class="meta">{lifetime} Values are write-only here.</p>' + vault_form(action, csrf, "done", "", done_label, "quiet")
     return PAGE.format(body=body)
@@ -1563,10 +1747,62 @@ def login_ok(headers):
                                OWNER_LOGIN.encode())
 
 
+class DeadlineReader(io.RawIOBase):
+    """A connection's reads, each allowed only the time left before an
+    absolute deadline. The socket timeout alone bounds the gap between two
+    bytes, not the request: a client trickling a byte every few seconds could
+    otherwise hold the single-threaded page, and its link, for as long as it
+    liked. Past the deadline the read raises socket.timeout, which
+    BaseHTTPRequestHandler answers by closing the connection."""
+
+    def __init__(self, sock, deadline):
+        super().__init__()
+        self.sock, self.deadline = sock, deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("request deadline passed")
+        self.sock.settimeout(min(left, REQUEST_TIMEOUT))
+        return self.sock.recv_into(buf)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "keydrop"
     sys_version = ""
     timeout = REQUEST_TIMEOUT
+
+    def setup(self):
+        """Every read on this connection shares one deadline: REQUEST_DEADLINE
+        from now, or the link's own deadline if that comes first."""
+        super().setup()
+        self.deadline = min(time.monotonic() + REQUEST_DEADLINE, getattr(self.server, "deadline", math.inf))
+        self.rfile.close()
+        self.rfile = io.BufferedReader(DeadlineReader(self.connection, self.deadline))
+
+    def __getattr__(self, name):
+        """Every method goes through the gates. BaseHTTPRequestHandler looks
+        up do_<METHOD> and, for one it can't find (TRACE, PROPFIND...),
+        answers 501 itself, before the route, Host and login checks and
+        without the security headers. Here any method but GET and POST is
+        _reject, which runs those checks first."""
+        if name.startswith("do_"):
+            return self._reject
+        raise AttributeError(name)
+
+    def send_error(self, code, message=None, explain=None):
+        """The stdlib's own errors (a malformed request line, a header too
+        long) as a bare response with the same headers as every other one.
+        Nothing about the request is known yet, so nothing is counted. A
+        request line too broken to name its version is still answered as
+        HTTP/1.0, not 0.9, so the answer has a status line and headers."""
+        self.close_connection = True
+        if self.request_version == "HTTP/0.9":
+            self.request_version = "HTTP/1.0"
+        self._send(code, b"", "text/plain")
 
     def log_message(self, *args):
         pass   # the default request log line contains the token
@@ -1596,6 +1832,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _strike_eligible(self):
         """Whether a failure from this request counts toward the lockout."""
         return True
+
+    def _bad_form(self, code=400, text=BAD_FORM):
+        """S-BAD-FORM and S-TOO-BIG: a body that isn't the page's form counts
+        as a bad request (SPEC 7.2), where this page counts strikes from it."""
+        if self._strike_eligible():
+            self.server.bad += 1
+        self._send(code, render_message(text).encode())
+
+    def _expired(self):
+        """S-EXPIRED: the link ran out while this request was in flight. The
+        page ends; nothing is written."""
+        self.server.outcome = "expired"
+        self._send(410, render_message(str(Expired())).encode())
+
+    def _past_deadline(self):
+        return time.monotonic() >= getattr(self.server, "deadline", math.inf)
 
     def _admitted(self):
         """A check between the login pin and the token; False means it has
@@ -1663,42 +1915,89 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return None
 
     def _read_form(self, max_fields):
-        """The parsed POST body, or None after sending a 400 (or a 413 when
-        Content-Length is over the cap). urlencoded for the buttons and the
-        schema editor, multipart/form-data for the forms that take a value.
-        The length is checked before a byte is read, and nothing past it is
-        read: an oversize upload is refused unread, which a browser may show
-        as a dropped connection rather than the message."""
-        try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            length = -1
+        """The parsed POST body, or None after answering S-BAD-FORM (400) or
+        S-TOO-BIG (413), both of which count as bad requests. urlencoded for
+        the buttons and the schema editor, multipart/form-data for the forms
+        that take a value. Exactly one Content-Length, all digits, and no
+        Transfer-Encoding, so there is one reading of where the body ends.
+        The length is checked before a byte is read, nothing past it is read,
+        and a body that ends short of it is refused, not parsed. An oversize
+        upload is refused unread, which a browser may show as a dropped
+        connection rather than the message."""
+        lengths = self.headers.get_all("Content-Length") or []
         ctype_header = self.headers.get("Content-Type") or ""
         ctype = ctype_header.split(";")[0].strip().lower()
         cap = {"application/x-www-form-urlencoded": MAX_BODY, UPLOAD: MAX_UPLOAD_BODY}.get(ctype)
-        if cap is None or length <= 0:
-            self._send(400, render_message("That didn't look like the form.").encode())
+        if (cap is None or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,9}", lengths[0].strip())
+                or self.headers.get_all("Transfer-Encoding") or len(self.headers.get_all("Content-Type") or []) != 1):
+            self._bad_form()
+            return None
+        length = int(lengths[0].strip())
+        if length <= 0:
+            self._bad_form()
             return None
         if length > cap:
-            self._send(413, render_message(TOO_LONG).encode())
+            self._bad_form(413, TOO_LONG)
             return None
         body = self.rfile.read(length)
         try:
+            if len(body) != length:
+                raise BadForm()
             if ctype == UPLOAD:
                 return parse_multipart(ctype_header, body, max_fields)
-            return urllib.parse.parse_qs(body.decode("utf-8"),
-                                         max_num_fields=max_fields, strict_parsing=True,
-                                         keep_blank_values=True)
-        except (KeydropError, UnicodeDecodeError, ValueError):
-            self._send(400, render_message("That didn't look like the form.").encode())
+            return parse_urlencoded(body, max_fields)
+        except KeydropError:
+            self._bad_form()
             return None
         finally:
             body = None
 
+    def _origin_ok(self):
+        """Pages here send no referrer, so a browser's own same-origin POST
+        carries `Origin: null` (or none). A real origin is only accepted if it
+        is exactly one of this page's own, scheme and port included; anything
+        else is another site's page posting here."""
+        origins = self.headers.get_all("Origin") or []
+        if len(origins) > 1:
+            return False
+        if not origins or origins[0].strip() == "null":
+            return True
+        return origins[0].strip().lower() in self.server.origins
+
+    def _csrf_check(self, fields):
+        """"ok", "stale" (a real form token that has aged out; not counted)
+        or "bad". The form token is the proof the owner submitted this page's
+        own form: the path token is in the link, and whoever has the link can
+        build a form that posts to it from any site. Sec-Fetch-Site and
+        Origin are second opinions where the browser sends them."""
+        site = (self.headers.get("Sec-Fetch-Site") or "same-origin").lower()
+        if site not in ("same-origin", "none") or not self._origin_ok():
+            return "bad"
+        return self.server.check_csrf(field(fields, "csrf"))
+
+    def _csrf_refused(self, fields):
+        """True after answering a POST whose form token or origin is wrong."""
+        verdict = self._csrf_check(fields)
+        if verdict == "ok":
+            return False
+        if verdict == "bad":
+            if not self._strike_eligible():
+                self._send(404, b"", "text/plain")
+                return True
+            self.server.bad += 1
+        log(self.server.name, f"refused: form token ({verdict})")
+        self._send(403, render_message("That form is stale. Reload the page.").encode())
+        return True
+
+    def _form_page(self, path, error="", control=None, code=200):
+        srv = self.server
+        return self._send(code, render_form(srv.name, srv.note, path, error, srv.schema,
+                                            getattr(srv, "expires", None), srv.issue_csrf(), control).encode())
+
     def do_GET(self):
         path = self._authorised()
         if path:
-            self._send(200, render_form(self.server.name, self.server.note, path, schema=self.server.schema, expires=getattr(self.server, "expires", None)).encode())
+            self._form_page(path)
 
     def do_POST(self):
         path = self._authorised()
@@ -1707,28 +2006,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fields = self._read_form(90)
         if fields is None:
             return
-        proposal = self.server.schema
-        try:
-            if field(fields, "schema"):
-                proposal = validate_schema(schema_json(field(fields, "schema")))
-            if field(fields, "action") == "edit-schema":
-                schema = schema_from_editor(fields)
-                self._send(200, render_form(self.server.name, self.server.note, path, schema=schema, expires=getattr(self.server, "expires", None)).encode())
-                return
-            value, schema = submitted_item(fields, self.server.schema)
-            if not STORE.fits(self.server.name, value, bool(schema)):
-                raise KeydropError(TOO_LONG)
-        except (KeydropError, ValueError) as e:
-            message = str(e) if isinstance(e, KeydropError) else "Invalid credential schema."
-            self._send(400, render_form(self.server.name, self.server.note, path, message, proposal, getattr(self.server, "expires", None)).encode())
+        if self._csrf_refused(fields):
             return
         try:
-            with store_lock():
+            # The requester's schema, never one from the form (SPEC 6).
+            value, schema = submitted_item(fields, self.server.schema, form_schema=False)
+            if not STORE.fits(self.server.name, value, bool(schema)):
+                raise FieldError(TOO_LONG, None)
+        except BadForm:
+            self._bad_form()
+            return
+        except (KeydropError, ValueError) as e:
+            message = str(e) if isinstance(e, KeydropError) else "Invalid credential schema."
+            self._form_page(path, message, getattr(e, "control", None), 400)
+            return
+        try:
+            if self._past_deadline():
+                raise Expired()
+            with store_lock(self.server.deadline):
+                if self._past_deadline():
+                    raise Expired()
                 clear_put_origin(self.server.name)
                 STORE.store(self.server.name, value, typed=bool(schema))
                 # A one-shot store keeps whatever rotate-by date the owner set.
                 write_item_meta(self.server.name, schema,
                                 read_items().get(self.server.name, {}).get("rotate_by", ""))
+        except Expired:
+            self._expired()
+            return
         except (KeydropError, OSError, subprocess.TimeoutExpired):
             self.server.outcome = "store-failed"
             self._send(500, render_message("Couldn't store it. Tell whoever sent you the link.").encode())
@@ -1745,8 +2050,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.server.requests += 1
         self._not_found(urllib.parse.urlsplit(self.path).path)
-
-    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject
 
 
 def field(fields, key):
@@ -1777,28 +2080,6 @@ class VaultHandler(Handler):
         self.server.flash = flash
         self._send(303, b"", "text/plain", extra=(("Location", path),))
 
-    def _origin_ok(self):
-        """Pages here send no referrer, so a browser's own same-origin POST
-        carries `Origin: null` (or none). A real origin is only accepted if it
-        names the host the request was sent to; anything else is another
-        site's page posting here."""
-        origins = self.headers.get_all("Origin") or []
-        if len(origins) > 1:
-            return False
-        if not origins or origins[0].strip() == "null":
-            return True
-        host = (self.headers.get("Host") or "").strip().lower()
-        return bool(host) and urllib.parse.urlsplit(origins[0].strip()).netloc.lower() == host
-
-    def _csrf_check(self, fields):
-        """"ok", "stale" (a real form token that has aged out; not counted)
-        or "bad". Sec-Fetch-Site and Origin are second opinions where the
-        browser sends them."""
-        site = (self.headers.get("Sec-Fetch-Site") or "same-origin").lower()
-        if site not in ("same-origin", "none") or not self._origin_ok():
-            return "bad"
-        return self.server.check_csrf(field(fields, "csrf"))
-
     def do_POST(self):
         path = self._authorised()
         if not path:
@@ -1807,15 +2088,7 @@ class VaultHandler(Handler):
         if fields is None:
             return
         try:
-            verdict = self._csrf_check(fields)
-            if verdict != "ok":
-                if verdict == "bad":
-                    if not self._strike_eligible():
-                        self._send(404, b"", "text/plain")
-                        return
-                    self.server.bad += 1
-                log(self.server.name, f"refused: form token ({verdict})")
-                self._send(403, render_message("That form is stale. Reload the page.").encode())
+            if self._csrf_refused(fields):
                 return
             self._act(path, field(fields, "action"), fields)
         finally:
@@ -1861,20 +2134,21 @@ class VaultHandler(Handler):
             self._page(path, 400, "Unknown action.")
             return
         if not valid_name(name):
-            self._page(path, 400, "Names are a-z, 0-9, . _ - and up to 64 characters.")
-            return
-        try:
-            exists = STORE.exists(name)
-        except (OSError, subprocess.TimeoutExpired):
-            self._page(path, 500, "Couldn't read the keychain.")
-            return
-        if act == "add" and exists:
-            self._page(path, 409, f"{name} already exists. Use Replace on it instead.")
-            return
-        if act != "add" and not exists:
-            self._page(path, 404, f"There's no {name}.")
+            if act == "add":
+                self._entry_again(path, act, name, fields, "Names are a-z, 0-9, . _ - and up to 64 characters.", "name")
+            else:
+                self._page(path, 400, "Names are a-z, 0-9, . _ - and up to 64 characters.")
             return
         if act == "delete":
+            # Only the confirm screen: the delete itself checks again under the lock.
+            try:
+                exists = STORE.exists(name)
+            except (KeydropError, OSError, subprocess.TimeoutExpired):
+                self._page(path, 500, "Couldn't read the keychain.")
+                return
+            if not exists:
+                self._page(path, 404, f"There's no {name}.")
+                return
             self._send(200, render_confirm_delete(path, self.server.issue_csrf(), name).encode())
             return
         if act == "delete-confirm":
@@ -1882,61 +2156,128 @@ class VaultHandler(Handler):
             return
         self._store(path, act, name, fields)
 
-    def _rate_limited(self, path, name, act):
+    def _rate_limited(self, name, act):
         """Booked only once a write is about to happen, so a refused form
-        doesn't use up a slot."""
+        doesn't use up a slot. Called under store_lock."""
         if self.server.write_allowed():
             return False
         self.server.audit(name, f"{act} rate-limited")
-        self._page(path, 429, "Too many changes in the last hour. Try again later.")
         return True
 
-    def _delete(self, path, name):
-        if self._rate_limited(path, name, "delete"):
-            return
+    def _check_target(self, act, name):
+        """Under store_lock: the (code, message) refusing act on name, or None.
+        Checked inside the lock so two pages (or a page and put) can't both
+        see a name as absent and both add it."""
         try:
-            STORE.delete(name)
+            exists = STORE.exists(name)
         except (KeydropError, OSError, subprocess.TimeoutExpired):
-            self.server.audit(name, "delete failed")
-            self._page(path, 500, f"Couldn't delete {name}.")
+            return 500, "Couldn't read the keychain."
+        if act == "add" and exists:
+            return 409, f"{name} already exists. Use Rotate on it instead."
+        if act != "add" and not exists:
+            return 404, f"There's no {name}."
+        return None
+
+    def _delete(self, path, name):
+        try:
+            with store_lock(self.server.deadline):
+                refusal = self._check_target("delete", name)
+                if refusal is None:
+                    if self._rate_limited(name, "delete"):
+                        refusal = 429, "Too many changes in the last hour. Try again later."
+                    else:
+                        try:
+                            STORE.delete(name)
+                            write_note(name, None)
+                            write_item_meta(name, None, None)
+                        except (KeydropError, OSError, subprocess.TimeoutExpired):
+                            self.server.audit(name, "delete failed")
+                            refusal = 500, f"Couldn't delete {name}."
+        except Expired:
+            self._expired()
             return
-        write_note(name, None)
-        write_item_meta(name, None, None)
+        if refusal:
+            self._page(path, *refusal)
+            return
         self.server.audit(name, "deleted")
         self._done(path, f"Deleted {name}.")
+
+    def _entry_again(self, path, act, name, fields, error, control=None, schema=None):
+        """A refused add or rotate goes back to the same form, with its
+        fields, the error and the control it is about; never a value. If the
+        form's own schema can't be read, back to the list instead."""
+        if schema is None and field(fields, "schema"):
+            try:
+                schema = validate_schema(schema_json(field(fields, "schema")))
+            except (KeydropError, ValueError, TypeError):
+                self._page(path, 400, error)
+                return
+        rotate_by = field(fields, "rotate_by")
+        note = field(fields, "note")
+        self._send(400, render_entry(path, self.server.issue_csrf(), name, schema, act,
+                                     rotate_by if re.fullmatch(r"[0-9-]{0,10}", rotate_by) else "",
+                                     error, note[:NOTE_MAX], control).encode())
 
     def _store(self, path, act, name, fields):
         try:
             note = clean_note(field(fields, "note"))
         except KeydropError as e:
-            self._page(path, 400, str(e).replace("--note", "The note"))
+            self._entry_again(path, act, name, fields, str(e).replace("--note", "The note"), "note")
             return
+        refusal = again = None
+        bad_form = False
         try:
-            previous = read_items().get(name, {})
-            value, schema = submitted_item(fields, previous.get("schema") if act != "add" else None)
-            rotate_by = rotation_date(field(fields, "rotate_by")) if "rotate_by" in fields else previous.get("rotate_by", "")
-            if not STORE.fits(name, value, bool(schema)):
-                raise KeydropError(TOO_LONG)
-        except (KeydropError, ValueError) as e:
-            self._page(path, 400, str(e) if isinstance(e, KeydropError) else "Invalid field.")
-            return
-        if self._rate_limited(path, name, act):
-            return
-        try:
-            with store_lock():
-                clear_put_origin(name)
-                STORE.store(name, value, typed=bool(schema))
-                write_item_meta(name, schema, rotate_by)
-        except (KeydropError, OSError, subprocess.TimeoutExpired):
-            self.server.audit(name, f"{act} failed")
-            self._page(path, 500, f"Couldn't store {name}.")
+            # One lock from the existence check to the last metadata write,
+            # shared with put and the request page.
+            with store_lock(self.server.deadline):
+                refusal = self._check_target(act, name)
+                if refusal is None:
+                    previous = read_items().get(name, {})
+                    fallback = previous.get("schema") if act != "add" else None
+                    try:
+                        value, schema = submitted_item(fields, fallback)
+                        try:
+                            rotate_by = (rotation_date(field(fields, "rotate_by")) if "rotate_by" in fields
+                                         else previous.get("rotate_by", ""))
+                        except KeydropError as e:
+                            raise FieldError(str(e), "rotate_by") from None
+                        if not STORE.fits(name, value, bool(schema)):
+                            raise FieldError(TOO_LONG, None)
+                    except BadForm:
+                        bad_form = True
+                    except (KeydropError, ValueError) as e:
+                        again = (str(e) if isinstance(e, KeydropError) else "Invalid field.",
+                                 getattr(e, "control", None), fallback)
+                    else:
+                        if self._rate_limited(name, act):
+                            refusal = 429, "Too many changes in the last hour. Try again later."
+                        else:
+                            try:
+                                clear_put_origin(name)
+                                STORE.store(name, value, typed=bool(schema))
+                                write_item_meta(name, schema, rotate_by)
+                                if note or act == "add":
+                                    write_note(name, note or None)
+                            except (KeydropError, OSError, subprocess.TimeoutExpired):
+                                self.server.audit(name, f"{act} failed")
+                                refusal = 500, f"Couldn't store {name}."
+                            finally:
+                                value = None
+        except Expired:
+            self._expired()
             return
         finally:
-            value = None
-            for key in [k for k in fields if k == "value" or is_file_part(k)]:
+            for key in [k for k in fields if k == "value" or is_file_part(k) or k.startswith("f_")]:
                 fields.pop(key, None)
-        if note or act == "add":
-            write_note(name, note or None)
+        if bad_form:
+            self._bad_form()
+            return
+        if refusal:
+            self._page(path, *refusal)
+            return
+        if again:
+            self._entry_again(path, act, name, fields, again[0], again[1], again[2])
+            return
         self.server.audit(name, f"{act} stored")
         self._done(path, f"Stored {name}.")
 
@@ -1957,6 +2298,10 @@ class Server(http.server.HTTPServer):
         self.token, self.name, self.note, self.pin = token, name, note, pin
         self.bad = self.requests = 0
         self.outcome = None
+        self.csrf = secrets.token_urlsafe(32)
+        # The link's end on the monotonic clock, so a wall-clock change can't
+        # stretch it; request() and vault() set it, home has none.
+        self.deadline = math.inf
         self.tailnet_port = None   # set by allow_hosts; None fails route_intact
         self.allow_hosts()
 
@@ -1968,17 +2313,24 @@ class Server(http.server.HTTPServer):
         """An outcome to end the serve loop with, or None to carry on."""
         return None
 
-    def allow_hosts(self, tailnet_name=None, tailnet_port=None):
+    def allow_hosts(self, tailnet_name=None, tailnet_port=None, plain_http=False):
         """The exact Host values this page answers: its loopback names on its
         own port, plus the tailnet name with and without the tailnet port
         (whether serve keeps the browser's Host or rewrites it to the
-        backend). A DNS-rebinding page always carries its own hostname."""
+        backend). A DNS-rebinding page always carries its own hostname. And
+        the exact origins its own pages post from: scheme, host and port."""
         port = self.server_address[1]
         hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         if tailnet_name:
             hosts |= {tailnet_name, f"{tailnet_name}:{tailnet_port}"}
+            scheme = "http" if plain_http else "https"
+            origins.add(f"{scheme}://{tailnet_name}:{tailnet_port}")
+            if int(tailnet_port) == (80 if plain_http else 443):
+                origins.add(f"{scheme}://{tailnet_name}")   # browsers leave a default port out
             self.tailnet_port = tailnet_port
         self.hosts = frozenset(h.lower() for h in hosts)
+        self.origins = frozenset(o.lower() for o in origins)
 
     def route_intact(self, status=None):
         """Whether serve still claims this page's port with a route to this
@@ -1994,6 +2346,14 @@ class Server(http.server.HTTPServer):
 
     def token_ok(self, path):
         return token_matches(path, self.token)
+
+    def issue_csrf(self):
+        return self.csrf
+
+    def check_csrf(self, given):
+        same = hmac.compare_digest(hashlib.sha256(given.encode("utf-8", "replace")).digest(),
+                                   hashlib.sha256(self.csrf.encode()).digest())
+        return "ok" if same else "bad"
 
     def refusal(self):
         """A reason not to start serving, checked under serve_lock right
@@ -2021,17 +2381,8 @@ class Vault(Server):
 
     def __init__(self, token, expires, pin=True, name=VAULT, port=0):
         super().__init__(self.handler, token, name, "", pin, port)
-        self.csrf = secrets.token_urlsafe(32)
         self.expires = expires
         self.flash = ""
-
-    def issue_csrf(self):
-        return self.csrf
-
-    def check_csrf(self, given):
-        same = hmac.compare_digest(hashlib.sha256(given.encode("utf-8", "replace")).digest(),
-                                   hashlib.sha256(self.csrf.encode()).digest())
-        return "ok" if same else "bad"
 
     def write_allowed(self):
         return True
@@ -2042,9 +2393,10 @@ class Vault(Server):
 
 
 def run_until_done(srv, deadline):
+    """deadline is on the monotonic clock (math.inf for none)."""
     srv.timeout = 0.5
     while srv.outcome is None:
-        if time.time() >= deadline:
+        if time.monotonic() >= deadline:
             return "expired"
         if srv.bad >= MAX_BAD or srv.requests >= srv.max_requests:
             return "locked-out"
@@ -2090,7 +2442,7 @@ def serve_child(srv, rec, report_fd):
         os.write(report_fd, b"ok")
         os.close(report_fd)
         report_fd = None
-        outcome = run_until_done(srv, rec["expires"] or float("inf"))
+        outcome = run_until_done(srv, srv.deadline)
     except Terminated as e:
         outcome = f"cancelled ({e})"
     except Refused as e:
@@ -2107,10 +2459,9 @@ def serve_child(srv, rec, report_fd):
         srv.server_close()
         log(rec["name"], outcome)
         with serve_lock():
-            if serving and outcome == "route-gone" and route_left(rec["tailnet_port"]):
-                drop_pending(rec)   # gone, or someone else's now: not ours to remove
-                ledger_drop(rec["tailnet_port"])
-            elif serving and not serve_off(rec["tailnet_port"], rec["plain_http"]):
+            # serve_off leaves a route that is gone or someone else's now
+            # (route-gone, say) alone, and counts that as done.
+            if serving and not serve_off(rec["tailnet_port"], rec["plain_http"], rec["local_port"]):
                 # Keep the record so reap retries; the route may still be live
                 # or come back from tailscaled's persisted config.
                 write_pending(dict(rec, teardown_failed=True))
@@ -2123,19 +2474,6 @@ def serve_child(srv, rec, report_fd):
             except OSError:
                 pass
     return outcome
-
-
-def route_left(port):
-    """After route-gone: True if serve status reads and :port is either absent
-    or no longer ours, so teardown must not touch it. False (unreadable, or
-    still ours) means tear down as usual, which keeps the record on failure."""
-    st = serve_status()
-    if st is None:
-        return False
-    try:
-        return str(port) not in (st.get("TCP") or {}) or not route_ours(st, port)
-    except (AttributeError, TypeError):
-        return False
 
 
 def detach_stdio(keep):
@@ -2230,6 +2568,7 @@ def request(name, note, ttl, plain_http=False, schema=None):
     token = secrets.token_urlsafe(32)
     srv = claim_port(lambda: OneShot(token, name, note, True, schema=schema), serve_ports_in_use())
     srv.expires = time.time() + ttl
+    srv.deadline = time.monotonic() + ttl
     return launch(srv, token, {"name": name, "note": note}, ttl, host, plain_http)
 
 
@@ -2382,6 +2721,7 @@ def vault(ttl, plain_http=False):
     token = secrets.token_urlsafe(32)
     expires = time.time() + ttl
     srv = claim_port(lambda: Vault(token, expires, True), serve_ports_in_use())
+    srv.deadline = time.monotonic() + ttl
     return launch(srv, token, {"name": VAULT, "kind": "vault", "note": ""}, ttl, host,
                   plain_http, expires)
 
@@ -2391,7 +2731,7 @@ def launch(srv, token, rec_fields, ttl, host, plain_http, expires=None):
     return the link."""
     local_port = srv.server_address[1]
     tailnet_port = local_port   # never another number: see claim_port
-    srv.allow_hosts(host, tailnet_port)
+    srv.allow_hosts(host, tailnet_port, plain_http)
     rec = dict(rec_fields, id=secrets.token_hex(4), local_port=local_port,
                tailnet_port=tailnet_port, plain_http=plain_http, created=time.time(),
                expires=expires or time.time() + ttl)
@@ -2548,8 +2888,6 @@ class HomeHandler(VaultHandler):
         path = urllib.parse.urlsplit(self.path).path
         if self._login_passes(path) and self._admitted():
             self._not_found(path)
-
-    do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject
 
 
 class Home(Vault):
@@ -2812,7 +3150,7 @@ def home_stop():
                   f"keydrop home; leaving it", file=sys.stderr)
             return False
         if backend is not None:
-            serve_off(port, st.get("plain_http", False))
+            serve_off(port, st.get("plain_http", False), port)
             status = serve_status()
     return status is not None and str(port) not in (status.get("TCP") or {})
 

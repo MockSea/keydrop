@@ -9,7 +9,7 @@ adapter's limits.
 
     tests/keydrop-management-test
 """
-import contextlib, copy, importlib.machinery, importlib.util, io, json, os, sys
+import contextlib, copy, email.message, importlib.machinery, importlib.util, io, json, math, os, sys
 from pathlib import Path
 import tempfile, time, types, unittest
 from unittest.mock import patch
@@ -34,6 +34,20 @@ KD = importlib.util.module_from_spec(spec)
 loader.exec_module(KD)
 
 
+def oneshot_handler(name, schema, fields, responses=None):
+    """A request-page handler with no server or socket behind it: the form
+    arrives already parsed, carrying the page's form token."""
+    h = object.__new__(KD.Handler)
+    h.server = types.SimpleNamespace(name=name, note="", schema=schema, outcome=None, bad=0,
+                                     deadline=math.inf, issue_csrf=lambda: "csrf",
+                                     check_csrf=lambda given: "ok" if given == "csrf" else "bad")
+    h.headers = email.message.Message()
+    h._authorised = lambda: "/token"
+    h._read_form = lambda n: dict(fields, csrf=["csrf"])
+    h._send = (lambda *a: responses.append(a)) if responses is not None else (lambda *a: None)
+    return h
+
+
 class Management(unittest.TestCase):
     def setUp(self):
         KD.ensure_state()
@@ -41,7 +55,7 @@ class Management(unittest.TestCase):
         self.schema = KD.template_schema('linkedin')
         self.events, self.responses = [], []
         self.h = object.__new__(KD.VaultHandler)
-        self.h.server = types.SimpleNamespace(write_allowed=lambda: True,
+        self.h.server = types.SimpleNamespace(write_allowed=lambda: True, deadline=math.inf,
             audit=lambda *x: self.events.append(x), issue_csrf=lambda: 'csrf')
         self.h._page = lambda path, code=200, error='', **kw: self.responses.append((code, error, kw))
         self.h._done = lambda path, msg: self.responses.append((303, msg))
@@ -201,7 +215,9 @@ class Management(unittest.TestCase):
         self.assertFalse(schema['fields'][1]['required'])
         data['n1']=[''];self.assertEqual(len(KD.schema_from_editor(data)['fields']),1)
         page=KD.render_form('test','<script>','/token',schema=schema)
-        self.assertIn('f_renamed',page);self.assertIn('Edit proposed fields',page)
+        # The editor is the vault's; the request page shows exactly the requester's fields.
+        self.assertIn('f_renamed',page);self.assertNotIn('Edit proposed fields',page)
+        self.assertIn('Edit proposed fields',KD.render_entry('/token','csrf',schema=schema))
         self.assertNotIn('<script>',page);self.assertIn('&lt;script&gt;',page)
         self.assertIn('data-1p-ignore',page)
         self.assertIn('prefers-color-scheme:dark',page)
@@ -226,11 +242,8 @@ class Management(unittest.TestCase):
         self.assertIn('delete-confirm',page);self.assertIn('Keep it',page)
 
     def test_request_handler(self):
-        h=object.__new__(KD.Handler)
-        h.server=types.SimpleNamespace(name='request-typed',note='',schema=self.schema,outcome=None)
-        h._authorised=lambda:'/token'
-        h._read_form=lambda n:self.fields()
-        h._send=lambda *args:self.responses.append(args)
+        fields=self.fields();del fields['schema']   # the request page's schema is the server's
+        h=oneshot_handler('request-typed',self.schema,fields,self.responses)
         h.do_POST()
         self.assertEqual(h.server.outcome,'stored')
         self.assertEqual(self.responses[-1][0],200)
@@ -295,11 +308,11 @@ class Management(unittest.TestCase):
 
     def test_real_keychain_label_line(self):
         """macOS prints the label as attribute 0x00000007, not "labl"."""
-        svce = KD.service("site")
-        out = (f'keychain: "/x/login.keychain-db"\nattributes:\n'
+        svce, kc = KD.service("site"), KD.vault_keychain()
+        out = (f'keychain: "{kc}"\nattributes:\n'
                f'    0x00000007 <blob>="{svce}.credential-v1"\n'
                f'    "acct"<blob>="{KD.ACCOUNT}"\n    "svce"<blob>="{svce}"\n'
-               f'keychain: "/x/login.keychain-db"\nattributes:\n'
+               f'keychain: "{kc}"\nattributes:\n'
                f'    0x00000007 <blob>="{KD.service("plain")}"\n'
                f'    "acct"<blob>="{KD.ACCOUNT}"\n    "svce"<blob>="{KD.service("plain")}"\n')
         with patch.object(KD.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=out, stderr="")):
@@ -314,7 +327,10 @@ class Management(unittest.TestCase):
             KD.keychain_store("big", too_long)
         self.assertEqual(KD.keychain_get("big"), "old value")
         self.h._store("/token", "replace", "big", {"value": [too_long]})
-        self.assertEqual(self.responses[-1][:2], (400, KD.TOO_LONG))
+        # Back to the same entry form with the error, not the list.
+        self.assertEqual(self.responses[-1][0], 400)
+        self.assertIn(KD.html.escape(KD.TOO_LONG).encode(), self.responses[-1][1])
+        self.assertIn(b"Rotate big", self.responses[-1][1])
         self.assertEqual(KD.keychain_get("big"), "old value")
         fits = "y" * KD.KeychainVault().capabilities()["max_bytes"]
         KD.keychain_store("big", fits)
@@ -384,12 +400,8 @@ class Put(unittest.TestCase):
         self.assertIsNone(KD.keychain_get("put-badlen"))
 
     def test_credential_envelope_matches_the_form(self):
-        h = object.__new__(KD.Handler)
-        h.server = types.SimpleNamespace(name="put-cred", note="", schema=KD.request_schema("put-cred", "credential"),
-                                         outcome=None)
-        h._authorised = lambda: "/token"
-        h._read_form = lambda n: {"f_username": ["agent@example.com"], "f_password": ["form-password"]}
-        h._send = lambda *a: None
+        h = oneshot_handler("put-cred", KD.request_schema("put-cred", "credential"),
+                            {"f_username": ["agent@example.com"], "f_password": ["form-password"]})
         h.do_POST()
         self.assertEqual(h.server.outcome, "stored")
         form_raw, form_meta = KD.keychain_get("put-cred"), KD.read_items()["put-cred"]
@@ -439,20 +451,16 @@ class Put(unittest.TestCase):
     def page_store(self, act, name, value, expect=303):
         h = object.__new__(KD.VaultHandler)
         h.server = types.SimpleNamespace(write_allowed=lambda: True, audit=lambda *x: None,
-                                         issue_csrf=lambda: "csrf")
+                                         issue_csrf=lambda: "csrf", deadline=math.inf)
         responses = []
         h._page = lambda path, code=200, error="", **kw: responses.append((code, error))
         h._done = lambda path, msg: responses.append((303, msg))
-        h._rate_limited = lambda *a: False
+        h._send = lambda code, body, *a, **kw: responses.append((code, body))
         h._store("/token", act, name, {"value": [value]})
         self.assertEqual(responses[-1][0], expect, responses)
 
     def oneshot_store(self, name, value):
-        h = object.__new__(KD.Handler)
-        h.server = types.SimpleNamespace(name=name, note="", schema=None, outcome=None)
-        h._authorised = lambda: "/token"
-        h._read_form = lambda n: {"value": [value]}
-        h._send = lambda *a: None
+        h = oneshot_handler(name, None, {"value": [value]})
         h.do_POST()
         return h.server.outcome
 
