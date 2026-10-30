@@ -195,8 +195,15 @@ def http(method, url, data=None, headers=None):
         return e.code, e.read().decode()
 
 
-def form(value):
-    return urllib.parse.urlencode({"value": value}).encode()
+def form(value, csrf=""):
+    return urllib.parse.urlencode({"value": value, "csrf": csrf}).encode()
+
+
+def page_csrf(url):
+    """The form token from a request page's own form: every POST to a page
+    needs it, not just the link."""
+    m = re.search(r'name="csrf" value="([^"]+)"', http("GET", url, headers=LOGIN)[1])
+    return m.group(1) if m else ""
 
 
 def pending_names():
@@ -455,7 +462,7 @@ def test_store_verified():
     try:
         name, value = test_name("e2elie"), secret_value()
         url = page(name, "--ttl", "1m")
-        code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+        code, body = http("POST", url, data=form(value, page_csrf(url)), headers=dict(LOGIN, **FORM))
         check(code == 500 and "Stored" not in body and value not in body,
               "page says it couldn't store, not Stored, when security lies")
         check(wait_gone(name) and log_outcomes(name)[-1] == "store-failed", "log: store-failed")
@@ -521,9 +528,12 @@ def test_local_flow(watch):
             check(code == 404 and body == "", "wrong token: bare 404")
             code, body = http("GET", base + "/", headers=LOGIN)
             check(code == 404 and body == "", "/: bare 404")
-            code, _ = http("POST", url, data=form(""), headers=dict(LOGIN, **FORM))
+            code, _ = http("POST", url, data=form("", page_csrf(url)), headers=dict(LOGIN, **FORM))
             check(code == 400 and name in pending_names(), "empty submit is refused and doesn't consume the link")
-        code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+            code, _ = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+            check(code == 403 and name in pending_names() and KD.keychain_get(name) is None,
+                  "a POST without the page's form token is refused: the link alone isn't enough")
+        code, body = http("POST", url, data=form(value, page_csrf(url)), headers=dict(LOGIN, **FORM))
         if attempt == 0:
             check(code == 200 and "Stored" in body and value not in body, "POST stores and says so (via delayed security shim)")
             check(wait_gone(name), "server gone after submit")
@@ -535,7 +545,8 @@ def test_local_flow(watch):
             check(KD.keychain_get(name) == value, "keydrop.<name> holds the submitted value")
             check(run("get", name).stdout == value, "`keydrop get` prints it")
             check(name in run("list").stdout.split(), "`keydrop list` shows the name")
-            check(log_outcomes(name) == ["requested", "stored"], "log: requested, stored")
+            check(log_outcomes(name) == ["requested", "refused: form token (bad)", "stored"],
+                  "log: requested, the token-less POST refused, stored")
         wait_gone(name)
         for needle in (value, value.encode().hex(), token):
             check(not state_contains(needle), f"state dir free of {'token' if needle == token else 'value'} (#{attempt})")
@@ -640,7 +651,7 @@ def test_pin_on_request():
 
     name, value = test_name("pinok"), secret_value()
     url = page(name, "--ttl", "1m")
-    code, body = http("POST", url, data=form(value), headers=dict(LOGIN, **FORM))
+    code, body = http("POST", url, data=form(value, page_csrf(url)), headers=dict(LOGIN, **FORM))
     check(code == 200 and "Stored" in body and KD.keychain_get(name) == value,
           "request page, the owner's login: stores")
 
@@ -964,9 +975,13 @@ def test_typed_local(watch):
         code, body = http("GET", url, headers=LOGIN)
         check(code == 200 and 'name="f_password"' in body, "typed request renders proposed fields")
         values = {"schema": json.dumps(schema), "f_username": "account", "f_password": value}
-        code, body = vpost(url, dict(values, f_password=""))
+        # The request page's schema is the requester's: its form carries none.
+        sent = {k: v for k, v in values.items() if k != "schema"}
+        code, body = vpost(url, dict(sent, f_password="", csrf=page_csrf(url)))
         check(code == 400 and KD.keychain_get(name) is None, "typed request rejects missing required value")
-        code, body = vpost(url, values)
+        code, body = vpost(url, dict(values, csrf=page_csrf(url)))
+        check(code == 400 and KD.keychain_get(name) is None, "typed request refuses a schema sent with the form")
+        code, body = vpost(url, dict(sent, csrf=page_csrf(url)))
         check(code == 200 and value not in body and wait_gone(name), "typed request stores and tears down without echo")
         check(KD.item_value(name, KD.keychain_get(name), "password") == value, "typed request reads one field")
         check(run("get", name).returncode != 0, "typed get requires --field")
@@ -1003,8 +1018,7 @@ def test_spec_credential(watch):
         code, body = http("GET", url, headers=LOGIN)
         check(code == 200 and 'name="f_url"' in body and 'name="f_totp"' not in body,
               "--fields renders exactly the asked optional fields")
-        schema = KD.credential_schema(name, ("url",))
-        code, body = vpost(url, {"schema": json.dumps(schema), "f_username": "me",
+        code, body = vpost(url, {"csrf": page_csrf(url), "f_username": "me",
                                  "f_password": value, "f_url": "https://example.com"})
         check(code == 200 and value not in body and wait_gone(name), "spec credential stores")
         r = run("get", name, "--field", "password")
@@ -1125,19 +1139,19 @@ def test_upload_units():
             s["fields"].append({"name": "spare", "label": "Spare", "kind": "secret", "required": False})
             check(refused(KD.validate_schema, s) is not None, f"schema: input refused with {bad}")
         typed = {"schema": [json.dumps(schema)], "file_private_key": [pem.encode()],
-                 "f_private_key": [""], "f_key_id": ["KEYID12345"], "f_team_id": ["TEAMID6789"]}
+                 "f_key_id": ["KEYID12345"], "f_team_id": ["TEAMID6789"]}
         raw, got_schema = si(typed)
         item = json.loads(raw)["fields"]
         check(item == {"private_key": pem, "key_id": "KEYID12345", "team_id": "TEAMID6789"} and got_schema == schema,
               "typed: a file fills one field byte for byte, empty file parts are no file")
         check(refused(si, dict(typed, file_key_id=[b"FROMFILE"], f_key_id=[""])) == "That didn't look like the form.",
               "typed: only an input=file field takes a file")
-        check(refused(si, dict(typed, f_private_key=["pasted"])) == KD.BOTH,
-              "typed: value and file for one field refused")
-        check(refused(si, dict(typed, file_private_key=[b""])) == "Nothing was entered.",
-              "typed: a required field with neither is S-EMPTY")
+        check(refused(si, dict(typed, f_private_key=["pasted"])) == "That didn't look like the form.",
+              "typed: an input=file field takes no paste (a one-line input flattens a key)")
+        check(refused(si, dict(typed, file_private_key=[b""])) == "Nothing was entered for Private key.",
+              "typed: a required field with no file is S-EMPTY, naming the field")
         pk_max = next(f["max"] for f in schema["fields"] if f["name"] == "private_key")
-        check(refused(si, dict(typed, file_private_key=[b"x" * (pk_max + 1)])) == "A field is too long.",
+        check(refused(si, dict(typed, file_private_key=[b"x" * (pk_max + 1)])) == "Private key is too long.",
               "typed: a file over its field's max refused")
         check("NUL" in (refused(si, dict(typed, file_private_key=[b"a\x00"])) or ""),
               "typed: a file with NUL bytes refused")
@@ -1156,13 +1170,13 @@ def test_upload_units():
         html_ = KD.render_form("svc", "", "/tok", schema=schema)
         main = html_.split("<details>")[0]
         check('enctype="multipart/form-data"' in main, "typed request form is multipart")
-        check(main.index('name="file_private_key"') < main.index('name="f_private_key"'),
-              "input=file field shows the file picker first")
+        check('name="file_private_key"' in main and 'name="f_private_key"' not in main,
+              "input=file field shows a file picker and no typed input")
         check('name="file_key_id"' not in main and 'name="file_team_id"' not in main and 'name="f_key_id"' in main,
               "fields not marked input=file get no file picker")
-        check(not re.search(r'<input[^>]*name="f_[a-z_]+"[^>]*required', main)
-              and not re.search(r'<input[^>]*type="file"[^>]*required', main),
-              "no value or file input is `required`: one of the two fills a field")
+        check(re.search(r'<input[^>]*name="f_key_id"[^>]*required', main)
+              and re.search(r'<input[^>]*type="file"[^>]*name="file_private_key"[^>]*required', main),
+              "each typed field has one input, and a required field's input is `required`")
         sel_html = KD.render_form("svc", "", "/tok", schema=KD.validate_schema(sel)).split("<details>")[0]
         check('name="file_region"' not in sel_html and 'name="file_token"' not in sel_html and 'name="f_token"' in sel_html,
               "a select field gets no file input")
@@ -1222,17 +1236,18 @@ def test_upload_local(watch):
     url = page(name, "--ttl", "1m")
     code, body = http("GET", url, headers=LOGIN)
     check(code == 200 and 'enctype="multipart/form-data"' in body, "request page form is multipart")
+    token = re.search(r'name="csrf" value="([^"]+)"', body).group(1)
     _, ctype = multipart({})
     check(raw_post_length(url, KD.MAX_UPLOAD_BODY + 1, ctype) == 413 and name in pending_names(),
           "oversize multipart Content-Length: 413, refused unread, link not used up")
     check(raw_post_length(url, KD.MAX_BODY + 1, "application/x-www-form-urlencoded") == 413,
           "oversize urlencoded Content-Length: 413")
-    code, body = mpost(url, {"value": "typed too"}, {"file": pem.encode()}, fname)
+    code, body = mpost(url, {"value": "typed too", "csrf": token}, {"file": pem.encode()}, fname)
     check(code == 400 and KD.BOTH in body and name in pending_names(), "request: value and file together, 400, link kept")
-    code, body = mpost(url, {"value": ""}, {"file": b""})
+    code, body = mpost(url, {"value": "", "csrf": token}, {"file": b""})
     check(code == 400 and "Nothing was entered." in body and name in pending_names(),
           "request: empty value and an empty file part, S-EMPTY, link kept")
-    code, body = mpost(url, {"value": ""}, {"file": pem.encode()}, fname)
+    code, body = mpost(url, {"value": "", "csrf": token}, {"file": pem.encode()}, fname)
     check(code == 200 and "Stored" in body and pem not in body, "request: a file upload stores")
     check(wait_gone(name), "request: page gone after an upload")
     check(KD.keychain_get(name) == pem, "request: keychain holds the file byte for byte")
@@ -1253,10 +1268,10 @@ def test_upload_local(watch):
             json.dump(schema, f)
         url = page(name, "--schema", path)
         code, body = http("GET", url, headers=LOGIN)
-        check(code == 200 and body.index('name="file_private_key"') < body.index('name="f_private_key"'),
-              "typed request page shows the file picker first for an input=file field")
-        sent = {"schema": json.dumps(KD.validate_schema(schema)), "f_private_key": "",
-                "f_key_id": "KEYID12345", "f_team_id": "TEAMID6789"}
+        check(code == 200 and 'name="file_private_key"' in body and 'name="f_private_key"' not in body,
+              "typed request page shows only a file picker for an input=file field")
+        token = re.search(r'name="csrf" value="([^"]+)"', body).group(1)
+        sent = {"f_key_id": "KEYID12345", "f_team_id": "TEAMID6789", "csrf": token}
         empties = {}
         big = pem_value(60)   # under the field's own max, over the vault's per-item limit
         code, body = mpost(url, sent, dict(empties, file_private_key=big.encode()), fname)
@@ -1281,7 +1296,8 @@ def test_upload_local(watch):
               "vault: rotate form takes files")
         pem2 = pem_value()
         watch.needles += [pem2.splitlines()[1]]
-        code, body = mpost(url, dict(sent, csrf=csrf, action="rotate", name=name),
+        code, body = mpost(url, dict(sent, csrf=csrf, action="rotate", name=name,
+                                     schema=json.dumps(KD.validate_schema(schema))),
                            dict(empties, file_private_key=pem2.encode()), fname)
         check(code == 200 and pem2 not in body and KD.item_value(name, KD.keychain_get(name), "private_key") == pem2,
               "vault: typed rotate by file stores the new file")

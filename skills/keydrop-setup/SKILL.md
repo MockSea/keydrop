@@ -114,9 +114,12 @@ implementation:
    lists every key.
 4. Run `keydrop config` and check the output with the user.
 
-The reference has no credential type yet (spec section 12). If the user
-turned credentials on, tell them, and either add the type to the reference
-following the spec or leave credentials for later.
+The reference has credentials and typed items, off by default. If the user
+wants them, turn them on in `policy.json` in the state dir, as the README's
+"Credentials and other typed items" says. Mark a field that arrives as a
+file (a `.p8` or `.pem` key) `"input": "file"`: it then takes only a file,
+and every other field takes only a typed value. The request page shows
+exactly the fields you ask for; the owner can't change them there.
 
 **Otherwise, build one.** Implement `SPEC.md`:
 
