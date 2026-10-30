@@ -1283,12 +1283,16 @@ class store_lock(serve_lock):
         while True:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
             except BlockingIOError:
                 if time.monotonic() >= self.deadline:
                     os.close(self.fd)
                     raise Expired() from None
                 time.sleep(0.05)
+                continue
+            if time.monotonic() >= self.deadline:   # a wait can win the lock just after the link ends
+                os.close(self.fd)
+                raise Expired()
+            return self
 
 
 def read_ledger():
