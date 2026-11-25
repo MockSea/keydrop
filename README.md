@@ -78,6 +78,7 @@ in effect.
 
     keydrop request <name> [--note "what it's for"] [--ttl 15m] [--http]
                     [--type secret|credential|<template>] [--fields totp,url,notes]
+                    [--schema <file>] [--template <service>]
     keydrop vault [--ttl 15m] [--http]
     keydrop get <name> [--field F]
     keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
@@ -86,7 +87,7 @@ in effect.
     keydrop status
     keydrop cancel <name>          (cancel vault ends a vault session)
     keydrop home                   always-on vault page, for launchd
-    keydrop home --new-link | --stop | --unlock
+    keydrop home --new-link | --stop | --unlock  [--force]
     keydrop config
 
 Names are lowercase letters, digits, `.`, `_` and `-`, up to 64 characters.
@@ -123,7 +124,9 @@ the value itself (say, the password for an account it is signing up for),
 
 `--generate` makes a 24-character password (`--length` 12 to 128) of letters,
 digits and `-_.!@#%+=`, with at least one of each. `--stdin` reads the value
-from a pipe, or prompts without echo at a terminal. Neither ever takes the
+from a pipe, or prompts without echo at a terminal. From a pipe, one trailing
+newline is dropped, as `echo` adds one, so a value that must end in a newline
+(some PEM files) loses it. Neither ever takes the
 value as an argument, and `put` never prints it: read it back with `get`.
 `--username` stores a credential exactly as the form would, so policy has to
 allow credentials. `put` refuses a name with a request pending, and a name
@@ -131,7 +134,8 @@ that already exists unless given `--replace`. `--replace` only works on items
 `put` made: anything stored or changed through a page stays out of its reach,
 whatever the flags, as long as the agent can only run `keydrop put` and `get`
 (one that can edit keydrop's state folder or run `security` itself can get
-around it). Every `put` is written to `home-audit.log`.
+around it). Every `put` that stores, replaces or fails, or is refused
+because `put` didn't make the item, is written to `home-audit.log`.
 
 ### Credentials and other typed items
 
@@ -149,12 +153,15 @@ refuses, so a careless `get` can't print a username next to its password.
 `notes`) a request may ask for; leave it out to allow all three. A refused
 request exits 2 and opens nothing.
 
-`--type` also takes a built-in template (`api-key`, `username-password`,
-`aws`, `google-oauth`, `stripe` and others), and `--fields '<JSON list>'` or
+`--type` (or `--template`) also takes a built-in template (`api-key`,
+`username-password`, `aws`, `google-oauth`, `stripe` and others), and `--fields '<JSON list>'` or
 `--schema <file>` proposes any fields an agent needs. The request page shows
 exactly those fields, and refuses a submit that tries to change them, so the
 item stored is the one the agent can read back; editing fields is on the
-vault and home pages' add and rotate forms. The type, field names and an
+vault and home pages' add and rotate forms. With credentials on, a request
+with no `--type` whose name is a multi-field template (`keydrop request aws`)
+proposes that template's fields, and `get` then needs `--field`; a name like
+`github`, whose template has one field, stays a plain secret. The type, field names and an
 optional rotate-by date are kept in `items.json` in the state dir (mode
 0600), never the values. The vault and home pages search items, flag overdue
 rotations and show recent activity.
@@ -287,6 +294,7 @@ don't put secrets in them.
     tests/keydrop-test
     tests/keydrop-home-test
     tests/keydrop-management-test
+    tests/keydrop-review-test
 
 No suite touches a real keychain or a real tailnet. `security` is a fake
 (`tests/fakes.py`) that keeps items in a JSON file, and `tailscale` is a stub

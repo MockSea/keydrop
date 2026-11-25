@@ -759,7 +759,8 @@ to any language. Most need a fake vault and a stub transport, so that a test
 never touches a real store or a real network.
 
 The reference implementation's suites (`tests/keydrop-test`,
-`tests/keydrop-home-test` and `tests/keydrop-management-test`) cover most of these checks today, but they are
+`tests/keydrop-home-test`, `tests/keydrop-management-test` and
+`tests/keydrop-review-test`) cover most of these checks today, but they are
 white-box Python: they import `keydrop` and call its functions. Turning them
 into a reusable suite means running them against a command and a port
 instead. Until then, they are the worked example for each check, listed in the
@@ -947,9 +948,20 @@ and the spec, for whoever brings it into line:
   message page.
 - **Size limit.** The keychain adapter refuses an item whose `security -i`
   line would reach 4096 characters (5.4), before anything is written.
-- **Exit codes.** Refusals (bad type or fields, disabled type or field)
-  exit 2. Everything else that fails exits 1, including vault and transport
-  failures that section 6 puts at 3.
+- **Exit codes.** Refusals for a bad type or fields, a disabled type or
+  field, and a bad name on `request` and `put` exit 2, as do `put`'s
+  refusals for its flags, an existing name, a pending request and size.
+  Everything else that fails exits 1, including these refusals that section
+  6 puts at 2: an invalid or unparseable `--ttl` on `request` and `vault`, a
+  bad name on `get`, a `--note` over 200 characters, a missing name on
+  `request`, and an empty `put --stdin`; and vault and transport failures
+  that section 6 puts at 3. Usage errors also split: an unknown command and
+  bad `get`, `list`, `cancel` or `config` arguments print the usage and exit
+  2, while bad `request`, `vault` and `home` arguments print a one-line
+  error and exit 1.
+- **`config`.** It prints the config keys in effect, not the policy or the
+  adapters section 6 asks for. The adapters are fixed (login keychain,
+  `tailscale serve`); the policy is `policy.json` in the state directory.
 - **Tests.** The suites are white-box (10, intro).
 
 ## 13. Open questions
