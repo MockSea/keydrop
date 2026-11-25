@@ -21,7 +21,7 @@ The repo this skill ships in has:
   page and its exact wording, the invariants, the adapter interfaces and the
   conformance checks. When this skill and the spec disagree, the spec wins.
 - `keydrop`, the reference implementation: one Python file for macOS, the
-  login keychain and `tailscale serve`, with two test suites in `tests/`.
+  login keychain and `tailscale serve`, with its test suites in `tests/`.
 - `reference/page.html`, every screen the page can show.
 
 Your job has four parts: take stock of the machine, choose adapters, get a
@@ -142,9 +142,10 @@ Before the user relies on it:
 
 1. **Fakes first.** Build a fake vault and a stub transport (spec 10.1) and
    run every check in spec 10.2 that applies. For the reference, that is
-   `tests/keydrop-test`, `tests/keydrop-home-test` and
-   `tests/keydrop-management-test`. Never point a test, or
-   any experiment of yours, at the real vault or the real transport.
+   `tests/keydrop-test`, `tests/keydrop-home-test`,
+   `tests/keydrop-management-test` and `tests/keydrop-review-test`. Never
+   point a test, or any experiment of yours, at the real vault or the
+   real transport.
 2. **One real round trip** with a throwaway name (spec 10.3): `keydrop
    request keydrop-smoke-test --note "test, paste anything"`, have the user
    submit any string, check that `keydrop get keydrop-smoke-test` returns it
