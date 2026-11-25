@@ -237,11 +237,13 @@ which isn't bundled:
 
     npm install playwright && npx playwright install chromium
 
-The filler looks for Playwright next to `contrib/`, then in the current
-directory, `NODE_PATH` and node's global modules. So run that in the keydrop
-checkout (`.gitignore` covers the `node_modules/` and `package*.json` it
-leaves), or use `npm install -g playwright`, or point `NODE_PATH` at an
-existing install.
+Run that in the keydrop checkout (`.gitignore` covers the `node_modules/`
+and `package*.json` it leaves). The filler looks for Playwright in this
+order: next to `contrib/` (the checkout and its parent directories), then
+`NODE_PATH`, then node's global modules (`npm install -g playwright`). It
+never searches the current directory, so running it from inside another
+project won't load that project's `node_modules`: the filler holds the
+password, and only code you installed for it should run in that process.
 
 Its exit status, which `run` passes back as its own: 0 signed in, 1 didn't
 (no form, timed out, window closed, stopped), 2 usage or input (including a

@@ -168,3 +168,46 @@ Results on card/key-7 (working tree of this commit), 2026-11-25:
   timing; nothing in this change touches that code. The machine's load average was about 8
   at the time. Rerun right after, on this branch and on a clean checkout of `cc194a8`: both
   `all passed (0 failed)`, exit 0. Read as a timing flake under load, not a regression.
+
+## Fix round 1125a: fill-login no longer loads Playwright from the current directory
+
+The security review of `7b701f7e573c1966b59d9294e1765b120b9a89b8` (the commit above, now
+`origin/feat/run-fill`) found one Medium: `loadPlaywright` in `contrib/fill-login.mjs` resolved
+Playwright from `process.cwd()` before node's global modules. Started from inside another project
+with its own `node_modules/playwright`, the filler imported that project's code into a process
+already holding the username and password.
+
+- `contrib/fill-login.mjs`: the `process.cwd()` base is gone. Playwright comes from next to
+  `contrib/` (walking up from the file), `NODE_PATH`, or the global prefix, in that order. The
+  "Playwright isn't installed" message says where to install it and that the current directory
+  isn't searched.
+- README: the install paragraph gives that order and says the current directory is never searched.
+- `tests/fill-login-test`: new check 4 copies the filler into a temp directory with no
+  `node_modules` above it and runs it, with `NODE_PATH` unset, from a temp project whose
+  `node_modules/playwright` and `playwright-core` write a marker file on import. The test's own
+  "is Playwright available" probe no longer looks in its current directory either.
+
+Reruns, 2026-11-25, dummy values only:
+
+- New check against the `7b701f7` filler (swapped into the worktree, then restored):
+  `FAIL doesn't import node_modules/playwright from the current directory (exit 3)`, suite
+  `FAILED 1`. The fake was imported, and its throwing `launchPersistentContext` gave exit 3.
+- Same check on this commit: `ok   doesn't import node_modules/playwright from the current
+  directory (exit 3)`. Exit 3 here is "Playwright isn't installed", with no marker written.
+- From inside a local project that has a real Playwright, `NODE_PATH` unset, credential
+  `dummy@example.com` / `DUMMY-PASS-k3` / `https://127.0.0.1:9/`:
+
+      err| fill-login: Playwright isn't installed. Install it in the keydrop checkout, e.g.
+      err|   npm install playwright && npx playwright install chromium
+      err| or globally, or point NODE_PATH at an install. The current directory isn't searched.
+      exit 3
+
+Tests on this commit (load average about 9.5):
+
+- `tests/fill-login-test`: all passed, 12 checks, browser cases skipped. With `NODE_PATH` pointed
+  at a local Playwright: all passed, 18 checks, exit 0, including "fills, submits and reports
+  signed in".
+- `tests/keydrop-management-test`: `Ran 52 tests`, `OK`.
+- `tests/keydrop-test`: `all passed`, exit 0.
+- `tests/keydrop-home-test`: run once as asked, `all passed (0 failed)`, exit 0. The rate-limit
+  checks that flaked last time passed.

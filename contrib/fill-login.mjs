@@ -20,8 +20,10 @@
 // --timeout passes. The signed-in session stays in --profile for whatever
 // opens that profile next.
 //
-// Playwright isn't bundled. It's looked up next to this file, then from the
-// current directory, NODE_PATH and node's global modules.
+// Playwright isn't bundled. It's looked up next to this file (and its parent
+// directories), then NODE_PATH, then node's global modules. The current
+// directory is never searched: this process holds the credential, so it
+// mustn't import whatever project it happens to be started from.
 
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
@@ -146,9 +148,10 @@ async function readCredential() {
 
 async function loadPlaywright() {
   const prefix = path.dirname(path.dirname(process.execPath));
+  // createRequire(base).resolve walks up from base, then NODE_PATH. None of
+  // these bases is process.cwd(), so the caller's project is never loaded.
   const bases = [
     import.meta.url,
-    path.join(process.cwd(), "noop.js"),
     path.join(prefix, "lib", "node_modules", "noop.js"),        // unix global installs
     path.join(path.dirname(process.execPath), "node_modules", "noop.js"),   // windows
   ];
@@ -243,8 +246,9 @@ async function main() {
   if (stored !== opts.origin) fail("--url is not the credential's site", EXIT.usage);
   const chromium = await loadPlaywright();
   if (!chromium) {
-    fail("Playwright isn't installed. Install it where this runs, e.g.\n"
-      + "  npm install playwright && npx playwright install chromium", EXIT.setup);
+    fail("Playwright isn't installed. Install it in the keydrop checkout, e.g.\n"
+      + "  npm install playwright && npx playwright install chromium\n"
+      + "or globally, or point NODE_PATH at an install. The current directory isn't searched.", EXIT.setup);
   }
   mkdirSync(opts.profile, { recursive: true, mode: 0o700 });   // it will hold session cookies
 

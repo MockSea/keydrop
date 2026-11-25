@@ -13,12 +13,14 @@ What's asserted:
    two-step form whose password page is on another origin. Each exits 1 and
    the password never reaches the server.
 3. The ordinary case fills, submits and reports "signed in".
+4. Started from a directory that has its own node_modules/playwright, the
+   filler doesn't import it (the fake marks a file on import).
 
 In every case neither value appears in the filler's stdout or stderr.
 
-Part 1 needs only `node`. Part 2 and 3 need Playwright with Chromium where
-the filler can find it (next to the repo, the current directory, NODE_PATH or
-node's global modules) and are skipped otherwise. Nothing touches a keychain:
+Part 1 and 4 need only `node`. Part 2 and 3 need Playwright with Chromium where
+the filler can find it (next to the repo, NODE_PATH or node's global
+modules; never the current directory) and are skipped otherwise. Nothing touches a keychain:
 the credential is piped in directly, as `keydrop run` would.
 
     tests/fill-login-test
@@ -163,6 +165,37 @@ def test_refusals_without_a_browser():
           "the stdin hint names --field url")
 
 
+def test_cwd_playwright_is_not_loaded():
+    # A copy of the filler with no node_modules above it, started from a
+    # project whose node_modules/playwright marks a file when imported. Only
+    # the global prefix (and NODE_PATH, unset here) may still supply one.
+    contrib = os.path.join(BASE, "isolated", "contrib")
+    os.makedirs(contrib)
+    copy = os.path.join(contrib, "fill-login.mjs")
+    shutil.copyfile(FILLER, copy)
+    project = os.path.join(BASE, "other-project")
+    marker = os.path.join(BASE, "cwd-playwright-loaded")
+    for name in ("playwright", "playwright-core"):
+        pkg = os.path.join(project, "node_modules", name)
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "package.json"), "w") as f:
+            json.dump({"name": name, "version": "0.0.0", "main": "index.js"}, f)
+        with open(os.path.join(pkg, "index.js"), "w") as f:
+            f.write(f"require('fs').writeFileSync({json.dumps(marker)}, 'loaded');\n"
+                    "module.exports = { chromium: { launchPersistentContext() {"
+                    " throw new Error('fake playwright from the cwd'); } } };\n")
+    env = {k: v for k, v in os.environ.items() if k != "NODE_PATH"}
+    proc = subprocess.run(
+        ["node", copy, "--profile", os.path.join(BASE, "profile-cwd"), "--headless",
+         "--timeout", "5", "--url", "https://127.0.0.1:9/login"],
+        input=json.dumps(cred("https://127.0.0.1:9/")).encode(),
+        capture_output=True, timeout=60, cwd=project, env=env)
+    out, err = proc.stdout.decode(), proc.stderr.decode()
+    leaked = any(v in out + err for v in (PASSWORD, USER))
+    check(not os.path.exists(marker) and "fake playwright" not in err and not leaked,
+          f"doesn't import node_modules/playwright from the current directory (exit {proc.returncode})")
+
+
 def test_in_the_browser(base):
     common = ["--allow-http-localhost", "--headless", "--timeout", "10"]
 
@@ -213,7 +246,10 @@ def playwright_available():
     probe = ("import('node:module').then(({createRequire}) => {"
              " for (const n of ['playwright', 'playwright-core']) {"
              f"  try {{ createRequire({json.dumps(FILLER)}).resolve(n); process.exit(0); }} catch {{}}"
-             f"  try {{ createRequire(process.cwd() + '/x.js').resolve(n); process.exit(0); }} catch {{}}"
+             "  const p = require('node:path'), prefix = p.dirname(p.dirname(process.execPath));"
+             "  for (const b of [p.join(prefix, 'lib', 'node_modules', 'x.js'),"
+             "                   p.join(p.dirname(process.execPath), 'node_modules', 'x.js')])"
+             "   try { createRequire(b).resolve(n); process.exit(0); } catch {}"
              " } process.exit(1); })")
     return subprocess.run(["node", "-e", probe], capture_output=True).returncode == 0
 
@@ -226,6 +262,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         test_refusals_without_a_browser()
+        test_cwd_playwright_is_not_loaded()
         if playwright_available():
             test_in_the_browser(f"http://127.0.0.1:{server.server_address[1]}")
         else:
