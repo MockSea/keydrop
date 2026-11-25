@@ -418,6 +418,34 @@ class Put(unittest.TestCase):
         self.assertNotIn(password, out)
         self.assertEqual(KD.read_items()["put-cred-gen"]["schema"], KD.credential_schema("put-cred-gen"))
 
+    def test_url_stores_the_website_field(self):
+        code, out, err = self.run_put("put-site", "--generate", "--username", "agent@example.com",
+                                      "--url", "https://example.com/login")
+        self.assertEqual((code, out, err), (0, "stored put-site (username agent@example.com)\n", ""))
+        raw = KD.keychain_get("put-site")
+        self.assertEqual(KD.item_value("put-site", raw, "url"), "https://example.com/login")
+        self.assertEqual(KD.read_items()["put-site"]["schema"], KD.credential_schema("put-site", ("url",)))
+        self.assertNotIn(KD.item_value("put-site", raw, "password"), out)
+        for args, why in ((["put-site-bad", "--generate", "--username", "u", "--url", "ftp://example.com"],
+                           "URL"),
+                          (["put-site-bad", "--generate", "--username", "u", "--url", "not a url"], "URL"),
+                          (["put-site-bad", "--generate", "--url", "https://example.com"], "--username"),
+                          (["put-site-bad", "--generate", "--username", "u", "--url"], "--url")):
+            with self.subTest(args=args):
+                code, out, err = self.run_put(*args)
+                self.assertEqual((code, out), (2 if why != "URL" else 1, ""), err)
+                self.assertIn(why, err)
+        self.assertIsNone(KD.keychain_get("put-site-bad"))
+
+    def test_help_prints_usage(self):
+        for flag in ("--help", "-h"):
+            code, out, err = self.run_put(flag)
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("keydrop put <name>", out)
+        # A value given to --username or --note is taken as that value, not as help.
+        code, out, _ = self.run_put("put-help-user", "--generate", "--username", "--help")
+        self.assertEqual((code, out), (0, "stored put-help-user (username --help)\n"))
+
     def test_refuses_to_overwrite_without_replace(self):
         self.assertEqual(self.run_put("put-twice", "--stdin", stdin="first")[0], 0)
         KD.write_item_meta("put-twice", None, "2099-01-01", origin="put")
@@ -769,11 +797,32 @@ class Run(unittest.TestCase):
         self.assertEqual((proc.returncode, proc.stdout, proc.stderr),
                          (1, b"", b"keydrop: no key named run-nothing-here\n"))
         proc = self.keydrop("run", "run-cred", "--field", "totp", *self.recorder())
-        self.assertEqual((proc.returncode, proc.stdout), (1, b""))
-        self.assertIn(b"Field is absent", proc.stderr)
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr),
+                         (1, b"", b"keydrop: Field is absent: run-cred has username, password.\n"))
+        # With several --field flags, the message names the item's fields, not the argument.
+        proc = self.keydrop("run", "run-cred", "--field", "username", "--field", "not-a-field-zz",
+                            *self.recorder())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"run-cred has username, password", proc.stderr)
+        self.assertNotIn(b"not-a-field-zz", proc.stderr)
         proc = self.keydrop("run", "run-secret", "--field", "password", *self.recorder())
         self.assertEqual((proc.returncode, proc.stderr), (1, b"keydrop: Unknown field.\n"))
         self.assertIsNone(self.seen("stdin"), "the child must not start")
+
+    def test_help_before_the_separator_prints_usage(self):
+        for args in (["--help"], ["-h"], ["run-secret", "--help", "--", "true"]):
+            with self.subTest(args=args):
+                proc = self.keydrop("run", *args)
+                self.assertEqual((proc.returncode, proc.stderr), (0, b""))
+                self.assertIn(b"keydrop run <name>", proc.stdout)
+        self.assertIsNone(self.seen("stdin"))
+        # After --, --help belongs to the command; after --field, it is a field id.
+        proc = self.keydrop("run", "run-secret", "--", sys.executable, "-c",
+                            "import sys; print(sys.argv[1:])", "--help")
+        self.assertEqual((proc.returncode, proc.stdout), (0, b"['--help']\n"))
+        proc = self.keydrop("run", "run-cred", "--field", "--help", "--", "true")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(b"Field is absent", proc.stderr)
 
     def test_child_exit_code_and_output_pass_through(self):
         proc = self.keydrop("run", "run-secret", *self.recorder("7"))
@@ -822,7 +871,8 @@ class Run(unittest.TestCase):
         missing = os.path.join(self.out, "no-such-command")
         proc = self.keydrop("run", "run-secret", "--", missing)
         self.assertEqual((proc.returncode, proc.stdout), (127, b""))
-        self.assertEqual(proc.stderr, b"keydrop: couldn't start the command: not found\n")
+        self.assertEqual(proc.stderr, b"keydrop: couldn't start the command: not found "
+                                      b"(the first word after --, run without a shell)\n")
         noexec = os.path.join(self.out, "not-executable")
         Path(noexec).write_text("#!/bin/sh\n")
         proc = self.keydrop("run", "run-secret", "--", noexec)

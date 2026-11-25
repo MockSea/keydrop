@@ -13,11 +13,12 @@ instead of pasting it into a chat.
                               start <cmd> with the value on its stdin (a
                               credential's fields as one JSON object) and
                               nowhere else; exits with <cmd>'s status
-    keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
-    keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
+    keydrop put <name> --generate [--length N] [--username U [--url SITE]] [--note "..."] [--replace]
+    keydrop put <name> --stdin [--username U [--url SITE]] [--note "..."] [--replace]
                               local write, no page: a generated password or a
                               value piped in; prints `stored <name>`, never the
-                              value. --username stores a credential
+                              value. --username stores a credential, --url adds
+                              its website (needed by contrib/fill-login.mjs)
     keydrop list [--long]     names only; --long adds type, created, updated
     keydrop status            pending requests and vault sessions
     keydrop cancel <name>     stop a pending request (`cancel vault` ends a session)
@@ -761,12 +762,17 @@ def item_typed(name):
     return entry.get("type") == "credential" or bool(read_items().get(name, {}).get("schema"))
 
 
-def envelope_field(raw, selected):
+def envelope_field(raw, selected, name):
     try:
         data = json.loads(raw)
         if data.get("keydrop") != 1 or data.get("type") != "credential" or not isinstance(data.get("fields"), dict):
             raise ValueError()
-        value = data["fields"][selected]
+        fields = data["fields"]
+        if selected not in fields:
+            # Name the fields the item has: ids are schema, never values. The
+            # --field argument itself isn't echoed, as no argument is.
+            raise KeydropError(f"Field is absent: {name} has {', '.join(fields) or 'no fields'}.")
+        value = fields[selected]
         if not isinstance(value, str):
             raise ValueError()
         return value
@@ -781,7 +787,7 @@ def item_value(name, raw, selected=None):
         return raw
     if not selected:
         raise KeydropError("Credentials require get <name> --field <name>.")
-    return envelope_field(raw, selected)
+    return envelope_field(raw, selected, name)
 
 
 # ---------- keychain ----------
@@ -2282,7 +2288,7 @@ def read_stdin_value():
     return raw[:-2] if raw.endswith("\r\n") else raw[:-1] if raw.endswith("\n") else raw
 
 
-def put(name, value, username=None, note="", replace=False):
+def put(name, value, username=None, note="", replace=False, url=None):
     """The local write path (SPEC 6.1): the same validation, policy, verified
     store and metadata as a form submit, with no page. The item is built by
     submitted_item from form-shaped fields, so a credential's envelope and
@@ -2291,9 +2297,15 @@ def put(name, value, username=None, note="", replace=False):
         raise RefusedError("name must be [a-z0-9._-], 1-64 chars")
     note = clean_note(note)
     if username is None:
+        if url is not None:
+            raise RefusedError("--url goes with --username")
         fields, schema = {"value": [value]}, None
-    else:
+    elif url is None:
         fields, schema = {"f_username": [username], "f_password": [value]}, credential_schema(name)
+    else:
+        # A url isn't a secret; submitted_item checks it as the form's url field.
+        fields = {"f_username": [username], "f_password": [value], "f_url": [url]}
+        schema = credential_schema(name, ("url",))
     item, schema = submitted_item(fields, schema)   # check_policy runs in here
     value = fields = None
     if not STORE.fits(name, item, bool(schema)):
@@ -2350,7 +2362,7 @@ def put_audit(name, event):
 
 
 def put_cli(rest):
-    name, username, note, length = None, None, "", None
+    name, username, note, length, url = None, None, "", None, None
     generate = from_stdin = replace = False
     it = iter(rest)
     for a in it:
@@ -2369,6 +2381,12 @@ def put_cli(rest):
             username = next(it, None)
             if username is None:
                 raise RefusedError("--username takes a value")
+        elif a == "--url":
+            url = next(it, None)
+            if not url:
+                raise RefusedError("--url takes a website")
+        elif a in ("-h", "--help"):
+            return usage_cli()
         elif a == "--note":
             note = next(it, "")
         elif name is None and not a.startswith("-"):
@@ -2383,8 +2401,10 @@ def put_cli(rest):
         raise RefusedError("put needs exactly one of --generate and --stdin")
     if length is not None and not generate:
         raise RefusedError("--length goes with --generate")
+    if url is not None and username is None:
+        raise RefusedError("--url goes with --username")
     value = generate_password(length or PUT_LENGTH) if generate else read_stdin_value()
-    put(name, value, username, note, replace)
+    put(name, value, username, note, replace, url)
     value = None
     print(f"stored {name}" + (f" (username {username})" if username is not None else ""))
     return 0
@@ -2402,7 +2422,14 @@ RUN_FORWARD = (signal.SIGTERM, signal.SIGHUP)
 
 
 def run_parse(rest):
-    """`run <name> [--field F]... -- <cmd> [args...]` -> (name, fields, cmd)."""
+    """`run <name> [--field F]... -- <cmd> [args...]` -> (name, fields, cmd), or
+    None when -h or --help comes before the first --."""
+    it = iter(rest[:rest.index("--")] if "--" in rest else rest)
+    for a in it:
+        if a == "--field":
+            next(it, None)   # a field id, even one spelled --help
+        elif a in ("-h", "--help"):
+            return None
     if "--" not in rest:
         raise RefusedError("run needs -- <command>")
     split = rest.index("--")
@@ -2439,7 +2466,7 @@ def run_payload(name, raw, fields):
         return raw.encode("utf-8", "surrogatepass")
     if not fields:
         raise RefusedError("Credentials require run <name> --field <name> (one or more).")
-    return json.dumps({f: envelope_field(raw, f) for f in fields}).encode("utf-8", "surrogatepass")
+    return json.dumps({f: envelope_field(raw, f, name) for f in fields}).encode("utf-8", "surrogatepass")
 
 
 def run_feed(pipe, payload):
@@ -2471,7 +2498,8 @@ def run(name, fields, cmd):
     except FileNotFoundError:
         payload = None
         # The command isn't echoed either: it's argv, and argv is where a value goes by mistake.
-        raise RunStartError("couldn't start the command: not found", RUN_NOT_FOUND) from None
+        raise RunStartError("couldn't start the command: not found (the first word after --, "
+                            "run without a shell)", RUN_NOT_FOUND) from None
     except PermissionError:
         payload = None
         raise RunStartError("couldn't start the command: not executable", RUN_NOT_EXECUTABLE) from None
@@ -2504,8 +2532,10 @@ def run(name, fields, cmd):
 
 def run_cli(rest):
     # Gated like get: config only. Nothing opens, so there is no owner login to pin.
-    name, fields, cmd = run_parse(rest)
-    return run(name, fields, cmd)
+    parsed = run_parse(rest)
+    if parsed is None:
+        return usage_cli()
+    return run(*parsed)
 
 
 def vault(ttl, plain_http=False):
@@ -2970,6 +3000,12 @@ USAGE = __doc__.split("\n\n")[1] + """
 Anything but secret needs "types_enabled": ["secret", "credential"] in
 policy.json in the state directory. SPEC.md section 5 has the field model.
 """
+
+
+def usage_cli():
+    """`run --help` and `put --help`: the same text as `keydrop --help`, exit 0."""
+    print(USAGE)
+    return 0
 
 
 NO_LOCAL = ("has no --local: a loopback listener with no serve route on its port is "

@@ -130,7 +130,7 @@ def test_refusals_without_a_browser():
          "--url is not the credential's site"),
         ("plain http to localhost without --allow-http-localhost",
          ["--url", "http://127.0.0.1:9/login"], cred("http://127.0.0.1:9/"),
-         "--url must be https"),
+         "--url must be https (or pass --allow-http-localhost for a local test page)"),
         ("plain http to another host even with --allow-http-localhost",
          ["--allow-http-localhost", "--url", "http://example.com/login"], cred("http://example.com/"),
          "--url must be https"),
@@ -149,6 +149,18 @@ def test_refusals_without_a_browser():
         check(code == 2 and out == "" and err == f"fill-login: {message}\n" and not leaked,
               f"refuses {label} (exit {code})")
     check(not os.path.exists(profile), "no profile is created when it refuses")
+
+    # Every place that shows the keydrop command shows all three fields.
+    run_line = "keydrop run <name> --field username --field password --field url --"
+    proc = subprocess.run(["node", FILLER, "--help"], capture_output=True, timeout=30)
+    check(proc.returncode == 0 and run_line in proc.stdout.decode(), "--help names --field url")
+    proc = subprocess.run(["node", FILLER, "--url", "https://example.com/"], capture_output=True, timeout=30)
+    check(proc.returncode == 2 and run_line in proc.stderr.decode(), "the usage on error names --field url")
+    proc = subprocess.run(["node", FILLER, "--profile", profile, "--url", "https://example.com/"],
+                          input=b"", capture_output=True, timeout=30)
+    check(proc.returncode == 2 and proc.stderr.decode() == "fill-login: stdin is not a JSON object "
+          "(run keydrop with --field username --field password --field url)\n",
+          "the stdin hint names --field url")
 
 
 def test_in_the_browser(base):

@@ -28,7 +28,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const USAGE = `usage: keydrop run <name> --field username --field password -- \\
+const USAGE = `usage: keydrop run <name> --field username --field password --field url -- \\
   node fill-login.mjs --profile <dir> --url <login url>
     [--user-selector <css>] [--pass-selector <css>] [--timeout <seconds>] [--headless]
     [--allow-http-localhost]   (testing only: also accept http://localhost and 127.0.0.1)`;
@@ -98,7 +98,9 @@ function loginOrigin(raw, what, httpLocal) {
   if (u.protocol === "https:") return u.origin;
   const local = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
   if (u.protocol === "http:" && local && httpLocal) return u.origin;
-  fail(`${what} must be https`, EXIT.usage);
+  const hint = u.protocol === "http:" && local && !httpLocal
+    ? " (or pass --allow-http-localhost for a local test page)" : "";
+  fail(`${what} must be https${hint}`, EXIT.usage);
 }
 
 // The page is still on the site --url names. Checked after loading and again
@@ -133,7 +135,7 @@ async function readCredential() {
   let data;
   try { data = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { data = null; }
   if (!data || typeof data !== "object" || Array.isArray(data)) {
-    fail("stdin is not a JSON object (run keydrop with --field username --field password)", EXIT.usage);
+    fail("stdin is not a JSON object (run keydrop with --field username --field password --field url)", EXIT.usage);
   }
   const pick = (k) => (typeof data[k] === "string" && data[k] !== "" ? data[k] : null);
   const cred = { username: pick("username"), password: pick("password"), url: pick("url") };

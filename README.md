@@ -81,8 +81,8 @@ in effect.
     keydrop vault [--ttl 15m] [--http]
     keydrop get <name> [--field F]
     keydrop run <name> [--field F]... -- <cmd> [args...]
-    keydrop put <name> --generate [--length N] [--username U] [--note "..."] [--replace]
-    keydrop put <name> --stdin [--username U] [--note "..."] [--replace]
+    keydrop put <name> --generate [--length N] [--username U [--url SITE]] [--note "..."] [--replace]
+    keydrop put <name> --stdin [--username U [--url SITE]] [--note "..."] [--replace]
     keydrop list [--long]
     keydrop status
     keydrop cancel <name>          (cancel vault ends a vault session)
@@ -127,7 +127,9 @@ digits and `-_.!@#%+=`, with at least one of each. `--stdin` reads the value
 from a pipe, or prompts without echo at a terminal. Neither ever takes the
 value as an argument, and `put` never prints it: read it back with `get`.
 `--username` stores a credential exactly as the form would, so policy has to
-allow credentials. `put` refuses a name with a request pending, and a name
+allow credentials. `--url <site>` (only with `--username`) adds the
+credential's website, which `contrib/fill-login.mjs` needs; it isn't a
+secret, so it can go on the command line. `put` refuses a name with a request pending, and a name
 that already exists unless given `--replace`. `--replace` only works on items
 `put` made: anything stored or changed through a page stays out of its reach,
 whatever the flags, as long as the agent can only run `keydrop put` and `get`
@@ -193,7 +195,8 @@ closes it. A secret goes as its raw bytes. A credential needs at least one
 arguments or environment, and keydrop never prints it. The command's own
 output passes through, and `run` exits with the command's status. keydrop's
 own errors start with `keydrop: `; a missing item or field fails before the
-command starts, and a command that can't be found exits 127.
+command starts (a missing field names the fields the item has), and a
+command that can't be found exits 127. `keydrop run --help` prints the usage.
 
 This keeps the value out of keydrop's output, not out of the command's: the
 command can do whatever it likes with what it reads, so only run commands
@@ -216,9 +219,12 @@ finish a second factor; it closes once the page has left the login flow, or
 after `--timeout` seconds (300 by default). The signed-in session stays in
 the profile directory for whatever opens it next.
 
-The credential needs its website stored in its `url` field (request it with
-`--fields url`) and passed on with `--field url`; without it the filler
-refuses. `--url` has to be https and on the same site (scheme, host
+The credential needs its website stored in its `url` field and passed on
+with `--field url`; without it the filler refuses. Store it locally with
+`keydrop put example-site --generate --username agent@example.com --url
+https://example.com`, or ask for it on a page with `keydrop request
+example-site --type credential --fields url`. A `put --username` item
+without `--url` doesn't work with the filler. `--url` has to be https and on the same site (scheme, host
 and port) as the stored website, and the page has to still be on that site
 after loading and again right before each field is filled, so a login page
 that redirects to a separate sign-in domain needs `--url` set to that page.
@@ -230,6 +236,18 @@ this machine, for testing against a local page. It needs Node and Playwright,
 which isn't bundled:
 
     npm install playwright && npx playwright install chromium
+
+The filler looks for Playwright next to `contrib/`, then in the current
+directory, `NODE_PATH` and node's global modules. So run that in the keydrop
+checkout (`.gitignore` covers the `node_modules/` and `package*.json` it
+leaves), or use `npm install -g playwright`, or point `NODE_PATH` at an
+existing install.
+
+Its exit status, which `run` passes back as its own: 0 signed in, 1 didn't
+(no form, timed out, window closed, stopped), 2 usage or input (including a
+`--url` that isn't the credential's site), 3 Playwright missing or the
+browser wouldn't start. These overlap keydrop's own 1 and 2; the stderr
+prefix tells them apart (`keydrop: ` or `fill-login: `).
 
 ### The home page under launchd
 

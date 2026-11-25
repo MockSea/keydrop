@@ -369,7 +369,7 @@ are part of the contract so that one skill can drive any implementation.
 | `config` | prints settings in effect, including policy and chosen adapters |
 | `vault [--ttl D]` | OPTIONAL. opens a vault session |
 | `home [--new-link \| --stop \| --unlock]` | OPTIONAL. the always-on page |
-| `put <name> (--generate \| --stdin) [--username U] [--replace]` | OPTIONAL. the local write path (6.1) |
+| `put <name> (--generate \| --stdin) [--username U [--url SITE]] [--replace]` | OPTIONAL. the local write path (6.1) |
 | `run <name> [--field F]... -- <cmd> [args...]` | OPTIONAL. starts `<cmd>` with the value on its stdin (6.2) |
 
 Exit status: 0 on success, 1 when the item doesn't exist, 2 for a refused
@@ -408,7 +408,9 @@ this machine (section 1).
 - It is the form's write, not a second one: the same name check (5.6), the
   same policy check (5.5, I12), the same item encoding (with `--username`, a
   `credential` envelope per 5.4 and the same field definitions), the same
-  size limit and the same verified store (I6).
+  size limit and the same verified store (I6). `--url SITE`, only with
+  `--username`, adds the credential's optional `url` field, checked as the
+  form checks it. A website isn't a secret, so it may be an argument.
 - It records `"origin": "put"` in the item's `items.json` entry. Any other
   write (a page store, a rotation, the vault) rewrites the entry without it,
   and drops the origin before it touches the store, so a write that fails

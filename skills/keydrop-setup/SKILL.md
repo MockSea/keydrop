@@ -206,7 +206,20 @@ When a task needs a secret you don't have:
 4. Wait until the name drops out of `keydrop status`. `request` returns
    immediately, so poll gently or ask the user to tell you when it's done. The
    link expires after 15 minutes by default (`--ttl`, an hour at most).
-5. Consume the value without printing it:
+5. Consume the value without printing it. If the implementation has `run`
+   (spec 6.2; `keydrop --help` lists it) and the consumer can read the value
+   from stdin, use `run`: the value goes to the command's stdin only, never
+   your output, argv or environment.
+
+       keydrop run openai-api-key -- some-command-that-reads-stdin
+       keydrop run staging-admin --field username --field password --field url -- \
+         node contrib/fill-login.mjs --profile ~/.local/state/browser-profiles/staging-admin \
+           --url https://staging.example.com/login
+
+   A credential goes as one JSON object of the fields you name. The second
+   line signs a browser profile in (README, "Handing a value to a command
+   without printing it"); it needs the credential's `url` field. When the
+   consumer needs the value in an environment variable instead, use `get`:
 
        OPENAI_API_KEY="$(keydrop get openai-api-key)" some-command
        PASS="$(keydrop get staging-admin --field password)" some-command
@@ -221,8 +234,11 @@ you are signing up for, a token another local tool prints), store it with
 `put` (spec 6.1). No link, no page, and the value never touches argv or
 stdout:
 
-    keydrop put example-site --generate --username agent@example.com
+    keydrop put example-site --generate --username agent@example.com --url https://example.com
     some-tool --print-token | keydrop put example-token --stdin
+
+`--url` stores the credential's website, which `contrib/fill-login.mjs`
+needs; leave it off for a credential nothing will sign in with.
 
 `put` is only for values you own. It can replace an item only if `put` made
 it and you pass `--replace`; anything the user stored or changed through a
